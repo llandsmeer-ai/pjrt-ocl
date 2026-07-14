@@ -5,3 +5,5 @@ __pycache__/
 poc/01-device-vm/vm
 .claude/
 poc/02-pjrt-skeleton/build/
+*.egg-info/
+.pytest_cache/
