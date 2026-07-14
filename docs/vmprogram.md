@@ -34,6 +34,13 @@ All integers little-endian. File = header, then sections in order, each 8-byte a
 `inputs: n_inputs × u32` buffer ids in PJRT argument order, then
 `outputs: n_outputs × u32` buffer ids in result order (padded to 8B after each array).
 
+## IO shapes (added before first implementation — still "v1")
+
+For each IO buffer (inputs in order, then outputs in order):
+`{ rank u32, pad u32, dims u64[rank] }`, each entry 8B aligned.
+The executor needs these to answer `PJRT_Buffer_ElementType/Dimensions` on result buffers;
+dtype comes from the buffer table.
+
 ## Const pool (n_consts entries)
 
 `{ buffer_id u32, byte_len u32, data[byte_len] }`, each entry padded to 8B. Uploaded into the
