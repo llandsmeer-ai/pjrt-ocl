@@ -62,6 +62,20 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     emitted by Python for now.
   - ❌ Hand-written textual-MLIR parser — fragile across JAX/MLIR versions, can't read
     bytecode/VHLO artifacts.
+  - ✅ **VALIDATED 2026-07-14** (`poc/03-python-lowering`): full chain serialize → subprocess
+    `lower_service.py` → VMProgram → numpy reference interpreter == `jax.jit` exactly (atol=0).
+    Subprocess cost 0.14 s. Headline facts (detail: `poc/03-python-lowering/research.md`):
+    - `PJRT_Client_Compile` receives `PJRT_Program{format:"mlir"}` whose code is a **VHLO
+      portable artifact** (MLIR bytecode, producer `StableHLO_vX.Y.Z`); `compile_options` is a
+      serialized `xla.CompileOptionsProto`. jax python passes the live module; jaxlib C++ does
+      the serialization (`xla::Serialize` → `serializePortableArtifact`).
+    - Version negotiation: plugin should advertise `stablehlo_current_version` (int64[3]) in
+      `PJRT_Plugin_Attributes`; client targets min(plugin, client). Without it: 12-week window
+      (1.13.7 on this jaxlib; current 1.17.0). `deserialize_portable_artifact` auto-upgrades.
+    - ⚠️ `serialize_portable_artifact` MUTATES its input module to VHLO in place — clone first
+      (bytecode roundtrip) or you corrupt jax's cached lowering in same-process tooling.
+    - Artifact bytes embed python-traceback locations ⇒ not stable across call sites; any
+      compile cache must key on semantics, not bytes.
 
 ## 3. Kernel strategy
 
