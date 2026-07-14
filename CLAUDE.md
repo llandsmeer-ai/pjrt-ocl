@@ -1,0 +1,159 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project goal
+
+**pjrt-ocl**: a pip-installable PJRT plugin (python package `pjrt_ocl`) that lets JAX (and
+eventually PyTorch/XLA) execute on **any OpenCL-capable hardware**. Primary targets: **Intel Xe2,
+AMD MIxxx (CDNA), NVIDIA GPUs**. The OpenCL platform/device is **configurable** (env var
+`PJRT_OCL_DEVICE=<platform substring>[:<device index>]` + PJRT client-create options; default:
+first GPU, else first CPU). Development order: **CPU first via PoCL** (easier debugging, printf,
+sanitizers), then the local NVIDIA GPU, then other vendors. Do not publish to PyPI yet — the goal
+for now is "works end-to-end locally".
+
+Core design: programs are **not** compiled per-dispatch. At PJRT-compile time we lower StableHLO
+into a flat **bytecode** (a list of instructions referencing a fixed kernel/opcode table). At
+execute time a **device-side megakernel VM** (persistent OpenCL kernel, à la ThunderKittens)
+interprets that bytecode: a big opcode switch, cross-workgroup barriers between instructions.
+The OpenCL C kernel library is generic (shape-agnostic, strides as runtime args), compiled once
+per device at plugin init and cached as program binaries — the OpenCL compiler is never invoked
+on the hot path.
+
+## Architecture (the pipeline)
+
+```
+jax.jit(f)                                  [user]
+  → StableHLO (serialized MLIR)             [JAX/XLA does this]
+  → PJRT_Client_Compile                     [our plugin: hand-rolled PJRT C API impl]
+      → parse via linked MLIR+StableHLO libs (CMake-built LLVM)
+      → (later) our own MLIR "vm" dialect as lowering target
+      → lowering: buffer assignment + instruction selection
+      → VMProgram { const pool, buffer plan, instr list }   ← the "bytecode"
+  → PJRT_LoadedExecutable_Execute
+      → upload instr list once; enqueue vm.cl megakernel
+      → device VM: for(pc..){ switch(op){...}; global_barrier(); }
+```
+
+Key properties of the execution model:
+- **Strictly linear bytecode — no jumps/branches, ever.** StableHLO itself has no jump ops (all
+  control flow is structured regions: `while`, `if`, `case`, and region-carrying ops like
+  `reduce`/`sort` — see docs/stablehlo-notes.md). Region ops lower to a single instruction whose
+  operands reference **nested instruction lists**; the VM interprets a `while` instruction by
+  alternately running the cond sub-list and body sub-list. Sub-lists are themselves linear.
+- The VM launches with a **fixed grid sized to device residency** (persistent threads); every
+  instruction internally uses grid-stride loops over its logical iteration space.
+- Cross-workgroup barrier between instructions is the hardest portability risk (see docs/decisions.md).
+  Fallback plan B (keep viable at all times): the same bytecode interpreted by a host-side loop of
+  `clEnqueueNDRangeKernel` calls. Design the bytecode format to be interpretable both ways.
+
+## Hard rules
+
+- **PoC-first**: every risky mechanism gets a minimal standalone proof-of-concept under `poc/NN-name/`
+  before being integrated. Never integrate unproven mechanisms into the main tree.
+- **Decision log**: `docs/decisions.md` is a decision tree. Every design exploration gets an entry:
+  what was tried, what failed (with the actual error/measurement), what was chosen and why.
+  Update it in the same session as the exploration — this is the project's institutional memory.
+- **Portability discipline**: core VM and kernel library use OpenCL 3.0-core features only
+  (target the 1.2-ish common subset; feature-detect at init). No vendor extensions in the core
+  path — vendor-specific tuning goes behind the kernel-table override mechanism. Never assume fp64.
+- `docs/` holds distilled references (PJRT API notes, StableHLO op semantics, OpenCL memory-model
+  notes). When you burn >15 min figuring out an external API fact, write it down there.
+
+## Environment facts (verified 2026-07-14)
+
+- Two OpenCL platforms available (`clinfo -l`): NVIDIA CUDA (RTX PRO 6000 Blackwell Max-Q) and
+  PoCL (AMD Ryzen 9 3900X CPU, `pocl-opencl-icd`). **Develop and test on PoCL first** — printf,
+  host debuggers and sanitizers work there — then validate on NVIDIA. The NVIDIA ICD had to be
+  registered manually: `/etc/OpenCL/vendors/nvidia.icd` containing `libnvidia-opencl.so.1`.
+- `sudo` available without password. Python 3.12.3, CMake, gcc/g++/clang, ninja NOT yet installed.
+- `opencl-headers` + `ocl-icd-opencl-dev` + `clinfo` installed. JAX not yet installed — when
+  installing, pin the version in `pyproject.toml` and record the matching PJRT C API version in
+  `docs/decisions.md` (the plugin must report a compatible `PJRT_Api` version).
+- LLVM/MLIR + stablehlo must be built from source via CMake (one-time ~1h build). Build them
+  **outside** the repo (e.g. `~/third_party/`) and point CMake at the install dirs; document exact
+  commits in `docs/decisions.md`.
+
+## Planned repo layout
+
+```
+pjrt_plugin/           C++ plugin: PJRT C API impl, MLIR ingest, lowering, OpenCL runtime
+  pjrt/                hand-rolled PJRT C API surface (client/device/buffer/executable)
+  lowering/            stablehlo → VMProgram (later: our MLIR vm dialect)
+  runtime/             OpenCL context/queue/allocator, binary cache, VM launcher
+  kernels/             vm.cl megakernel + generic op library (OpenCL C)
+python/pjrt_ocl/       python package: jax_plugins entry point, discovery + packaging
+poc/                   numbered standalone proof-of-concepts (each with its own README)
+tests/                 pytest, comparing against JAX CPU backend
+docs/                  decisions.md (decision tree), reference notes
+```
+
+## Commands
+
+(These are the contract; keep them working as the code appears.)
+
+- Configure/build plugin: `cmake -S . -B build -G Ninja && cmake --build build`
+- Build+run a PoC: `cmake --build build --target poc-NN && ./build/poc/NN-name/poc-NN`
+- C++ unit tests: `ctest --test-dir build`
+- Python e2e tests: `pytest tests/` (needs `pip install -e python/` once packaging exists)
+- Smoke test JAX sees us: `JAX_PLATFORMS=opencl python -c "import jax; print(jax.devices())"`
+- Select OpenCL backend: `PJRT_OCL_DEVICE="Portable"` (PoCL CPU) / `PJRT_OCL_DEVICE="NVIDIA"` —
+  platform-name substring, optional `:<device index>`
+- Inspect what JAX will hand us: `python tools/dump_stablehlo.py "<jax expr>"` (write this tool early;
+  `jax.jit(f).lower(args).compiler_ir('stablehlo')` is the API)
+- OpenCL sanity: `clinfo -l`
+
+## Milestones
+
+Work through these in order; each has an explicit exit criterion. Details/status live in
+`docs/roadmap.md` once created.
+
+- **M0 – PoCs for the three risky mechanisms (parallelizable, standalone):**
+  - `poc/01-device-vm`: pure OpenCL persistent megakernel interpreting a hand-written instruction
+    list (add/mul on buffers). Must prove: opcode switch dispatch, grid-stride execution,
+    **cross-workgroup barrier via atomics** (acquire/release on global mem), residency-limited
+    launch sizing. Bring it up on PoCL first, then validate on NVIDIA. Measure per-instruction
+    overhead vs separate kernel launches. This PoC decides whether device-VM survives or we fall
+    back to plan B.
+  - `poc/02-pjrt-skeleton`: minimal .so implementing just enough PJRT C API (from a vendored
+    `pjrt_c_api.h`) that `jax.devices()` lists our device. This tests the "hand-rolled C API vs
+    XLA C++ wrappers" question — expect friction; record every unimplemented-callback crash in
+    the decision log before considering the XLA-wrapper route.
+  - `poc/03-stablehlo-parse`: standalone CMake binary linking MLIR+StableHLO that parses a
+    JAX-dumped module (bytecode and textual) and prints ops/types/shapes.
+- **M1 – Bytecode + lowering:** define `VMProgram` serialization (opcode enum, operand/buffer
+  refs, launch geometry); implement stablehlo→bytecode for elementwise f32 ops + constants;
+  static buffer plan (arena + offsets, SSA liveness for reuse).
+- **M2 – End-to-end:** `jax.jit(lambda a,b: a+b)` produces correct results on the GPU through the
+  real plugin. Buffer H2D/D2H, `PJRT_Client_Compile` → `Execute` wired to the VM. Exit criterion:
+  pytest comparing against CPU backend passes.
+- **M3 – Op coverage:** broadcast(-in-dim), reshape/transpose (as strided views where possible),
+  reductions, dot_general (naive tiled matmul first), select, compare, convert. Grow pytest
+  coverage per-op; property-test against CPU backend with random shapes.
+- **M4 – Control flow:** `while`/`if`/`case` as instructions referencing nested instruction
+  lists; scalar condition read on device between sub-list runs. No jumps — linear lists all the
+  way down. This is where the device-VM design must prove its worth.
+- **M5 – Hardening & perf:** dtype matrix (f16/bf16 where supported, int32/64, bool), buffer
+  donation, binary cache keyed by (device, driver), per-op profiling hooks, kernel-table overrides
+  for tuned matmul. Then: try Intel Xe2 / AMD via CI or remote access (not available locally).
+
+## Technical notes / gotchas
+
+- **PJRT C API**: single self-contained header in openxla/xla (`xla/pjrt/c/pjrt_c_api.h`) — vendor
+  it with the commit hash recorded. JAX discovers plugins via a `jax_plugins` entry point in
+  `pyproject.toml` (preferred) whose module exposes `initialize()` calling
+  `xla_bridge.register_plugin('opencl', priority=500, library_path=...)`. Mind
+  `PJRT_Api.pjrt_api_version` — jaxlib refuses mismatched versions (no ABI stability yet).
+  Distilled integration notes: `docs/pjrt-integration.md`
+  (source: https://openxla.org/xla/pjrt/pjrt_integration).
+- **Global barrier in OpenCL**: there is no portable grid-wide barrier primitive. The known-viable
+  pattern is persistent threads + atomic arrival counter + seq_cst/acq_rel atomics on `global`
+  memory — but it is only safe when all workgroups are co-resident, so launch size must come from
+  occupancy queries, not problem size. Validate on each vendor; this is the project's #1 risk.
+- **OpenCL C has no function pointers** — the VM's dispatch is a switch over opcodes in one
+  translation unit. Watch compile time / register pressure as the op library grows; mitigation is
+  splitting into multiple VM kernels by op family (each still handles instruction *ranges*).
+- **StableHLO versioning**: JAX serializes portable "VHLO" artifacts; use stablehlo's
+  deserialization API rather than parsing raw MLIR from a mismatched version.
+- **JAX defaults to f32** (x64 disabled) — convenient, since fp64 is absent on Intel Xe2 consumer
+  parts. Don't gate anything on fp64.
