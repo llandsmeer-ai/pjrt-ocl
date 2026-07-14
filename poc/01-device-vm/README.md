@@ -23,6 +23,8 @@ Env knobs: `OCL_PLATFORM`, `VM_GROUPS`, `VM_LOCAL`, `VM_STRESS`, `VM_BENCH_N`, `
 2. **barrier stress**: chains of `REVADD` ping-pongs — every instruction has a cross-workgroup
    data dependency on the previous one; a single missed/broken barrier corrupts the result.
 3. **overhead**: K adds executed inside the VM vs K separate `clEnqueueNDRangeKernel` launches.
+4. **nested while**: 2-deep `OP_WHILE` (nested instruction lists + frame stack, no jumps);
+   3×4 loop doubling a 64k vector with scalar loop counters, checked exactly.
 
 ## Results (2026-07-14)
 

@@ -16,6 +16,12 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     interpreted by the VM.
     - ❌ pc-manipulation/jumps in bytecode — rejected: user prefers stupid-linear execution;
       nothing in StableHLO needs it.
+    - ✅ **Nested-list control flow VALIDATED 2026-07-14** (`poc/01` test4): `OP_WHILE` with
+      cond/body sub-list refs + explicit frame stack in the interpreter; 2-deep nesting passes on
+      PoCL + NVIDIA.
+      - ⚠️ **Lesson**: the cond scalar MUST be read with `atomic_add(p,0)` — a plain load hit
+        stale per-SM cache on NVIDIA, diverged the workgroups' loop decision, and deadlocked the
+        barrier (PoCL was fine). Rule: uniform-control-flow values are always read atomically.
   - ✅ **Cross-workgroup barrier — VALIDATED 2026-07-14** (`poc/01-device-vm`): Xiao&Feng-style
     arrival counter + phase flag with OpenCL **1.2** atomics passes correctness + 2000-instr
     dependency stress on both PoCL (24 grp) and NVIDIA (188 grp, ~1.1 µs/barrier). Megakernel vs

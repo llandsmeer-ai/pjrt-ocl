@@ -26,6 +26,15 @@
 - `VM_LOCAL=64` untuned; tune later (likely 128–256 on GPUs).
 - Instruction fetch: every work-item reads the instr struct from global memory each step — fine at
   µs scale; could broadcast via local memory later.
-- Not yet in the PoC: nested instruction lists for `while`/`if` (the instr struct + interpreter
-  loop trivially extend: an instruction whose operands are program offsets; cond scalar read from
-  arena by all work-items after a barrier).
+## Control flow (added after initial validation)
+
+- `OP_WHILE` implemented as nested (linear) instruction lists driven by an explicit frame stack
+  in the interpreter (MAX_DEPTH 8, all work-items converged). Nested 2-deep while (3×4 loop
+  doubling a 64k vector + scalar counters) passes on PoCL and NVIDIA. No jumps anywhere.
+- **PORTABILITY BUG FOUND & FIXED**: reading the loop-condition scalar with a plain load hung
+  NVIDIA (worked on PoCL). Cause: plain global loads can hit stale per-CU caches (NVIDIA L1 is
+  not coherent across SMs), so workgroups DIVERGED on the loop-exit decision → barrier deadlock.
+  Fix: read the cond scalar with `atomic_add(ptr, 0)` (atomics bypass L1).
+  **Rule for the real VM: any value that steers uniform control flow must be read atomically.**
+  (Corollary: cond values are compared as bits, nonzero=true; producers must write exactly
+  1.0f/0.0f — beware that -0.0f bits are nonzero.)

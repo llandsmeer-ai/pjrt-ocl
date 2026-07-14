@@ -23,7 +23,8 @@ typedef struct {
     cl_uint op, dst, a, b, n, imm, pad0, pad1;
 } instr_t;
 
-enum { OP_NOP = 0, OP_ADD, OP_MUL, OP_SUB, OP_FILL, OP_IOTA, OP_REVADD };
+enum { OP_NOP = 0, OP_ADD, OP_MUL, OP_SUB, OP_FILL, OP_IOTA, OP_REVADD,
+       OP_LTS, OP_WHILE };
 
 static double now_ms(void)
 {
@@ -124,17 +125,18 @@ int main(void)
     cl_uint n_instr = 0;
 #define EMIT(...) do { prog[n_instr++] = (instr_t){__VA_ARGS__}; } while (0)
 
-    /* run helper */
-    void run_vm(cl_uint count) {
-        CHK(clEnqueueWriteBuffer(q, progbuf, CL_TRUE, 0, count * sizeof(instr_t), prog, 0, NULL, NULL), "write prog");
+    /* run helper: `total` instrs uploaded, main (root) list = first `main_count` */
+    void run_vm2(cl_uint main_count, cl_uint total) {
+        CHK(clEnqueueWriteBuffer(q, progbuf, CL_TRUE, 0, total * sizeof(instr_t), prog, 0, NULL, NULL), "write prog");
         clSetKernelArg(kvm, 0, sizeof arena, &arena);
         clSetKernelArg(kvm, 1, sizeof progbuf, &progbuf);
-        clSetKernelArg(kvm, 2, sizeof count, &count);
+        clSetKernelArg(kvm, 2, sizeof main_count, &main_count);
         clSetKernelArg(kvm, 3, sizeof barbuf, &barbuf);
         clSetKernelArg(kvm, 4, sizeof ngroups, &ngroups);
         CHK(clEnqueueNDRangeKernel(q, kvm, 1, NULL, &gsz, &lsz, 0, NULL, NULL), "enqueue vm");
         CHK(clFinish(q), "finish vm");
     }
+    void run_vm(cl_uint count) { run_vm2(count, count); }
 
     /* =========== test 1: correctness of a small linear program ========= */
     /* b0=iota(N); b1=fill(2.0); b2=b0*b1; b3=b2-b0; b4=rev(b3)+b0 */
@@ -212,6 +214,45 @@ int main(void)
     double t_launch = now_ms() - t0;
     printf("test3 overhead: %u x add(%u elems)\n  vm megakernel: %.1f ms (%.1f us/op)\n  %u launches:   %.1f ms (%.1f us/op)\n  ratio: %.2fx\n",
            BK, BN, t_vm, 1e3 * t_vm / BK, BK, t_launch, 1e3 * t_launch / BK, t_launch / t_vm);
+
+    /* =========== test 4: nested while via nested instruction lists ===== */
+    /* x = iota(N); for io in 0..3: for jo in 0..4: x += x  =>  x[j] = j*2^12 */
+    {
+        const cl_uint x = 0;
+        const cl_uint io = N, ko = N + 1, ki = N + 2, one = N + 3;
+        const cl_uint jo = N + 4, co = N + 5, ci = N + 6;
+        union { float f; cl_uint u; } f0 = {.f = 0.0f}, f1 = {.f = 1.0f},
+                                      f3 = {.f = 3.0f}, f4 = {.f = 4.0f};
+        n_instr = 0;
+        /* main list [0..6) */
+        EMIT(OP_IOTA, x, 0, 0, N, 0);
+        EMIT(OP_FILL, io, 0, 0, 1, f0.u);
+        EMIT(OP_FILL, ko, 0, 0, 1, f3.u);
+        EMIT(OP_FILL, ki, 0, 0, 1, f4.u);
+        EMIT(OP_FILL, one, 0, 0, 1, f1.u);
+        EMIT(OP_WHILE, co, 6, 1, 7, 3);          /* cond=[6,7) body=[7,10) */
+        /* outer cond [6] */
+        EMIT(OP_LTS, co, io, ko, 1, 0);
+        /* outer body [7..10) */
+        EMIT(OP_FILL, jo, 0, 0, 1, f0.u);
+        EMIT(OP_WHILE, ci, 10, 1, 11, 2);        /* cond=[10,11) body=[11,13) */
+        EMIT(OP_ADD, io, io, one, 1, 0);
+        /* inner cond [10] */
+        EMIT(OP_LTS, ci, jo, ki, 1, 0);
+        /* inner body [11..13) */
+        EMIT(OP_ADD, x, x, x, N, 0);
+        EMIT(OP_ADD, jo, jo, one, 1, 0);
+        run_vm2(6, n_instr);
+
+        CHK(clEnqueueReadBuffer(q, arena, CL_TRUE, x * 4, N * 4, out, 0, NULL, NULL), "read");
+        float scal[2];
+        CHK(clEnqueueReadBuffer(q, arena, CL_TRUE, io * 4, 8, scal, 0, NULL, NULL), "read io");
+        bad = 0;
+        for (cl_uint i = 0; i < N; i++)
+            if (out[i] != (float)i * 4096.0f) bad++;
+        if (scal[0] != 3.0f) bad++;
+        printf("test4 nested while: %s (%d bad; io=%g want 3)\n", bad ? "FAIL" : "PASS", bad, scal[0]);
+    }
 
     printf("done\n");
     return bad ? 1 : 0;
