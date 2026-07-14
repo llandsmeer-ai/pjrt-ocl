@@ -484,6 +484,30 @@ int main(void) {
         printf("E skipped (need >= 8 lanes)\n");
     }
 
+    /* ===== BENCH_MMA=<M>: matmul throughput via async engine ===== */
+    if (envi("BENCH_MMA", 0) && nlanes >= 8) {
+        const cl_uint M = (cl_uint)envi("BENCH_MMA", 1024);
+        const cl_uint A = 4u << 20, B = A + M * M, C = B + M * M;
+        for (cl_uint i = 0; i < M * M; i++) h[i] = (float)((int)(i % 7) - 3);
+        wr(A, h, M * M); wr(B, h, M * M);
+        const cl_uint tiles = (M / MMA_T) * (M / MMA_T);
+        double best = 1e30;
+        for (int rep = 0; rep < 5; rep++) {
+            streams_clear();
+            cl_uint tmm = add_task((task_t){T_MMA, C, A, B, M, M, M});
+            for (cl_uint l = 0; l < nlanes; ++l) {
+                cl_uint lo = (cl_uint)((unsigned long long)tiles * l / nlanes);
+                cl_uint hi = (cl_uint)((unsigned long long)tiles * (l + 1) / nlanes);
+                if (lo < hi) emit(l, (entry_t){tmm, lo, hi, FLAG_NONE, 0, FLAG_NONE});
+            }
+            double ms = run_async();
+            if (ms < best) best = ms;
+        }
+        double gflop = 2.0 * M * M * M / 1e9;
+        printf("BENCH MMA %ux%ux%u: %.2f ms best-of-5 = %.1f GFLOP/s\n",
+               M, M, M, best, gflop / (best / 1e3));
+    }
+
     printf("%s\n", total_bad ? "SOME TESTS FAILED" : "ALL PASS");
     return total_bad ? 1 : 0;
 }
