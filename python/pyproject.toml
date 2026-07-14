@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pjrt-ocl"
+version = "0.1.0"
+description = "JAX PJRT plugin executing StableHLO on OpenCL devices via a device-side bytecode VM"
+readme = "NOTES.md"
+requires-python = ">=3.10"
+# Only what the lowering subprocess + registration actually import. jaxlib comes
+# with jax; the versions are pinned by the host env (we develop against jax 0.10.2),
+# not here — a plugin must not fight the environment's jax pin. No other deps allowed.
+dependencies = [
+    "jax",
+    "numpy",
+]
+
+[project.entry-points.'jax_plugins']
+opencl = 'pjrt_ocl'
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pjrt_ocl*"]
