@@ -101,6 +101,19 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     makes each new jax version/feature self-diagnosing.
   - 🅱️ XLA C++ wrapper route (`pjrt_c_api_wrapper_impl.h`, full Bazel build) — retired unless the
     async Event contract proves intractable by hand.
+  - ✅ **M2 e2e VALIDATED 2026-07-14**: `jax.jit((a+b)*a)` == numpy exactly on NVIDIA + PoCL via
+    the full stack (compile → lowering subprocess → VMProgram → megakernel). Multi-output,
+    chained calls, identity/output-aliasing, 2D all pass. New CHECK-crash contracts found at M2
+    (both now implemented): `PJRT_LoadedExecutable_AddressableDeviceLogicalIds`,
+    `PJRT_LoadedExecutable_GetDeviceAssignment` (wants a serialized xla.DeviceAssignmentProto —
+    hand-encoded 9 protobuf bytes for the 1×1 case). `PJRT_Executable_OptimizedProgram` +
+    `PJRT_Device_MemoryStats` + `PJRT_Client_TopologyDescription` errors are tolerated by jax.
+    Events pre-signaled (fully synchronous v1) worked without incident — the feared async Event
+    contract never materialized for single-device jit.
+  - ⚠️ Once the .so exists at the default path, plugin discovery makes EVERY `import jax` in the
+    venv use our backend (priority 500 > cpu 400): pure-lowering tests must pin
+    `JAX_PLATFORMS=cpu` before importing jax; eager jax ops (even `jnp.arange`) compile through
+    the plugin, so eager coverage == jit coverage.
 
 ## 4b. jax/PJRT version pin
 

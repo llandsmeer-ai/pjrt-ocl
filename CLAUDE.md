@@ -86,6 +86,10 @@ Key properties of the execution model:
 - `opencl-headers` + `ocl-icd-opencl-dev` + `clinfo` + `ninja-build` installed.
 - **jax 0.10.2 / jaxlib 0.10.2** in `.venv/` (project venv; use `.venv/bin/python` for everything
   Python). Record the matching PJRT C API version in `docs/decisions.md` once known.
+- **The root overlay `/` is FULL (0 bytes, host-side growth — not ours).** ALWAYS
+  `. ./env.sh` first: it pins POCL_CACHE_DIR / CUDA_CACHE_PATH / PIP_CACHE_DIR / TMPDIR onto the
+  project mount. Symptom of forgetting: PoCL "CL_OUT_OF_HOST_MEMORY … failed to build the
+  program" (= its kernel-cache tempfile write failed, not RAM).
 - **Only 32 GB RAM** — large C++ builds OOM this machine (user has seen it with XLA). If the
   LLVM/XLA fallback is ever exercised: cap link parallelism (`ninja -j8`,
   `-DLLVM_PARALLEL_LINK_JOBS=2`, lld, no LTO) and watch `free -g` during any big build. Also
@@ -129,10 +133,10 @@ docs/                  decisions.md (decision tree), reference notes
 
 ## Milestones
 
-Work through these in order; each has an explicit exit criterion. Details/status live in
-`docs/roadmap.md` once created.
+Work through these in order; each has an explicit exit criterion.
+**Status 2026-07-14: M0 ✅  M1 ✅  M2 ✅ — next: M3.**
 
-- **M0 – PoCs for the three risky mechanisms (parallelizable, standalone):**
+- **M0 ✅ – PoCs for the three risky mechanisms (parallelizable, standalone):**
   - `poc/01-device-vm`: pure OpenCL persistent megakernel interpreting a hand-written instruction
     list (add/mul on buffers). Must prove: opcode switch dispatch, grid-stride execution,
     **cross-workgroup barrier via atomics** (acquire/release on global mem), residency-limited

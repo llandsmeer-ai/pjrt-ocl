@@ -17,6 +17,12 @@ import zlib
 import numpy as np
 import pytest
 
+# These tests exercise LOWERING against the CPU backend. Once libpjrt_ocl.so
+# is built, jax's plugin discovery would otherwise route tracing through the
+# plugin itself (priority 500 > cpu). Must be set before jax is imported, and
+# propagated to subprocess tests via os.environ.
+os.environ["JAX_PLATFORMS"] = "cpu"
+
 import pjrt_ocl
 import pjrt_ocl.lowering as L
 import pjrt_ocl.vmreader as R
@@ -287,7 +293,11 @@ def test_empty_stdin_exit3_json():
 
 
 def test_initialize_without_plugin_so_does_not_crash_jax():
-    env = {k: v for k, v in os.environ.items() if k != "PJRT_OCL_PLUGIN_PATH"}
+    env = {k: v for k, v in os.environ.items() if k != "JAX_PLATFORMS"}
+    # Point discovery at a nonexistent .so: initialize() must skip gracefully
+    # and jax must fall back to cpu (regardless of whether the real plugin is
+    # built at the default path).
+    env["PJRT_OCL_PLUGIN_PATH"] = "/nonexistent/libpjrt_ocl.so"
     code = (
         "import jax, pjrt_ocl\n"          # jax import runs plugin discovery
         "pjrt_ocl.initialize()\n"          # explicit call must also be safe
@@ -297,8 +307,7 @@ def test_initialize_without_plugin_so_does_not_crash_jax():
                           text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     assert "cpu" in proc.stdout
-    if not os.path.isfile(pjrt_ocl._default_plugin_path()):
-        assert "skipping registration" in proc.stderr  # graceful, logged
+    assert "skipping registration" in proc.stderr  # graceful, logged
 
 
 # ---------------------------------------------------------------------------
