@@ -100,3 +100,17 @@ Goal: measure per-tick occupancy so idle lanes are visible, not assumed away.
 correct; (b) matmul as MMA tiles (local memory) — correct vs host; (c) reduce as
 partials+combine across ticks — correct; (d) calibration µbench + cost-aware vs naive packing —
 measured bubble % improves; (e) perf vs serial megakernel and streamed launches on a wide graph.
+
+## Ceiling assessment (2026-07-14, "does anything block cuBLAS-class perf?")
+
+- Architecture: NO blocker — persistent-lane tile ranges ≡ CUTLASS stream-K structure;
+  interpreter overhead amortizes to ~0.
+- Ceiling 1 (engineering): one binary per launch ⇒ fattest tile-op's registers/local tax all
+  lanes. Mitigation: typed lanes as CONCURRENT kernel launches syncing via shared atomic flags.
+  🔬 needs PoC: cross-kernel co-residency of spinning groups is driver-dependent.
+- Ceiling 2 (accept): no SASS/PTX access from OpenCL on NVIDIA ⇒ CLBlast-class 40–70% of SIMT
+  peak is the realistic target (cuBLAS ~85–90%).
+- Ceiling 3 (fundamental): matrix units unreachable from OpenCL on NVIDIA (tensor cores) and
+  AMD (MFMA); Intel exposes cl_intel_subgroup_matrix_multiply_accumulate. SIMT fp32 rate is our
+  matmul ceiling ⇒ ~4–8x behind tensor-core TF32/BF16 on matmul-heavy ML on NVIDIA. Per-vendor
+  escape hatches = marked future branches.
