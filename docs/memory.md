@@ -55,9 +55,14 @@ needs shapes ⇒ dynamism = "when is the memory plan evaluated?".
   `PJRT_Buffer_DynamicDimensionIndices`): allocate at bounds, actual size lives in a scalar arena
   slot, instructions read `n` from arena (flag bit / twin opcodes — grid-stride doesn't care;
   size scalars read atomically like while-conds). Real lowering work, no architectural change.
-- **L3 (🧭 research note only)**: unbounded data-dependent allocation. Fights the pre-planned
-  arena; a device-side bump allocator over a heap region is *expressible* (offsets are integers)
-  but dealloc/compaction is ugly. Nothing in jax needs it.
+- **L3 (🧭 north star, per user 2026-07-14)**: unbounded data-dependent allocation, reallocation
+  and data-dependent reshaping on device. The user anticipates a JAX-successor that needs this —
+  keep the door open but do NOT force the design around it. Door-keeping that costs nothing now:
+  offsets-as-integers already makes a device-side bump/heap allocator *expressible* in the VM
+  (descriptor slots holding offsets); keep instruction operands indirectable (the L2 "n from a
+  scalar slot" mechanism generalizes to "offset from a descriptor slot"); keep the arena one flat
+  allocation rather than fragmenting into per-tensor cl_mems inside the VM. Dealloc/compaction
+  remains the open hard problem — revisit when the successor's semantics are concrete.
 
 Rule of thumb: recompile-per-shape through M3; make format v2 L1-ready (sizes as expressions);
 never attempt shape-varying while carried values (StableHLO forbids them anyway).

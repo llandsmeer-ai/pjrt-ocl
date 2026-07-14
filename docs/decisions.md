@@ -118,6 +118,23 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
   - 🔬 jaxlib ↔ PJRT C API version matching is strict (no ABI guarantee yet): pin JAX and record the
     `PJRT_Api` major/minor we build against.
 
+## 5b. Python package (M1, merged 2026-07-14)
+
+- ✅ `python/pjrt_ocl` implements VMProgram v1 exactly (golden byte-layout test); 14/14 pytest.
+  Options dict to C++: `python_exe`, `lower_service`; exit codes 0/2(unsupported)/3(internal).
+- ⚠️ **No COPY opcode in v1** ⇒ returning an argument/constant lowers as output-map ALIASING of
+  the producing buffer id; the executor must tolerate output regions == input/const regions.
+- ⚠️ **FMA divergence**: XLA CPU contracts `a*b-c` under jit (no flag disables it; three tried) ⇒
+  bit-exact comparisons vs jax.jit need integer-valued f32; real-valued data compares vs EAGER
+  jax. Policy applies to all future e2e tests.
+- 🧭 Splat constants currently expand into the const pool; FILL_F32 lowering is a follow-up.
+
+## 5c. Dynamic memory north star (user, 2026-07-14)
+
+- User anticipates a JAX-successor with fully dynamic device memory (realloc + data-dependent
+  reshape). Direction: keep the door open, do NOT force the design. See docs/memory.md L0–L3
+  spectrum; cheap door-keeping = indirectable operands + flat-arena discipline.
+
 ## 6. Naming
 
 - ✅ **pjrt-ocl** (python package `pjrt_ocl`, JAX platform name `opencl`) — picked from user's
