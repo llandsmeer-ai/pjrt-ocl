@@ -25,6 +25,27 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     loops (validated, kept in tree; routing marked segments through it is a later optimization).
   - Note: the user's ORIGINAL brief said "a series of kernel dispatches, from a simple bytecode"
     — the megakernel detour is preserved below for the record.
+- ✅ **SUPERSEDING DESIGN 2026-07-14 (user-proposed, agreed): tick-synchronous VLIW-style VM**
+  — see docs/tile-isa.md, the spec of record. GPU as spatially-partitioned VLIW machine:
+  persistent lane-interpreters (≈1–4/CU), schedule table (ticks × lanes) assigns DIFFERENT ops
+  to DIFFERENT lanes in the same tick; tick boundary = validated barrier; control flow =
+  uniform tick-range jumps (atomic cond reads). Independent ops run spatially parallel entirely
+  on device — no host in the loop. Prior art: Mirage Persistent Kernel / Hazy megakernels.
+  - ✅ **Three-layer split** (user + analysis): tensor bytecode stays the portable ISA;
+    per-device schedule compile derives task descriptors (one per op, tiles NEVER materialized
+    as instructions — cells reference tile RANGES) + schedule table. Tile-op vocabulary is the
+    execution opset (EW_TILE/MMA_TILE/REDUCE_PARTIAL+COMBINE/GATHER_TILE/FUSED_TILE-reserved).
+    Rationale: uniform tile costs make tick packing tractable; tile residency unlocks fusion;
+    bytecode stays compact/device-neutral/symbolic-friendly (L1 dynamic shapes recompiles only
+    the µs schedule layer).
+  - ✅ **Cost model is MEASURED, not assumed** (user requirement): first-run µbenchmark per
+    device → per-tile-op costs cached (device+driver key); LPT packing uses them.
+  - ✅ **Instrumentation is a spec-level feature** (user requirement): logical-clock ranks
+    (portable) + kernel-clock/event-profiling modes; bubble % reported under
+    PJRT_OCL_VM_STATS=1; goal = prove execution units stay occupied, enable profile-guided
+    re-packing.
+  - Streamed-launch engine (above) remains the second engine behind the same bytecode;
+    honest-benchmark referee decides per segment class. → `poc/04-vliw-vm`
 
 ### 1-old. Megakernel era (historical, still true for the segment engine)
 
