@@ -38,8 +38,12 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
 ## 2. StableHLO ingestion
 
 - ❌ **Link MLIR + StableHLO C++ libs, built via CMake** — was the plan (user decision 2026-07-14),
-  **killed by evidence 2026-07-14**: this machine has only ~4.8 GB free disk (host-shared overlay,
-  nothing cleanable); an LLVM+MLIR build needs 20–40 GB. Also checked prebuilt escape hatches:
+  dropped 2026-07-14. Original trigger was a disk scare that turned out WRONG (I measured the
+  root overlay, ~3 GB free; `/home/ubuntu/project` is a separate mount with ~445 GB — user
+  corrected this). The pivot stands anyway on merits: python lowering is version-matched to JAX,
+  no LLVM rebuild per JAX upgrade, hackable compile logic. C++ MLIR build (in `third_party/`
+  inside the project mount) is a VIABLE fallback again, e.g. for a future C++ `vm` dialect.
+  Prebuilt escape hatches checked and still dead:
   - ❌ Link jaxlib's bundled MLIR: `libjax_common.so` (334 MB, contains all of MLIR+StableHLO)
     exports only 27 dynamic symbols — Python module init wrappers; the MLIR C API is hidden.
     Verified with `nm -D` 2026-07-14. Not linkable.

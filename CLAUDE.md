@@ -86,9 +86,12 @@ Key properties of the execution model:
 - `opencl-headers` + `ocl-icd-opencl-dev` + `clinfo` + `ninja-build` installed.
 - **jax 0.10.2 / jaxlib 0.10.2** in `.venv/` (project venv; use `.venv/bin/python` for everything
   Python). Record the matching PJRT C API version in `docs/decisions.md` once known.
-- **Only ~5 GB free disk** (host-shared overlay; not cleanable). This killed the build-LLVM plan —
-  see docs/decisions.md §2. Do NOT start large source builds; lowering uses jaxlib's bundled
-  StableHLO python bindings instead.
+- **Disk layout matters**: `/home/ubuntu/project` is its own mount with ~445 GB free — big builds
+  are fine if kept INSIDE the project dir (use `third_party/` here, gitignored). The root overlay
+  `/` (which backs `~`, `~/.cache`, `/tmp`, apt) has only ~3 GB free — keep caches and large
+  downloads out of it (`pip install --cache-dir third_party/pip-cache`, etc.).
+- Lowering uses jaxlib's bundled StableHLO python bindings (see docs/decisions.md §2) — chosen for
+  JAX version-matching, not just the disk scare that originally triggered the pivot.
 
 ## Planned repo layout
 
