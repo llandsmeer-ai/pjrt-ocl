@@ -72,14 +72,28 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
 
 ## 4. PJRT layer
 
-- 🔬 **Hand-rolled PJRT C API** (vendored `pjrt_c_api.h`, no XLA source dep, CMake-only) — try this
-  FIRST (user preference), but user predicts it may fail; record every crash/unimplemented-callback
-  incident here before switching. → `poc/02-pjrt-skeleton`
-  - 🅱️ **XLA C++ wrapper route**: inherit `xla::PjRtClient` (cf. `tfrt_cpu_pjrt_client.h`), then
-    `pjrt::CreateWrapperClient` + `pjrt::CreatePjrtApi` via `pjrt_c_api_wrapper_impl.h`
-    (reference: `pjrt_c_api_cpu.cc`). Cost: full XLA Bazel build. See docs/pjrt-integration.md.
-  - Mandatory C API surface per openxla docs: `GetPjRtApi`, `PJRT_Client_Create`;
-    optional: `PJRT_Plugin_Initialize`, `PJRT_Plugin_Attributes`, `PJRT_TopologyDescription_Create`.
+- ✅ **Hand-rolled PJRT C API — VALIDATED 2026-07-14** (`poc/02-pjrt-skeleton`): `jax.devices()`
+  returns our OclDevice on both NVIDIA and PoCL with ~650 lines of C++, one vendored header,
+  CMake+Ninja (~3 s build), zero XLA source dep. User's failure prediction did not materialize.
+  ~30 of 138 API entries suffice for device enumeration. Incident log (full detail in
+  `poc/02-pjrt-skeleton/NOTES.md`):
+  - jaxlib dlsym's **`GetPjrtApi`** (lowercase "rt"), not `GetPjRtApi` as some docs write.
+  - `PJRT_Error_ForEachPayload` must work from day one — stubbing it → infinite error recursion
+    → core dump (framework calls it on every error).
+  - `PJRT_Device_GetAttributes` returning UNIMPLEMENTED is a CHECK-crash (`LogFatalIfPjrtError`),
+    not catchable; empty attributes are fine. Expect more CHECK-crash (not error) contracts in
+    Compile/Execute/Event callbacks at M2 — implement those to spec, not as stubs.
+  - Keep the trick: every stub returns UNIMPLEMENTED **carrying its own callback name** —
+    makes each new jax version/feature self-diagnosing.
+  - 🅱️ XLA C++ wrapper route (`pjrt_c_api_wrapper_impl.h`, full Bazel build) — retired unless the
+    async Event contract proves intractable by hand.
+
+## 4b. jax/PJRT version pin
+
+- ✅ jax/jaxlib **0.10.2** ⇒ XLA pin via `third_party/xla/revision.bzl` at tag `jax-v0.10.2` ⇒
+  XLA commit `5a9e73cbd92530cac2ac36f4736a774b2412afe2` ⇒ **PJRT C API 0.112** (vendored at
+  `poc/02-pjrt-skeleton/vendor/pjrt_c_api.h`). Exact minor match ⇒ no ENABLE_PJRT_COMPATIBILITY
+  needed. Recipe documented for future bumps.
 
 ## 5. Python packaging / discovery
 
