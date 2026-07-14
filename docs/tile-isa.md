@@ -37,18 +37,33 @@ A lane derives tile coordinates from (descriptor, tile index) by divmod — tile
 materialized as instructions. Tile sizes are chosen per device at schedule-compile time;
 the tensor bytecode stays device-neutral.
 
-## Schedule table
+## Schedule artifact: PER-LANE INSTRUCTION STREAMS (model of record, user-corrected 2026-07-14)
 
-`cell[tick][lane] = { task_id | NOP, tile_lo, tile_hi }` — a lane executes tiles
-[tile_lo, tile_hi) of the task, serially, within the tick. Dependences are compiled into tick
-order: all tiles of a producer land in ticks strictly before any consumer tile (per-tile
-dependence/pipelining is a marked future refinement — Mirage-style events instead of ticks).
-Tick boundary = the validated inter-workgroup barrier (poc/01). Lanes = persistent workgroups,
-1–4 per CU, counts in the validated co-residency regime (≤ ~3× CUs, 256 threads).
+The scheduler emits **one linear bytecode stream per lane**. One megakernel launch with N
+workgroups; lane i interprets stream i at its own pace — **no global synchronization**.
 
-Control flow: tick-range jumps. All lanes read the cond scalar atomically after a tick barrier
-(poc/01 rule) and uniformly continue at the while/if sub-range. Nested, linear, no jumps —
-unchanged semantics, now over tick ranges.
+Stream entry: `{ task_id | NOP, tile_lo, tile_hi, wait_flag, wait_count, signal_flag }`
+- If `wait_flag != NONE`: atomic-poll `flags[wait_flag] >= wait_count` before executing
+  (the poc/01 atomic-read pattern; a waiting lane spins — co-residency required, as always).
+- Execute tiles [tile_lo, tile_hi) of the task serially.
+- If `signal_flag != NONE`: `atomic_add(&flags[signal_flag], tiles_done)`.
+
+Dependencies are per-op completion counters: each tensor op gets a flag; producers' lanes add
+their tile counts; a consumer entry waits for `flags[op] == n_tiles(op)`. Consumers start the
+moment their dependency is met — lanes pipeline past each other, imbalance absorbs across the
+program instead of costing max-lane per step. Per-TILE (finer than per-op) dependence counters
+are a marked refinement of the same mechanism.
+
+"Ticks" survive only as a scheduling heuristic (a mental level-structure for the packer) and as
+an optional lockstep debug mode (WAIT-ALL after every entry ≡ poc/04's validated tick barrier) —
+useful for deterministic replay and per-step profiling.
+
+Control flow: each lane's stream contains the same structured WHILE/IF entries (cond scalar read
+atomically; all lanes take identical control decisions — uniformity rule from poc/01); bodies
+are per-lane sub-streams. A control region acts as a natural all-lanes sync point (cond producer
+signals; all lanes wait it).
+
+Lanes = persistent workgroups, 1–4 per CU, 256 threads, validated co-residency regime.
 
 ## Cost model & calibration (hardware-dependent by design)
 

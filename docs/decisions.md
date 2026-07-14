@@ -46,6 +46,25 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     re-packing.
   - Streamed-launch engine (above) remains the second engine behind the same bytecode;
     honest-benchmark referee decides per segment class. → `poc/04-vliw-vm`
+  - ✅ **MODEL CORRECTION (user, 2026-07-14): per-lane bytecode streams, NOT global tick
+    lockstep.** Each lane owns a linear instruction stream; sync is point-to-point via per-op
+    completion counters (WAIT/SIGNAL entries, atomic polls). Lockstep ticks = degenerate case
+    (WAIT-ALL each entry), kept only as debug/profiling mode. Rationale: imbalance absorbs
+    program-wide instead of costing max-lane per tick; consumers pipeline behind producers;
+    equals Mirage MPK's event model. Spec updated (docs/tile-isa.md).
+    - ✅ Refinement (user): global sync EXISTS but is SCHEDULER-PLACED (BARRIER entries at
+      dataflow joins); cost model shapes per-lane work so arrivals coincide → bubbles mostly
+      absent by construction. Barrier arrival-rank instrumentation names the lane class to
+      unload (validated in test E: NVIDIA → mma last; PoCL → ew last. Same graph!).
+    - ✅ **Test E VALIDATED 2026-07-14 both platforms**: 4 lanes cooperating on 256³ matmul
+      while 184 (resp. 20) lanes run 8 EW ops as many small entries; one global barrier;
+      consumer phase. Correct + 0.58 ms NVIDIA / 13.3 ms PoCL.
+  - ✅ **poc/04 (lockstep variant) VALIDATED 2026-07-14** (NVIDIA + PoCL): spatial co-scheduling in one tick,
+    local-memory MMA tiles, cross-tick reduce — all correct; cost-aware packing 1.65x over
+    naive on NVIDIA. ⚠️ Same policy LOST (0.81x) on PoCL because naive 1-tile/lane calibration
+    is contaminated by ~20–30µs launch/barrier overhead (also why bubble% read >100). Fix
+    specced: multi-K slope fit per tile-op per device. EW:MMA cost ratio 0.9 (NVIDIA) vs 5.6
+    (PoCL) — user's measure-don't-assume requirement empirically confirmed.
 
 ### 1-old. Megakernel era (historical, still true for the segment engine)
 
