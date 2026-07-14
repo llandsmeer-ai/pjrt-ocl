@@ -127,15 +127,21 @@ Work through these in order; each has an explicit exit criterion. Details/status
 - **M2 – End-to-end:** `jax.jit(lambda a,b: a+b)` produces correct results on the GPU through the
   real plugin. Buffer H2D/D2H, `PJRT_Client_Compile` → `Execute` wired to the VM. Exit criterion:
   pytest comparing against CPU backend passes.
-- **M3 – Op coverage:** broadcast(-in-dim), reshape/transpose (as strided views where possible),
-  reductions, dot_general (naive tiled matmul first), select, compare, convert. Grow pytest
-  coverage per-op; property-test against CPU backend with random shapes.
+- **M3 – Op coverage, test-driven:** as soon as M2-level "1+1" works, adopt a real corpus of JAX
+  programs and let its failures drive which ops/features to implement next (test-driven design).
+  Candidates (evaluate, record choice in docs/decisions.md): a curated subset of upstream JAX's
+  own test suite run against our backend, StableHLO's interpreter conformance/testdata, and a
+  generated corpus (hypothesis-based random jax.numpy programs checked against the CPU backend).
+  Maintain a coverage scoreboard (ops passing / total) in `tests/` and grow it monotonically.
+  Typical op order: broadcast(-in-dim), reshape/transpose (strided views where possible),
+  reductions, dot_general (naive tiled matmul first), select, compare, convert.
 - **M4 – Control flow:** `while`/`if`/`case` as instructions referencing nested instruction
   lists; scalar condition read on device between sub-list runs. No jumps — linear lists all the
   way down. This is where the device-VM design must prove its worth.
 - **M5 – Hardening & perf:** dtype matrix (f16/bf16 where supported, int32/64, bool), buffer
   donation, binary cache keyed by (device, driver), per-op profiling hooks, kernel-table overrides
-  for tuned matmul. Then: try Intel Xe2 / AMD via CI or remote access (not available locally).
+  for tuned matmul. Then other vendors: **AMD hardware will be provided by the user in time** —
+  keep the codebase ready for it (no NVIDIA-isms); Intel Xe2 via CI or remote access.
 
 ## Technical notes / gotchas
 
