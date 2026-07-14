@@ -208,7 +208,11 @@ E2E_CASES = [
 def test_e2e_matches_jax(name, fn, shapes):
     import jax
     rng = np.random.default_rng(zlib.crc32(name.encode()))  # stable per case
-    args = [rng.standard_normal(s).astype(np.float32) for s in shapes]
+    # Integer-valued f32 inputs: every intermediate is exactly representable,
+    # so XLA CPU's mul+add/sub FMA contraction (which changes rounding on
+    # general data — see python/NOTES.md) cannot alter the result and the
+    # jax.jit comparison is bit-exact.
+    args = [rng.integers(-16, 16, size=s).astype(np.float32) for s in shapes]
 
     prog = lower_via_service(fn, *args)
     assert prog.input_shapes == [tuple(s) for s in shapes]
@@ -217,6 +221,23 @@ def test_e2e_matches_jax(name, fn, shapes):
     want = np.asarray(jax.jit(fn)(*args))
     assert got.shape == want.shape
     np.testing.assert_array_equal(got, want)  # identical f32 op order => exact
+
+
+def test_e2e_real_data_matches_per_op_jax():
+    """General real-valued data, compared exactly against *eager* jax (one XLA
+    op at a time = the StableHLO per-op semantics our VM implements). jax.jit
+    is NOT used as the oracle here: XLA CPU contracts multiply+subtract into
+    an FMA under jit, giving 1-ULP differences (measured; see python/NOTES.md).
+    """
+    import jax.numpy as jnp
+    rng = np.random.default_rng(zlib.crc32(b"real"))
+    args = [rng.standard_normal(64).astype(np.float32) for _ in range(3)]
+
+    prog = lower_via_service(_f_mul_sub, *args)
+    (got,) = R.execute(prog, args)
+
+    eager = np.asarray(_f_mul_sub(*(jnp.asarray(x) for x in args)))
+    np.testing.assert_array_equal(got, eager)
 
 
 def test_e2e_direct_script_invocation():
