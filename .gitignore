@@ -2,3 +2,5 @@ build/
 __pycache__/
 *.so
 .cache/
+poc/01-device-vm/vm
+.claude/

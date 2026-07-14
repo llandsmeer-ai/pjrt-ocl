@@ -16,11 +16,16 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     interpreted by the VM.
     - ❌ pc-manipulation/jumps in bytecode — rejected: user prefers stupid-linear execution;
       nothing in StableHLO needs it.
-  - 🔬 **Cross-workgroup barrier** — #1 project risk. Candidate: persistent threads + atomic
-    arrival counter with acq_rel/seq_cst atomics on global memory; only safe with all workgroups
-    co-resident (occupancy-derived launch size). → `poc/01-device-vm`
-  - 🔬 **Opcode dispatch** — no function pointers in OpenCL C → single big switch; risk: compile
-    time/register pressure as op library grows. Mitigation candidate: split VM by op family.
+  - ✅ **Cross-workgroup barrier — VALIDATED 2026-07-14** (`poc/01-device-vm`): Xiao&Feng-style
+    arrival counter + phase flag with OpenCL **1.2** atomics passes correctness + 2000-instr
+    dependency stress on both PoCL (24 grp) and NVIDIA (188 grp, ~1.1 µs/barrier). Megakernel vs
+    separate launches on NVIDIA: **2.5x faster @1M-elem ops, 3.2x @4K** — the design pays off.
+    Rules: never launch more groups than co-resident capacity (= CUs for now; PoCL would deadlock
+    otherwise); 1.2-relaxed-atomics barrier is technically outside the 1.2 memory model —
+    follow-up: feature-detect OpenCL 2.0 `atomic_load_explicit(memory_scope_device)` path.
+  - 🔬 **Opcode dispatch** — no function pointers in OpenCL C → single big switch (works fine in
+    poc/01); risk: compile time/register pressure as op library grows. Mitigation candidate:
+    split VM by op family.
   - 🅱️ **Host-side dispatch loop** over the same bytecode (one clEnqueueNDRangeKernel per instr).
     Keep the bytecode dual-interpretable so this fallback stays cheap to activate.
 
