@@ -66,13 +66,13 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
   };
 
   uint32_t magic, version, n_buffers, n_instrs, n_consts, main_len, n_inputs,
-      n_outputs;
+      n_outputs, n_aux, hpad;
   if (!r.U32(&magic) || !r.U32(&version)) return fail("truncated header");
   if (magic != 0x314D5056u) return fail("bad magic");
-  if (version != 1) return fail("unsupported version " + std::to_string(version));
+  if (version != 2) return fail("unsupported version " + std::to_string(version));
   if (!r.U32(&n_buffers) || !r.U32(&n_instrs) || !r.U32(&n_consts) ||
       !r.U32(&main_len) || !r.U32(&n_inputs) || !r.U32(&n_outputs) ||
-      !r.U64(&out->arena_bytes))
+      !r.U32(&n_aux) || !r.U32(&hpad) || !r.U64(&out->arena_bytes))
     return fail("truncated header");
   out->main_len = main_len;
 

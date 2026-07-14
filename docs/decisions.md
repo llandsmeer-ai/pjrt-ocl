@@ -8,6 +8,26 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
 
 ## 1. Execution model
 
+- ✅ **PIVOT 2026-07-14 (user-driven, M3): host-dispatch is the primary engine.** Each data
+  instruction = one `clEnqueueNDRangeKernel` of a dedicated per-op kernel at full problem size
+  (one WI per element; per-op local sizes), in-order queue, NO global barrier on the hot path.
+  Control flow: host reads the cond scalar (~10µs) and selects the next range. Evidence that
+  killed megakernel-as-primary:
+  - poc/01's benchmark was accidentally RIGGED: the "separate launches" baseline used the VM's
+    tiny persistent grid. Honest baseline (full-size launch): launches ≈ megakernel at 1M elems
+    (1.04x), and both 3x faster at local=256 than the starved 188×64 config.
+  - Co-residency cliff: 1128×256 persistent groups DEADLOCKED (spin > residency). The barrier
+    needs an exact occupancy oracle per device/driver/kernel — fragility on every vendor.
+  - Megakernel switch couples register pressure across ops and blocks cooperative kernels
+    (tiled matmul, tree reduce).
+  - Bytecode is engine-agnostic (deliberate) — this pivot changes ZERO format bytes.
+  - 🅱️ Megakernel demoted to optional segment engine for long chains of tiny ops / tight scalar
+    loops (validated, kept in tree; routing marked segments through it is a later optimization).
+  - Note: the user's ORIGINAL brief said "a series of kernel dispatches, from a simple bytecode"
+    — the megakernel detour is preserved below for the record.
+
+### 1-old. Megakernel era (historical, still true for the segment engine)
+
 - ✅ **Device-side megakernel VM** (persistent kernel, opcode switch) — user decision 2026-07-14.
   Motivation: minimal dispatch overhead.
   - ✅ **Strictly linear bytecode, no jumps/conditionals** — user decision 2026-07-14. StableHLO has

@@ -24,8 +24,23 @@ static_assert(sizeof(VmInstr) == 32);
 enum VmOp : uint32_t {
   kNop = 0, kAddF32 = 1, kMulF32 = 2, kSubF32 = 3,
   kFillF32 = 4, kIotaF32 = 5, kLtsF32 = 6, kWhile = 7,
-  kMaxOp = kWhile,
+  // v2
+  kDivF32 = 8, kMaxF32 = 9, kMinF32 = 10, kPowF32 = 11, kCopyF32 = 12,
+  kNegF32 = 13, kExpF32 = 14, kLogF32 = 15, kSqrtF32 = 16, kRsqrtF32 = 17,
+  kTanhF32 = 18, kAbsF32 = 19, kFloorF32 = 20, kCeilF32 = 21, kSignF32 = 22,
+  kCmpF32 = 23, kSelectF32 = 24, kGatherStrided = 25, kReduce = 26,
+  kDot = 27, kIotaDim = 28, kIf = 29,
+  kMaxOp = kIf,
 };
+
+// Op shape classes for validation/patching.
+inline bool VmOpIsControl(uint32_t op) { return op == kWhile || op == kIf; }
+inline bool VmOpIsUnary(uint32_t op) {
+  return (op >= kCopyF32 && op <= kSignF32) || op == kIotaF32;
+}
+inline bool VmOpUsesAux(uint32_t op) {
+  return op == kGatherStrided || op == kReduce || op == kDot || op == kIotaDim;
+}
 
 struct VmProgram {
   struct Buffer {
@@ -41,6 +56,7 @@ struct VmProgram {
   std::vector<std::vector<int64_t>> input_dims;   // parallel to inputs
   std::vector<std::vector<int64_t>> output_dims;  // parallel to outputs
   std::vector<std::pair<uint32_t, std::vector<uint8_t>>> consts;
+  std::vector<int32_t> aux;  // v2: per-instruction shape/stride metadata
   std::vector<VmInstr> instrs;
 
   // Parses + validates a serialized VMProgram. Returns false with *err set.

@@ -204,12 +204,16 @@ int main(void)
     clSetKernelArg(kadd1, 2, sizeof a0, &a0);
     clSetKernelArg(kadd1, 3, sizeof a1, &a1);
     clSetKernelArg(kadd1, 4, sizeof BN, &BN);
+    /* honest baseline: launch with one work-item per element (grid-stride
+     * kernel degenerates to 1 elem/WI), NOT the VM's tiny persistent grid */
+    size_t full_gsz = ((size_t)BN + lsz - 1) / lsz * lsz;
+    if (envi("BENCH_SMALL_LAUNCH", 0)) full_gsz = gsz;
     for (cl_uint k = 0; k < 8; k++)
-        CHK(clEnqueueNDRangeKernel(q, kadd1, 1, NULL, &gsz, &lsz, 0, NULL, NULL), "warm add1");
+        CHK(clEnqueueNDRangeKernel(q, kadd1, 1, NULL, &full_gsz, &lsz, 0, NULL, NULL), "warm add1");
     clFinish(q);
     t0 = now_ms();
     for (cl_uint k = 0; k < BK; k++)
-        CHK(clEnqueueNDRangeKernel(q, kadd1, 1, NULL, &gsz, &lsz, 0, NULL, NULL), "enqueue add1");
+        CHK(clEnqueueNDRangeKernel(q, kadd1, 1, NULL, &full_gsz, &lsz, 0, NULL, NULL), "enqueue add1");
     clFinish(q);
     double t_launch = now_ms() - t0;
     printf("test3 overhead: %u x add(%u elems)\n  vm megakernel: %.1f ms (%.1f us/op)\n  %u launches:   %.1f ms (%.1f us/op)\n  ratio: %.2fx\n",
