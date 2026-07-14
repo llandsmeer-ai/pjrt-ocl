@@ -47,6 +47,20 @@ Key properties of the execution model:
   Fallback plan B (keep viable at all times): the same bytecode interpreted by a host-side loop of
   `clEnqueueNDRangeKernel` calls. Design the bytecode format to be interpretable both ways.
 
+## How to work (session & agent organization)
+
+- One session = one coherent work block (a milestone or a PoC). Cross-session state lives ONLY in
+  git + CLAUDE.md + `docs/` — assume the next session remembers nothing else. Start each session
+  by reading `docs/decisions.md` and `git log --oneline -15`.
+- Keep the current riskiest/most iterative item **in the main session** (e.g. poc/01 barrier
+  work); delegate self-contained, verifiable chunks to **background agents in git worktrees**
+  (e.g. poc/02 PJRT boilerplate, later per-op-family coverage work in M3). Long dumb jobs
+  (LLVM build) run as background shell tasks in parallel.
+- Delegated agents must return: what they tried/failed (for `docs/decisions.md` — the main
+  session merges these entries) and how their result was verified. Unverified agent work is
+  treated as not done.
+- Commit small and often; never end a session with undocumented design findings.
+
 ## Hard rules
 
 - **PoC-first**: every risky mechanism gets a minimal standalone proof-of-concept under `poc/NN-name/`
