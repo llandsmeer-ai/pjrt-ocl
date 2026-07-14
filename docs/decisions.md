@@ -26,14 +26,27 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
 
 ## 2. StableHLO ingestion
 
-- ✅ **Link MLIR + StableHLO C++ libs, built once via CMake** (outside repo, e.g. ~/third_party) —
-  user decision 2026-07-14. Robust for MLIR bytecode + VHLO portable artifacts; gives us MLIR infra
-  for a future custom `vm` dialect.
-  - 🔬 Pin LLVM + stablehlo commits (record here once built); match stablehlo version to the JAX
-    release we pin.
-  - ❌ Hand-written textual-MLIR parser — rejected without PoC: fragile across JAX/MLIR versions,
-    can't read bytecode/VHLO artifacts.
-  - ❌ Python-side lowering shim — rejected: non-standard plumbing through PJRT compile.
+- ❌ **Link MLIR + StableHLO C++ libs, built via CMake** — was the plan (user decision 2026-07-14),
+  **killed by evidence 2026-07-14**: this machine has only ~4.8 GB free disk (host-shared overlay,
+  nothing cleanable); an LLVM+MLIR build needs 20–40 GB. Also checked prebuilt escape hatches:
+  - ❌ Link jaxlib's bundled MLIR: `libjax_common.so` (334 MB, contains all of MLIR+StableHLO)
+    exports only 27 dynamic symbols — Python module init wrappers; the MLIR C API is hidden.
+    Verified with `nm -D` 2026-07-14. Not linkable.
+  - ❌ LLVM release-tarball prebuilts + stablehlo source: stablehlo pins non-release LLVM commits;
+    extracted tarballs alone (~10 GB) don't fit either.
+- ✅ **Python-side lowering, out-of-process** (previously rejected, revived by the disk evidence —
+  and it's arguably better): lowering is compile-time-only, so the C++ plugin spawns the venv
+  Python (`sys.executable` passed via `register_plugin(..., options=...)` →
+  `PJRT_Client_Create` create_options) as a subprocess during `PJRT_Client_Compile`, pipes the
+  serialized VHLO artifact in, receives flat VMProgram bytecode out. Uses jaxlib's own StableHLO
+  Python bindings ⇒ **version-matched to JAX by construction**, zero heavy C++ deps, lowering is
+  plain debuggable Python. C++ side stays a pure executor. → `poc/03-python-lowering`
+  - ❌ In-process CPython callback instead of subprocess — rejected: GIL re-entrancy from inside a
+    PJRT C call is a hazard; subprocess is ~100s of ms per compile, acceptable.
+  - 🔬 Custom MLIR `vm` dialect (from original plan) deferred; VMProgram is a plain binary format
+    emitted by Python for now.
+  - ❌ Hand-written textual-MLIR parser — fragile across JAX/MLIR versions, can't read
+    bytecode/VHLO artifacts.
 
 ## 3. Kernel strategy
 

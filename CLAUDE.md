@@ -26,10 +26,12 @@ on the hot path.
 jax.jit(f)                                  [user]
   → StableHLO (serialized MLIR)             [JAX/XLA does this]
   → PJRT_Client_Compile                     [our plugin: hand-rolled PJRT C API impl]
-      → parse via linked MLIR+StableHLO libs (CMake-built LLVM)
-      → (later) our own MLIR "vm" dialect as lowering target
-      → lowering: buffer assignment + instruction selection
-      → VMProgram { const pool, buffer plan, instr list }   ← the "bytecode"
+      → spawn venv-python lowering subprocess (pjrt_ocl.lowering)
+        — uses jaxlib's OWN StableHLO python bindings ⇒ version-matched to JAX for free
+        — python exe path arrives via register_plugin options → PJRT_Client_Create
+      → lowering (in Python): parse VHLO artifact, buffer assignment, instruction selection
+      → VMProgram { const pool, buffer plan, instr list }   ← the "bytecode", plain binary format
+      → C++ plugin only ever sees VMProgram bytes; it is a pure executor
   → PJRT_LoadedExecutable_Execute
       → upload instr list once; enqueue vm.cl megakernel
       → device VM: for(pc..){ switch(op){...}; global_barrier(); }
@@ -81,22 +83,23 @@ Key properties of the execution model:
   host debuggers and sanitizers work there — then validate on NVIDIA. The NVIDIA ICD had to be
   registered manually: `/etc/OpenCL/vendors/nvidia.icd` containing `libnvidia-opencl.so.1`.
 - `sudo` available without password. Python 3.12.3, CMake, gcc/g++/clang, ninja NOT yet installed.
-- `opencl-headers` + `ocl-icd-opencl-dev` + `clinfo` installed. JAX not yet installed — when
-  installing, pin the version in `pyproject.toml` and record the matching PJRT C API version in
-  `docs/decisions.md` (the plugin must report a compatible `PJRT_Api` version).
-- LLVM/MLIR + stablehlo must be built from source via CMake (one-time ~1h build). Build them
-  **outside** the repo (e.g. `~/third_party/`) and point CMake at the install dirs; document exact
-  commits in `docs/decisions.md`.
+- `opencl-headers` + `ocl-icd-opencl-dev` + `clinfo` + `ninja-build` installed.
+- **jax 0.10.2 / jaxlib 0.10.2** in `.venv/` (project venv; use `.venv/bin/python` for everything
+  Python). Record the matching PJRT C API version in `docs/decisions.md` once known.
+- **Only ~5 GB free disk** (host-shared overlay; not cleanable). This killed the build-LLVM plan —
+  see docs/decisions.md §2. Do NOT start large source builds; lowering uses jaxlib's bundled
+  StableHLO python bindings instead.
 
 ## Planned repo layout
 
 ```
-pjrt_plugin/           C++ plugin: PJRT C API impl, MLIR ingest, lowering, OpenCL runtime
+pjrt_plugin/           C++ plugin: PJRT C API impl + OpenCL runtime (pure VMProgram executor)
   pjrt/                hand-rolled PJRT C API surface (client/device/buffer/executable)
-  lowering/            stablehlo → VMProgram (later: our MLIR vm dialect)
-  runtime/             OpenCL context/queue/allocator, binary cache, VM launcher
+  runtime/             OpenCL context/queue/allocator, binary cache, VM launcher,
+                       lowering-subprocess plumbing
   kernels/             vm.cl megakernel + generic op library (OpenCL C)
-python/pjrt_ocl/       python package: jax_plugins entry point, discovery + packaging
+python/pjrt_ocl/       python package: jax_plugins entry point, packaging, AND
+  lowering/            stablehlo → VMProgram lowering (runs as compile-time subprocess)
 poc/                   numbered standalone proof-of-concepts (each with its own README)
 tests/                 pytest, comparing against JAX CPU backend
 docs/                  decisions.md (decision tree), reference notes
@@ -133,8 +136,10 @@ Work through these in order; each has an explicit exit criterion. Details/status
     `pjrt_c_api.h`) that `jax.devices()` lists our device. This tests the "hand-rolled C API vs
     XLA C++ wrappers" question — expect friction; record every unimplemented-callback crash in
     the decision log before considering the XLA-wrapper route.
-  - `poc/03-stablehlo-parse`: standalone CMake binary linking MLIR+StableHLO that parses a
-    JAX-dumped module (bytecode and textual) and prints ops/types/shapes.
+  - `poc/03-python-lowering`: pure-Python PoC: take `jax.jit(f).lower(...)` → serialized VHLO
+    artifact bytes → deserialize with `jaxlib.mlir` bindings → walk stablehlo ops → print
+    ops/types/shapes and emit a strawman VMProgram. Also prove subprocess plumbing: read artifact
+    from stdin, write VMProgram to stdout.
 - **M1 – Bytecode + lowering:** define `VMProgram` serialization (opcode enum, operand/buffer
   refs, launch geometry); implement stablehlo→bytecode for elementwise f32 ops + constants;
   static buffer plan (arena + offsets, SSA liveness for reuse).
