@@ -96,10 +96,26 @@ def resolve_target(target: str) -> str:
     return target  # explicit "X.Y.Z"
 
 
+def _clone_module(module):
+    """Copy a module via MLIR-bytecode round-trip in the same context.
+
+    Required because serialize_portable_artifact CONVERTS ITS INPUT TO VHLO IN
+    PLACE (verified on jaxlib 0.10.2) — serializing jax's live cached lowering
+    corrupts it and later jax.jit calls die with "MLIR module must have a main
+    function". See NOTES.md.
+    """
+    import io
+    from jaxlib.mlir import ir
+    buf = io.BytesIO()
+    module.operation.write_bytecode(file=buf)
+    return ir.Module.parse(buf.getvalue(), context=module.context)
+
+
 def serialize_as_plugin_would_receive(module, target: str = "current") -> bytes:
     """Exact PJRT_Program.code bytes: a VHLO portable artifact (MLIR bytecode)."""
     from jaxlib.mlir.dialects import stablehlo
-    return stablehlo.serialize_portable_artifact(module, resolve_target(target))
+    return stablehlo.serialize_portable_artifact(_clone_module(module),
+                                                 resolve_target(target))
 
 
 def main(argv=None):
