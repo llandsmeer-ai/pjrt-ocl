@@ -86,6 +86,10 @@ Key properties of the execution model:
 - `opencl-headers` + `ocl-icd-opencl-dev` + `clinfo` + `ninja-build` installed.
 - **jax 0.10.2 / jaxlib 0.10.2** in `.venv/` (project venv; use `.venv/bin/python` for everything
   Python). Record the matching PJRT C API version in `docs/decisions.md` once known.
+- **Only 32 GB RAM** — large C++ builds OOM this machine (user has seen it with XLA). If the
+  LLVM/XLA fallback is ever exercised: cap link parallelism (`ninja -j8`,
+  `-DLLVM_PARALLEL_LINK_JOBS=2`, lld, no LTO) and watch `free -g` during any big build. Also
+  applies at runtime: don't map huge arenas host-side carelessly.
 - **Disk layout matters**: `/home/ubuntu/project` is its own mount with ~445 GB free — big builds
   are fine if kept INSIDE the project dir (use `third_party/` here, gitignored). The root overlay
   `/` (which backs `~`, `~/.cache`, `/tmp`, apt) has only ~3 GB free — keep caches and large
