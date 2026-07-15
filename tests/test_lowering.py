@@ -25,9 +25,13 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import pjrt_ocl
 import pjrt_ocl.lowering as L
+import pjrt_ocl.scheduler as S
 import pjrt_ocl.vmreader as R
 
 PYTHON = sys.executable
+
+# deterministic device config for golden tests (independent of env)
+GOLDEN_CFG = S.DeviceConfig(nlanes=8, costs={})
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -70,6 +74,17 @@ def lower_via_service(fn, *args) -> R.Program:
     return R.parse(proc.stdout)
 
 
+def both_validators(prog: R.Program, args) -> np.ndarray:
+    """Run BOTH reference validators (semantic tensor interpreter + schedule
+    lane simulator) and assert they agree; return the (shared) outputs."""
+    sem = R.execute(prog, args)
+    sch = R.execute_schedule(prog, args)
+    assert len(sem) == len(sch)
+    for a, b in zip(sem, sch):
+        np.testing.assert_array_equal(a, b)
+    return sem
+
+
 # ---------------------------------------------------------------------------
 # (a) golden header/layout checks, raw struct.unpack — independent of vmreader
 # ---------------------------------------------------------------------------
@@ -92,13 +107,18 @@ def _hand_built_program() -> L.VMProgram:
 
 
 def test_golden_layout_exact_bytes():
-    """Byte-for-byte spec check of the writer against docs/vmprogram.md."""
-    blob = _hand_built_program().serialize()
+    """Byte-for-byte spec check of the v3 writer against docs/vmprogram.md:
+    exact bytes for the tensor sections, then struct.unpack of the schedule
+    header + one task + one barrier entry."""
+    prog = _hand_built_program()
+    sched = S.schedule_program(prog, GOLDEN_CFG)
+    blob = prog.serialize(sched)
 
     expected = bytearray()
-    # header (40B): magic, version, n_buffers, n_instrs, n_consts, main_len,
-    #               n_inputs, n_outputs, arena_bytes u64
-    expected += struct.pack("<IIIIIIIIQ", 0x314D5056, 1, 4, 2, 1, 2, 2, 1, 256)
+    # header (48B): magic, version=3, n_buffers, n_instrs, n_consts, main_len,
+    #               n_inputs, n_outputs, n_aux, pad, arena_bytes u64
+    expected += struct.pack("<IIIIIIIIIIQ",
+                            0x314D5056, 3, 4, 2, 1, 2, 2, 1, 0, 0, 256)
     # buffer table: {arena_byte_offset u64, size_bytes u64, dtype u32, pad u32}
     for off in (0, 64, 128, 192):
         expected += struct.pack("<QQII", off, 12, 0, 0)
@@ -108,15 +128,46 @@ def test_golden_layout_exact_bytes():
     # IO shapes: {rank u32, pad u32, dims u64[rank]} x (inputs then outputs)
     for _ in range(3):
         expected += struct.pack("<IIQ", 1, 0, 3)
+    # aux pool: n_aux = 0 -> nothing (8B-aligned already)
     # const pool: {buffer_id u32, byte_len u32, data}, padded to 8B
     expected += struct.pack("<II", 2, 12)
     expected += np.array([1.0, 2.0, 3.0], dtype="<f4").tobytes() + b"\0" * 4
-    # instructions: {op,dst,a,b,n,imm,pad,pad} u32 x8
+    # instructions: {op,dst,a,b,n,imm,aux,pad1} u32 x8 (aux=0 for EW)
     expected += struct.pack("<8I", 1, 3, 0, 1, 3, 0, 0, 0)  # ADD_F32
     expected += struct.pack("<8I", 3, 3, 3, 2, 3, 0, 0, 0)  # SUB_F32
 
-    assert len(blob) == 40 + 4 * 24 + 16 + 48 + 24 + 2 * 32 == 288
-    assert blob == bytes(expected)
+    tensor_len = 48 + 4 * 24 + 16 + 48 + 24 + 2 * 32
+    assert tensor_len == 296
+    assert blob[:tensor_len] == bytes(expected)
+
+    # --- schedule sections ---
+    FLAG_NONE = 0xFFFFFFFF
+    BARRIER = 0xFFFFFFFE
+    pos = tensor_len
+    n_tasks, n_entries, n_flags, n_lanes = struct.unpack_from("<IIII", blob, pos)
+    # add-then-sub => two dataflow levels, each one 1-tile EW task on lane 0;
+    # a BARRIER on all 8 lanes after each level.
+    assert (n_tasks, n_flags, n_lanes) == (2, 0, 8)
+    assert n_entries == 4 + 7 * 2  # lane0: E,BAR,E,BAR ; lanes1-7: BAR,BAR
+    pos += 16
+
+    # task 0: EW add, dst=3 a=0 b=1 p0=0(add) p1=3(n_elems)
+    t0 = struct.unpack_from("<8I", blob, pos)
+    assert t0 == (S.TILE_EW, 3, 0, 1, S.EW_ADD, 3, 0, 0)
+    pos += 32 * n_tasks  # skip past both tasks
+
+    # lane table (n_lanes x {entry_off, entry_count}); lane 0 owns 4 entries
+    off0, cnt0 = struct.unpack_from("<II", blob, pos)
+    assert (off0, cnt0) == (0, 4)
+    pos += 8 * n_lanes
+
+    # entries: first is task 0 on tiles [0,1); second is a BARRIER
+    e0 = struct.unpack_from("<8I", blob, pos)
+    assert e0 == (0, 0, 1, FLAG_NONE, 0, FLAG_NONE, 0, 0)
+    e1 = struct.unpack_from("<8I", blob, pos + 32)
+    assert e1 == (BARRIER, 0, 0, FLAG_NONE, 0, FLAG_NONE, 0, 0)
+
+    assert len(blob) == tensor_len + 16 + 32 * n_tasks + 8 * n_lanes + 32 * n_entries
 
 
 def test_golden_layout_jax_lowered_add():
@@ -128,13 +179,15 @@ def test_golden_layout_jax_lowered_add():
     blob = proc.stdout
 
     (magic, version, n_buffers, n_instrs, n_consts, main_len, n_inputs,
-     n_outputs, arena_bytes) = struct.unpack_from("<IIIIIIIIQ", blob, 0)
+     n_outputs, n_aux, hpad, arena_bytes) = struct.unpack_from(
+         "<IIIIIIIIIIQ", blob, 0)
     assert magic == 0x314D5056
-    assert version == 1
+    assert version == 3
     assert (n_buffers, n_instrs, n_consts, main_len) == (3, 1, 0, 1)
     assert (n_inputs, n_outputs) == (2, 1)
+    assert (n_aux, hpad) == (0, 0)
     assert arena_bytes == 3 * 64  # three f32[8] buffers, 64B-aligned slots
-    pos = 40
+    pos = 48
 
     for i in range(n_buffers):
         off, size, dtype, pad = struct.unpack_from("<QQII", blob, pos)
@@ -158,22 +211,41 @@ def test_golden_layout_jax_lowered_add():
         assert dim == 8
         pos += 16
 
+    # aux pool empty (n_aux == 0), so const pool then instructions follow
     assert pos % 8 == 0                                       # instructions
+    # {op,dst,a,b,n,imm,aux,pad1}: ADD_F32 dst=2 a=0 b=1 n=8, aux=0
     assert struct.unpack_from("<8I", blob, pos) == (1, 2, 0, 1, 8, 0, 0, 0)
     pos += 32
+
+    # schedule sections: one EW add task, one dataflow level => one barrier
+    # phase; task on lane 0, BARRIER on all 8 lanes.
+    n_tasks, n_entries, n_flags, n_lanes = struct.unpack_from("<IIII", blob, pos)
+    assert (n_tasks, n_flags, n_lanes) == (1, 0, 8)
+    assert n_entries == 1 + 8       # one task entry on lane0 + 8 barriers
+    pos += 16
+    assert struct.unpack_from("<8I", blob, pos) == (S.TILE_EW, 2, 0, 1,
+                                                    S.EW_ADD, 8, 0, 0)
+    pos += 32 * n_tasks + 8 * n_lanes
+    # first entry = task 0 tiles [0,1); second entry = BARRIER
+    assert struct.unpack_from("<8I", blob, pos)[:3] == (0, 0, 1)
+    assert struct.unpack_from("<I", blob, pos + 32)[0] == 0xFFFFFFFE
+    pos += 32 * n_entries
     assert pos == len(blob)
 
 
 def test_reader_rejects_bad_magic_and_version():
-    blob = bytearray(_hand_built_program().serialize())
+    prog = _hand_built_program()
+    sched = S.schedule_program(prog, GOLDEN_CFG)
+    blob = bytearray(prog.serialize(sched))
     good = bytes(blob)
     blob[0] ^= 0xFF
     with pytest.raises(R.FormatError, match="magic"):
         R.parse(bytes(blob))
     blob[0] ^= 0xFF
-    struct.pack_into("<I", blob, 4, 2)  # version = 2
+    struct.pack_into("<I", blob, 4, 2)  # version = 2 (want 3)
     with pytest.raises(R.FormatError, match="version"):
         R.parse(bytes(blob))
+    # trailing garbage after the (complete) schedule sections is rejected
     with pytest.raises(R.FormatError, match="trailing"):
         R.parse(good + b"\0" * 8)
 
@@ -222,7 +294,8 @@ def test_e2e_matches_jax(name, fn, shapes):
 
     prog = lower_via_service(fn, *args)
     assert prog.input_shapes == [tuple(s) for s in shapes]
-    (got,) = R.execute(prog, args)
+    assert prog.schedule is not None
+    (got,) = both_validators(prog, args)      # semantic + schedule agree
 
     want = np.asarray(jax.jit(fn)(*args))
     assert got.shape == want.shape
@@ -240,7 +313,7 @@ def test_e2e_real_data_matches_per_op_jax():
     args = [rng.standard_normal(64).astype(np.float32) for _ in range(3)]
 
     prog = lower_via_service(_f_mul_sub, *args)
-    (got,) = R.execute(prog, args)
+    (got,) = both_validators(prog, args)      # semantic + schedule agree
 
     eager = np.asarray(_f_mul_sub(*(jnp.asarray(x) for x in args)))
     np.testing.assert_array_equal(got, eager)
@@ -254,7 +327,7 @@ def test_e2e_direct_script_invocation():
     artifact = serialize_as_plugin_would_receive(_f_add, *args)
     proc = run_service(artifact, direct_script=True)
     assert proc.returncode == 0, proc.stderr.decode()
-    (got,) = R.execute(R.parse(proc.stdout), args)
+    (got,) = both_validators(R.parse(proc.stdout), args)
     np.testing.assert_array_equal(got, np.asarray(jax.jit(_f_add)(*args)))
 
 
@@ -345,8 +418,211 @@ def test_vmreader_while_loop():
         ],
         main_len=3,
     )
-    parsed = R.parse(prog.serialize())
+    parsed = R.parse(prog.serialize())        # tensor-only (WHILE not schedulable)
+    assert parsed.schedule is None
     counter, data = R.execute(parsed, [])
     assert counter.shape == () and counter == np.float32(5.0)
     np.testing.assert_array_equal(
         data, np.arange(8, dtype=np.float32) * np.float32(32.0))
+
+
+# ---------------------------------------------------------------------------
+# (f) scheduler: dataflow levels, co-scheduling, packing, config
+# ---------------------------------------------------------------------------
+
+
+def _tasks_in_phase(prog: R.Program):
+    """Return, per barrier phase, the set of task ids executed in that phase."""
+    sched = prog.schedule
+    counts = [sum(1 for e in s if e.task == S.TASK_BARRIER)
+              for s in sched.lane_streams]
+    assert len(set(counts)) == 1, f"barrier counts differ: {counts}"
+    n_phases = counts[0]
+    phases = [set() for _ in range(n_phases)]
+    for stream in sched.lane_streams:
+        p = 0
+        for e in stream:
+            if e.task == S.TASK_BARRIER:
+                p += 1
+            else:
+                phases[p].add(e.task)
+    return phases
+
+
+def _f_two_independent(a, b, c, d):
+    return a + b, c * d
+
+
+def test_two_independent_ops_co_scheduled():
+    """lambda a,b,c,d: (a+b, c*d) — the two ops share no data, so they MUST
+    land in the same dataflow level (same barrier phase) and run on distinct
+    lanes. Verifiable directly in the parsed schedule."""
+    import jax
+    rng = np.random.default_rng(1234)
+    args = [rng.integers(-16, 16, size=(8,)).astype(np.float32)
+            for _ in range(4)]
+
+    prog = lower_via_service(_f_two_independent, *args)
+    assert prog.schedule is not None
+    assert len(prog.schedule.tasks) == 2
+
+    phases = _tasks_in_phase(prog)
+    # exactly ONE barrier phase containing BOTH tasks => co-scheduled
+    assert len(phases) == 1, f"expected a single level, got {len(phases)} phases"
+    assert phases[0] == {0, 1}
+
+    # the two task entries are on different lanes within that phase
+    lanes_with_tasks = [lane for lane, stream in enumerate(prog.schedule.lane_streams)
+                        for e in stream if e.task in (0, 1)]
+    assert len(lanes_with_tasks) == 2
+    assert len(set(lanes_with_tasks)) == 2, "co-scheduled tasks must use 2 lanes"
+
+    # both validators agree with eager jax (per-op semantics)
+    got = both_validators(prog, args)
+    want = [np.asarray(x) for x in jax.jit(_f_two_independent)(*args)]
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(g, w)
+
+
+def test_scheduler_dependent_chain_serializes():
+    """a*b - c : the subtract depends on the multiply, so they must be in
+    separate levels (two barrier phases)."""
+    rng = np.random.default_rng(9)
+    args = [rng.integers(-8, 8, size=(8,)).astype(np.float32) for _ in range(3)]
+    prog = lower_via_service(_f_mul_sub, *args)
+    phases = _tasks_in_phase(prog)
+    assert len(phases) == 2
+    assert phases[0] and phases[1]
+    assert phases[0].isdisjoint(phases[1])
+
+
+def test_scheduler_nlanes_config_and_coverage():
+    """PJRT_OCL_NLANES controls lane count; every lane carries the barrier
+    sequence; a single big EW op spreads its tiles across lanes covering them
+    exactly once (checked by execute_schedule's coverage assertions)."""
+    # one add of 40000 elems => ceil(40000/16384) = 3 tiles
+    prog = L.VMProgram(
+        arena_bytes=3 * ((40000 * 4 + 63) // 64 * 64),
+        buffers=[L.Buffer(0, 40000 * 4),
+                 L.Buffer((40000 * 4 + 63) // 64 * 64, 40000 * 4),
+                 L.Buffer(2 * ((40000 * 4 + 63) // 64 * 64), 40000 * 4)],
+        inputs=[0, 1], outputs=[2],
+        input_shapes=[(40000,), (40000,)], output_shapes=[(40000,)],
+        consts=[],
+        instrs=[L.Instr(L.OP_ADD_F32, dst=2, a=0, b=1, n=40000)],
+        main_len=1,
+    )
+    cfg = S.DeviceConfig(nlanes=4, costs={})
+    sched = S.schedule_program(prog, cfg)
+    assert sched.n_lanes == 4
+    # 3 tiles, cost-equal => 3 lanes get one tile each, lane 3 unused this level
+    entries = [e for stream in sched.lane_streams for e in stream
+               if e.task == 0]
+    assert sorted((e.tile_lo, e.tile_hi) for e in entries) == [(0, 1), (1, 2), (2, 3)]
+    # roundtrip + coverage validation via the reader
+    parsed = R.parse(prog.serialize(sched))
+    a = np.arange(40000, dtype=np.float32)
+    b = np.arange(40000, dtype=np.float32) * 2
+    (out,) = R.execute_schedule(parsed, [a, b])
+    np.testing.assert_array_equal(out, a + b)
+
+
+def _two_add_prog(n0: int, n1: int) -> L.VMProgram:
+    """Two independent adds with element counts n0, n1 (co-schedule in 1 level).
+    Buffers: in0,in1 (n0), in2,in3 (n1), out0 (n0), out1 (n1)."""
+    sizes = [n0, n0, n1, n1, n0, n1]
+    buffers, off = [], 0
+    for n in sizes:
+        buffers.append(L.Buffer(off, n * 4))
+        off += (n * 4 + 63) // 64 * 64      # 64B-aligned slots
+    return L.VMProgram(
+        arena_bytes=off,
+        buffers=buffers,
+        inputs=[0, 1, 2, 3], outputs=[4, 5],
+        input_shapes=[(n0,), (n0,), (n1,), (n1,)],
+        output_shapes=[(n0,), (n1,)],
+        consts=[],
+        instrs=[L.Instr(L.OP_ADD_F32, dst=4, a=0, b=1, n=n0),
+                L.Instr(L.OP_ADD_F32, dst=5, a=2, b=3, n=n1)],
+        main_len=2,
+    )
+
+
+def test_scheduler_lane_allocation_proportional_to_cost():
+    """When two independent EW ops co-schedule, lanes are allocated in
+    proportion to cost (= tiles x unit cost). Current ops are all EW (uniform
+    unit cost), so the bigger op gets more lanes: 8 tiles vs 2 tiles over
+    8 lanes => 6 lanes vs 2 lanes."""
+    prog = _two_add_prog(8 * S.TILE_SIZE, 2 * S.TILE_SIZE)
+    sched = S.schedule_program(prog, S.DeviceConfig(nlanes=8, costs={}))
+    lanes0 = sum(1 for st in sched.lane_streams for e in st if e.task == 0)
+    lanes1 = sum(1 for st in sched.lane_streams for e in st if e.task == 1)
+    assert lanes0 > lanes1
+    assert lanes0 + lanes1 <= 8
+    assert (lanes0, lanes1) == (6, 2)
+    # tiles split contiguously and cover each task's tiles exactly once
+    R.execute_schedule(
+        R.parse(prog.serialize(sched)),
+        [np.zeros(8 * S.TILE_SIZE, np.float32)] * 2 +
+        [np.zeros(2 * S.TILE_SIZE, np.float32)] * 2)
+
+
+def test_scheduler_equal_cost_even_split():
+    prog = _two_add_prog(4 * S.TILE_SIZE, 4 * S.TILE_SIZE)
+    sched = S.schedule_program(prog, S.DeviceConfig(nlanes=8, costs={}))
+    lanes0 = sum(1 for st in sched.lane_streams for e in st if e.task == 0)
+    lanes1 = sum(1 for st in sched.lane_streams for e in st if e.task == 1)
+    assert lanes0 == lanes1 == 4
+
+
+def test_device_config_from_env_and_cost_table(tmp_path):
+    """PJRT_OCL_NLANES + PJRT_OCL_COST_TABLE parsing; missing file => 1.0."""
+    cost = tmp_path / "cost.json"
+    cost.write_text(json.dumps({"ew_tile_us": 2.5, "mma_tile_us": 40.0,
+                                "gather_tile_us": 3.0, "reduce_tile_us": 5.0}))
+    cfg = S.DeviceConfig.from_env(
+        {"PJRT_OCL_NLANES": "16", "PJRT_OCL_COST_TABLE": str(cost)})
+    assert cfg.nlanes == 16
+    assert cfg.unit_cost(S.TILE_EW) == 2.5
+    assert cfg.unit_cost(S.TILE_MMA) == 40.0
+    assert cfg.unit_cost(S.TILE_GATHER) == 3.0
+    assert cfg.unit_cost(S.TILE_REDUCE_PART) == 5.0
+
+    # defaults: no env => 8 lanes, all unit costs 1.0
+    d = S.DeviceConfig.from_env({})
+    assert d.nlanes == 8
+    assert d.unit_cost(S.TILE_EW) == 1.0
+    assert d.unit_cost(S.TILE_MMA) == 1.0
+
+    # missing file => all 1.0
+    m = S.DeviceConfig.from_env({"PJRT_OCL_COST_TABLE": str(tmp_path / "no.json")})
+    assert m.unit_cost(S.TILE_EW) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# (g) control-flow scheduling seam (WHILE/IF): not implemented yet
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skip(reason="region-op scheduling (WHILE/IF) is a Phase-1 seam; "
+                         "scheduler raises ScheduleError until implemented")
+def test_scheduler_while_loop():
+    """Skeleton: once region-op scheduling lands, a WHILE tensor instr should
+    schedule its cond/body region lists into per-lane sub-ranges and emit a
+    WHILE control entry (task=0xFFFFFFFD) uniformly in every lane."""
+    raise NotImplementedError
+
+
+def test_scheduler_rejects_region_op_for_now():
+    """Until the seam is filled, a WHILE instruction is rejected cleanly."""
+    prog = L.VMProgram(
+        arena_bytes=64 * 4,
+        buffers=[L.Buffer(0, 4), L.Buffer(64, 4)],
+        inputs=[], outputs=[0],
+        input_shapes=[], output_shapes=[()],
+        consts=[(1, np.float32(0.0).tobytes())],
+        instrs=[L.Instr(L.OP_WHILE, dst=1, a=1, b=0, n=1, imm=0)],
+        main_len=1,
+    )
+    with pytest.raises(S.ScheduleError):
+        S.schedule_program(prog, GOLDEN_CFG)
