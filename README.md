@@ -142,7 +142,9 @@ core path, and it never assumes fp64. Design decisions and their rationale live 
 
 ## Limitations & roadmap
 
-- **f32 only** for now; integer/bf16/f16 dtypes are not yet implemented.
+- **Dtypes in progress**: f32 works today; full dtype coverage (i32/bool first, then
+  i64/f64/f16, then bf16/complex) is the active workstream — the VM is being made
+  byte-addressed and dtype-dispatched. f64/f16 will be device-conditional (OpenCL extensions).
 - **Op coverage is partial** and grows test-first — reshape, slice, concatenate,
   partial-axis reductions, batched matmul, and `if`/`case` are next.
 - **PoCL (CPU) is reliable for correctness spot-checks but not heavy iteration**: the

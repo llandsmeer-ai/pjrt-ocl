@@ -23,6 +23,32 @@ performance mode. Work autonomously. This file is the plan of record for continu
   slot-file fusion, typed lanes integration (poc/05), then 128×128 MMA behind typed lanes.
 - Merged PoCs this session: poc/04 (VLIW), poc/05 (typed-lanes viable), poc/06 (fast MMA).
 
+## SCOPE CORRECTION (user, 2026-07-15): full dtype coverage is a goal, NOT f32-only
+
+f32-only was the M1/M2 *starting* milestone, wrongly carried forward as a permanent
+constraint. Target = full JAX coverage for complex workloads ⇒ multiple dtypes. The whole
+stack is currently f32-hardcoded (VM `__global float* arena`, loader patches f32-element
+offsets, tile-ops compute in `float`, `tensor_info` rejects non-f32). Making it dtype-aware is
+the new keystone workstream.
+
+**Architecture change**: buffers already carry a `dtype` field. Extend the enum; make the arena
+byte-addressed (patch BYTE offsets, not ÷4); each tile-op reinterprets via typed pointers and
+dispatches on a per-task dtype. Alignment is fine (arena buffers are 64B-aligned).
+
+**Dtype tiers by cost (OpenCL reality):**
+- **Tier 1 — native OpenCL, needed by *default* JAX** (32-bit, x64 off): `i32`, `bool`/pred,
+  `u32`. Unlock indexing/gather/scatter, real boolean masks, integer counters, argmax/argmin.
+  Highest value, tractable. Do first.
+- **Tier 2 — native but device-conditional / x64**: `i64`, `f64` (needs `cl_khr_fp64`; ABSENT
+  on Intel Xe2 consumer & others — feature-detect, error clearly if used on a device without it),
+  `f16` (needs `cl_khr_fp16`). jax x64 mode (`jax_enable_x64`) needs i64/f64.
+- **Tier 3 — no native OpenCL type, needs emulation**: `bf16` (store u16, up-convert to f32 for
+  math), `complex64/128` (pairs of f32/f64 — every op splits into real/imag). Significant.
+
+**Plan**: (1) dtype-aware format + loader + VM foundation; (2) Tier 1 (i32, bool) end-to-end
+through both validators + jax tests; (3) Tier 2 behind feature-detection; (4) Tier 3 emulation.
+Mixed-dtype ops (convert, compare→bool, select(bool pred), bitcast) come with Tier 1.
+
 ## Phase 3 perf directives (user, 2026-07-15)
 
 1. ✅ **Transfers fixed — data stays ON DEVICE.** PJRT_Buffer holds a device cl_mem;
