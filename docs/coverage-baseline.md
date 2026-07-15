@@ -1,4 +1,22 @@
-# JAX coverage baseline (lax_test.py, 2026-07-15)
+# JAX coverage progress (lax_test.py)
+
+## After dtype work (2026-07-15): 297 → **405 passing** (2162 → 2054 failing)
+
+The i32/u32/i64/bool/f64/convert implementation cleared EVERY 4-byte + boolean +
+i8/i16 dtype rejection from the baseline (i32 528, bool 286, i16 212, i8 178,
+u32 102 — all gone). Remaining dtype rejections are only the ones needing the
+2-byte / emulated path: **bf16 920, f16 786, complex 358, f8 10**. Next-op
+frontier surfaced by dtype support: `or`/`and`/`xor` (138, bitwise/logical now
+that int/bool exist), composite (118), reduce_window (102), convolution (94),
+log_plus_one (54), bitcast_convert (52), sort (46).
+
+Priority now: (1) f16/bf16 (2-byte; byte-addressed arena is ready — need
+cl_khr_fp16 gating + bf16 u16 emulation) = the single biggest bucket; (2) the
+easy new ops (or/and/xor, log1p, bitcast_convert); (3) reduce_window/conv/sort.
+
+---
+
+# JAX coverage baseline (lax_test.py, 2026-07-15, pre-dtype)
 
 First run of JAX's own `tests/lax_test.py` against our OpenCL backend
 (`tools/jax_coverage.sh`), single-device, jax 0.10.2.
