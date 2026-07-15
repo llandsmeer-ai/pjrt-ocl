@@ -1,5 +1,19 @@
 # JAX coverage progress (lax_test.py)
 
+## 2026-07-15 wave 3: **1164 passing** (was 297 baseline → 405 → 1164)
+
+f16/bf16 + full EW math/logical batch (log1p/atan2/trig/round/and/or/xor/is_finite)
++ func.call inlining (where/clip) + integer reduce + bitcast_convert. Then
+concatenate + pad (strided-scatter tile op). All 4/8/2-byte + bool dtypes work.
+
+Remaining top ops (ranked): composite 316 (mostly jax's own composite-feature
+tests, narrow), convolution 218, **while 122** (VM already supports on-device
+while — needs lowering + scheduler wiring), reduce_window 118, scatter 98 (general
+stablehlo.scatter), sort 76, complex 62, dynamic_slice 46. These are the
+structurally-harder ops (control flow, dynamic indexing, windowed/conv, sort) —
+fanned out as focused efforts.
+
+
 ## After dtype work (2026-07-15): 297 → **405 passing** (2162 → 2054 failing)
 
 The i32/u32/i64/bool/f64/convert implementation cleared EVERY 4-byte + boolean +
