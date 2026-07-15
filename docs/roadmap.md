@@ -45,6 +45,18 @@ dispatches on a per-task dtype. Alignment is fine (arena buffers are 64B-aligned
 - **Tier 3 — no native OpenCL type, needs emulation**: `bf16` (store u16, up-convert to f32 for
   math), `complex64/128` (pairs of f32/f64 — every op splits into real/imag). Significant.
 
+### TODO — native f16 via cl_khr_fp16 on supported platforms (user, 2026-07-15)
+
+f16/bf16 currently do 2-byte storage + **f32 compute** (portable, no extension: vload_half/
+vstore_half, bf16 bit-shift). This is correct everywhere but leaves performance on the table on
+devices with native half arithmetic. TODO: when `cl_khr_fp16` is present (feature-detect at init,
+like fp64), enable `#pragma OPENCL EXTENSION cl_khr_fp16` and a native-`half` compute path for
+f16 (and vectorized half ops), selected per-device behind the same kernel-table/override
+mechanism. Keep the portable f32-compute path as the fallback for devices without it (incl.
+NVIDIA OpenCL, which exposes fp16 storage but not always compute). bf16 stays emulated (no
+hardware bf16 in OpenCL). This is a perf optimization, not a correctness gap — sequence it after
+op coverage.
+
 **Plan**: (1) dtype-aware format + loader + VM foundation; (2) Tier 1 (i32, bool) end-to-end
 through both validators + jax tests; (3) Tier 2 behind feature-detection; (4) Tier 3 emulation.
 Mixed-dtype ops (convert, compare→bool, select(bool pred), bitcast) come with Tier 1.
