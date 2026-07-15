@@ -58,9 +58,46 @@ cell and checks it equals `iter`; repeat. Stale reads counted.
    B is already clean on PoCL, but the spin-barrier still deadlocks there at
    high lane counts because CPU workgroups aren't guaranteed co-resident).
 
+## Part 2 — the CPU/PoCL deadlock is imbalance-starvation, not the barrier
+
+Follow-up question: "can't we make barriers work on CPU? force co-residency?"
+The barrier primitive itself is **fine on PoCL** — the persistent spin-barrier
+runs 200k iterations at G=8..32 with zero hangs. Yet the real `vm2` megakernel
+(`runtime_test`) deadlocks on PoCL with **4 workgroups busy-spinning** while the
+rest sleep. `barrier_starvation.c` bisects the difference between poc07 (works)
+and vm2 (hangs):
+
+| kernel variant on PoCL | result |
+|---|---|
+| barrier in a counted loop (poc07 shape) | ✅ works, any G |
+| barrier in `for(;;)`+break (vm2 interpreter shape) | ✅ works |
+| + 8 KB `__local` (vm2's MMA panels) | ✅ works |
+| + private frame stack + 16 regs (vm2 footprint) | ✅ works |
+| **+ imbalanced lanes** (only lane 0 does pre-barrier work) | ❌ **DEADLOCK, any G** |
+
+**Root cause: PoCL's thread pool is non-preemptive.** A workgroup that reaches
+the barrier first spins on the arrival counter, holding its worker thread and
+never yielding. The slow workgroup that still owes an arrival can be starved of
+a thread → it never arrives → everyone spins forever. poc07 is perfectly
+*balanced* (every lane does identical work), so all arrive together and nobody
+spins long. Real VM schedules are *imbalanced* by construction (a matmul tile on
+one lane, EW ops on others, idle lanes at the barrier) → guaranteed starvation.
+OpenCL C has **no yield primitive**, so an in-kernel spin-barrier cannot be made
+robust to imbalance on a non-preemptive CPU runtime. Co-residency isn't the
+lever (it deadlocks at G=4 with 24 threads free); balance is, and we don't
+control it.
+
+**Conclusion:** the persistent spin-barrier is a GPU technique. The correct
+cross-workgroup barrier on CPU OpenCL is the **kernel boundary** (test D: host
+relaunch per phase, 46 µs/phase on PoCL, immune to imbalance because a workgroup
+that finishes simply *exits* and frees its thread). CPU devices need the
+host-dispatch engine; GPUs keep the (now device-scope-correct) megakernel.
+
 ## Build / run
 
 ```
-make && PJRT_OCL_DEVICE=NVIDIA ./poc07
+make && PJRT_OCL_DEVICE=NVIDIA ./poc07              # part 1: memory model
       PJRT_OCL_DEVICE=Portable ./poc07
+cc -O2 -o bs barrier_starvation.c -lOpenCL          # part 2: imbalance starvation
+PJRT_OCL_DEVICE=Portable G_ENV=4 ./bs               # deadlocks (imbalanced)
 ```

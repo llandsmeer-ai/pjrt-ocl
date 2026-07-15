@@ -24,10 +24,30 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
   RUNTIME-PROBED, never trusted from `CL_DEVICE_ATOMIC_FENCE_CAPABILITIES`. Native on PoCL/AMD/
   Intel. Rejected alternatives kept for the record: `volatile` cross-lane reads (test C) also work
   on NVIDIA via L1-bypass but kill L1 reuse; no `cl_khr_*` extension provides a grid barrier.
-  Applied to `pjrt_plugin/kernels/vm_common.cl`; runtime_test A+B still PASS on NVIDIA. **Follow-up:
-  this unblocks lifting `n_lanes=1` for while** (multi-lane loop bodies) — needs a cross-lane-under-
-  iteration e2e test before flipping the scheduler gate. **Axis 2 (liveness) is still open** — see
-  next node; device-scope fences do NOT help it.
+  Applied to `pjrt_plugin/kernels/vm_common.cl`; runtime_test A+B still PASS on NVIDIA. **DONE:
+  multi-lane while shipped** — with the gate lifted, the while e2e on the OLD barrier returned 23
+  (want 17: the real cross-lane race); on the device-scope barrier it returns 17, 20/20 e2e runs
+  deterministic on NVIDIA. **Axis 2 (liveness) — ROOT-CAUSED below; device-scope fences do NOT
+  help it.**
+
+- ✅ **LIVENESS ROOT CAUSE NAILED 2026-07-15 (poc/07 part 2): imbalance + spin + PoCL
+  non-preemption.** Earlier this was hand-waved as "PoCL doesn't co-schedule workgroups." poc/07's
+  `barrier_starvation.c` bisects it exactly. The spin-barrier PRIMITIVE is fine on PoCL — poc/07
+  runs 200k barrier iterations at G=8..32 (even G>CUs) with zero hangs. The megakernel deadlocks
+  only when lanes are **imbalanced**: a variant that adds, one at a time, vm2's unstructured
+  `for(;;)`+break loop, its 8 KB `__local`, and its private frame/register footprint STILL runs
+  clean — until only lane 0 does pre-barrier work, then it **DEADLOCKS at every G (incl. G=4 with
+  24 threads free)**. Mechanism: PoCL's worker pool is NON-PREEMPTIVE; a workgroup that reaches the
+  barrier first spins on the arrival counter holding its thread and never yields, starving the slow
+  workgroup that still owes an arrival. Real schedules are imbalanced by construction (tile on one
+  lane, EW on others, idle lanes) → guaranteed starvation. **Co-residency is NOT the lever** (fails
+  at G=4≪24 threads); balance is, and the scheduler can't guarantee it. OpenCL C has **no yield
+  primitive**, so an in-kernel spin-barrier CANNOT be made imbalance-robust on a non-preemptive CPU
+  runtime — this is why nobody ships CPU cross-workgroup sync as a spin. **The correct CPU barrier
+  is the KERNEL BOUNDARY** (poc/07 test D: host relaunch per phase, 46 µs/phase on PoCL, immune
+  because a finished workgroup EXITS and frees its thread). Decision: **host-dispatch engine for CPU
+  (non-GPU) devices; GPUs keep the device-scope megakernel.** Supersedes the vaguer fix-options in
+  the node below.
 - ⚠️ **CONFIRMED #1 RISK 2026-07-15: cross-workgroup spin-barrier is UNRELIABLE on PoCL under
   iteration (LIVENESS axis — still open; poc/07 fixed only the visibility axis above).** The persistent-VLIW engine (vm2.cl) uses the poc/01 global barrier between schedule
   phases. On NVIDIA it is rock-solid (500 two-level + 300 chained-matmul back-to-back runs, zero

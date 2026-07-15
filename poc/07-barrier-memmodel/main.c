@@ -154,7 +154,12 @@ int main(void){
    * clamp to 8 so neighbours definitely co-reside on any device. */
   cl_uint G = cus<8?cus:8;
   cl_uint T = 200000;   /* enough iterations to expose a rare stale read */
-  size_t lsz=32, gsz=(size_t)G*lsz;
+  size_t lsz=32;
+  if(const char*e=getenv("G_ENV")) G=atoi(e);
+  if(const char*e=getenv("LSZ_ENV")) lsz=atoi(e);
+  if(const char*e=getenv("T_ENV")) T=atoi(e);
+  size_t gsz=(size_t)G*lsz;
+  printf("[cfg] G=%u lsz=%zu T=%u\n", G, lsz, T);
 
   cl_mem a=clCreateBuffer(ctx,CL_MEM_READ_WRITE,G*sizeof(int),NULL,&e); CK(e);
   cl_mem b=clCreateBuffer(ctx,CL_MEM_READ_WRITE,2*sizeof(cl_uint),NULL,&e); CK(e);
