@@ -340,7 +340,7 @@ def test_unsupported_op_exit2_json():
     import jax.numpy as jnp
 
     def f(x):
-        return jnp.sum(x)  # stablehlo.reduce: beyond v1 coverage
+        return jnp.tanh(x)  # stablehlo.tanh: beyond current coverage
 
     artifact = serialize_as_plugin_would_receive(f, jnp.zeros(8, jnp.float32))
     proc = run_service(artifact)
@@ -348,7 +348,7 @@ def test_unsupported_op_exit2_json():
     assert proc.stdout == b""
     err = json.loads(proc.stderr.decode())
     assert err["error"] == "LoweringError"
-    assert "stablehlo.reduce" in err["message"]
+    assert "stablehlo.tanh" in err["message"]
     assert "stablehlo.add" in err["message"]  # known-ops list included
 
 
