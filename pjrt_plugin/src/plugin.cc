@@ -222,6 +222,19 @@ struct PJRT_LoadedExecutable {
   bool deleted = false;
 };
 
+// Our VM dtype enum (runtime.h VmDtype) -> PJRT buffer type, for reporting
+// output element types back to the framework.
+static PJRT_Buffer_Type VmDtypeToPjrt(uint32_t dt) {
+  switch (dt) {
+    case pjrt_ocl::kDtI32:  return PJRT_Buffer_Type_S32;
+    case pjrt_ocl::kDtU32:  return PJRT_Buffer_Type_U32;
+    case pjrt_ocl::kDtBool: return PJRT_Buffer_Type_PRED;
+    case pjrt_ocl::kDtI64:  return PJRT_Buffer_Type_S64;
+    case pjrt_ocl::kDtF64:  return PJRT_Buffer_Type_F64;
+    default:                return PJRT_Buffer_Type_F32;
+  }
+}
+
 static size_t DtypeSize(PJRT_Buffer_Type t) {
   switch (t) {
     case PJRT_Buffer_Type_PRED: case PJRT_Buffer_Type_S8:
@@ -771,7 +784,8 @@ static PJRT_Error* Impl_PJRT_Client_Compile(PJRT_Client_Compile_Args* args) {
   meta->fingerprint = "pjrt-ocl-" + std::to_string(std::hash<std::string>{}(
                           std::string(vmp_bytes.begin(), vmp_bytes.end())));
   for (size_t i = 0; i < prog.outputs.size(); ++i) {
-    meta->output_types.push_back(PJRT_Buffer_Type_F32);
+    meta->output_types.push_back(
+        VmDtypeToPjrt(prog.buffers[prog.outputs[i]].dtype));
     const auto& dims = prog.output_dims[i];
     meta->output_dim_sizes.push_back(dims.size());
     meta->output_dims_flat.insert(meta->output_dims_flat.end(), dims.begin(),
@@ -951,7 +965,7 @@ static PJRT_Error* Impl_PJRT_LoadedExecutable_Execute(
     auto* out = new PJRT_Buffer{};
     out->client = lexe->client;
     out->device = lexe->client->devices[0];
-    out->type = PJRT_Buffer_Type_F32;
+    out->type = VmDtypeToPjrt(prog.buffers[prog.outputs[i]].dtype);
     out->dims = prog.output_dims[i];
     out->mem = outputs[i];
     out->size_bytes = prog.buffers[prog.outputs[i]].size_bytes;

@@ -90,6 +90,7 @@ struct VmProgram {
 struct DeviceInfo {
   std::string platform_name, device_name, driver_version, cl_version;
   bool is_gpu = false;
+  bool has_fp64 = false;   // cl_khr_fp64 — gates f64 programs
   cl_uint compute_units = 0;
 };
 

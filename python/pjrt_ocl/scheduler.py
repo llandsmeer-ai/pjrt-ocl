@@ -128,7 +128,7 @@ class DeviceConfig:
 
 @dataclasses.dataclass
 class Task:
-    tile_op: int
+    tile_op: int          # base op; dtype packed into bits 8-15 at serialize
     dst: int = 0
     a: int = 0
     b: int = 0
@@ -136,6 +136,7 @@ class Task:
     p1: int = 0
     p2: int = 0
     p3: int = 0
+    dtype: int = 0        # DT_* — how the VM interprets arena slots
 
     def n_tiles(self) -> int:
         if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM):
@@ -185,7 +186,7 @@ class Schedule:
         out += SCHED_HDR_STRUCT.pack(len(self.tasks), len(flat),
                                      self.n_flags, self.n_lanes)
         for t in self.tasks:
-            out += TASK_STRUCT.pack(t.tile_op, t.dst, t.a, t.b,
+            out += TASK_STRUCT.pack(t.tile_op | (t.dtype << 8), t.dst, t.a, t.b,
                                     t.p0, t.p1, t.p2, t.p3)
         for off, count, root_len in lane_tab:
             out += LANETAB_STRUCT.pack(off, count, root_len, 0)
@@ -250,20 +251,25 @@ def _levels(instrs, indices: list[int]) -> list[list[int]]:
 
 # --- instruction -> task mapping --------------------------------------------
 
-def _instr_to_task(ins: L.Instr) -> Task:
+def _instr_to_task(ins: L.Instr, buffers) -> Task:
     """Map a compute tensor instruction to its tile task. Built-in EW fast
-    path; other ops register a mapper in opsem.TO_TASK."""
+    path; other ops register a mapper in opsem.TO_TASK. The task dtype is the
+    result buffer's dtype (how the VM interprets its arena slots)."""
+    dtype = buffers[ins.dst].dtype
     if ins.op in _TENSOR_TO_EW:
         subop = _TENSOR_TO_EW[ins.op]
         p2 = ins.imm if ins.op == L.OP_FILL_F32 else 0
-        return Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.b,
+        task = Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.b,
                     p0=subop, p1=ins.n, p2=p2, p3=0)
-    mapper = opsem.TO_TASK.get(ins.op)
-    if mapper is not None:
-        return mapper(ins)
-    raise ScheduleError(
-        f"scheduler: no task mapping for opcode {ins.op} "
-        f"({L.OP_NAMES.get(ins.op, hex(ins.op))})")
+    else:
+        mapper = opsem.TO_TASK.get(ins.op)
+        if mapper is None:
+            raise ScheduleError(
+                f"scheduler: no task mapping for opcode {ins.op} "
+                f"({L.OP_NAMES.get(ins.op, hex(ins.op))})")
+        task = mapper(ins)
+    task.dtype = dtype
+    return task
 
 
 # --- lane packing within a level (LPT by cost) ------------------------------
@@ -358,7 +364,7 @@ def schedule_program(prog: L.VMProgram,
         if ins.op == L.OP_NOP:
             continue
         instr_task[idx] = len(tasks)
-        tasks.append(_instr_to_task(ins))
+        tasks.append(_instr_to_task(ins, prog.buffers))
 
     sched_indices = [i for i in range(len(main)) if i in instr_task]
     for level in _levels(main, sched_indices):

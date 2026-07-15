@@ -71,8 +71,10 @@ DTYPE_NUMPY = {
     DT_I32: np.dtype("<i4"),
     DT_U32: np.dtype("<u4"),
     DT_BOOL: np.dtype("<i4"),   # our arena repr: i32 0/1
+    DT_I64: np.dtype("<i8"),
+    DT_F64: np.dtype("<f8"),
 }
-# Tier-1 dtypes are all 4-byte and share the slot-reinterpret VM path.
+# 4-byte dtypes (share tile size math); 8-byte need the wide arena path.
 TIER1_DTYPES = frozenset({DT_F32, DT_I32, DT_U32, DT_BOOL})
 
 OP_NOP = 0
@@ -282,10 +284,12 @@ class _Ctx:
 
 
 def _elem_dtype(element_type) -> int:
-    """MLIR element type -> our dtype enum (Tier 1). Raises for unsupported."""
+    """MLIR element type -> our dtype enum. Raises for unsupported."""
     from jaxlib.mlir import ir
     if isinstance(element_type, ir.F32Type):
         return DT_F32
+    if isinstance(element_type, ir.F64Type):
+        return DT_F64                      # device-gated (cl_khr_fp64) at load
     if isinstance(element_type, ir.IntegerType):
         w = element_type.width
         if w == 1:
@@ -294,11 +298,13 @@ def _elem_dtype(element_type) -> int:
             # stablehlo integers are signless; treat as i32 (jax uses i32 for
             # indices/counters). unsigned is distinguished by the op, not type.
             return DT_I32
+        if w == 64:
+            return DT_I64                  # Tier 2
         raise LoweringError(
-            f"unsupported integer width i{w} (Tier 1 = i32/bool; i64 is Tier 2)")
+            f"unsupported integer width i{w} (have i1/i32/i64; i8/i16 later)")
     raise LoweringError(
         f"unsupported element type {element_type} "
-        f"(Tier 1 dtypes: f32, i32, bool; f64/f16/bf16/i64/complex are later)")
+        f"(have f32/f64/i32/i64/bool; f16/bf16/complex are later)")
 
 
 def _tensor_info(mlir_type) -> tuple[tuple[int, ...], int, int]:
@@ -313,14 +319,6 @@ def _tensor_info(mlir_type) -> tuple[tuple[int, ...], int, int]:
     if any(t.is_dynamic_dim(i) for i in range(t.rank)):
         raise LoweringError(f"dynamic shapes unsupported: {mlir_type}")
     dtype = _elem_dtype(t.element_type)
-    # Recognition is dtype-aware (groundwork), but the VM/scheduler/vmreader
-    # only execute f32 today. Gate here so non-f32 raises a clean "not yet"
-    # instead of silently mis-executing as f32. Lifting this gate per dtype is
-    # the Tier-1 (i32/bool) vertical-slice work (docs/roadmap.md, dtype tiers).
-    if dtype != DT_F32:
-        raise LoweringError(
-            f"dtype {DTYPE_NUMPY.get(dtype, dtype)} recognized but not yet "
-            f"executable (VM is f32-only pending the dtype workstream)")
     shape = tuple(t.shape)
     return shape, math.prod(shape) if t.rank else 1, dtype
 
@@ -369,7 +367,12 @@ OP_HANDLERS["stablehlo.subtract"] = _elementwise_binop(OP_SUB_F32)
 def _lower_constant(ctx: _Ctx, op):
     from jaxlib.mlir import ir
     _, n_elems, dtype = _tensor_info(op.results[0].type)
-    attr = ir.DenseFPElementsAttr(op.attributes["value"])
+    value = op.attributes["value"]
+    # int/bool constants are DenseIntElementsAttr; float are DenseFPElementsAttr.
+    if dtype in (DT_I32, DT_U32, DT_BOOL, DT_I64):
+        attr = ir.DenseIntElementsAttr(value)
+    else:
+        attr = ir.DenseFPElementsAttr(value)
     arr = np.asarray(attr, dtype=DTYPE_NUMPY[dtype]).reshape(-1)
     if arr.size == 1 and n_elems != 1:  # splat: expand into the const pool
         arr = np.broadcast_to(arr, (n_elems,)).copy()

@@ -84,7 +84,7 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
     if (!r.U64(&b.arena_byte_offset) || !r.U64(&b.size_bytes) ||
         !r.U32(&b.dtype) || !r.U32(&pad))
       return fail("truncated buffer table");
-    if (b.dtype != 0) return fail("unsupported dtype " + std::to_string(b.dtype));
+    if (b.dtype > kDtMax) return fail("unsupported dtype " + std::to_string(b.dtype));
     if (b.arena_byte_offset % 4 || b.arena_byte_offset + b.size_bytes > out->arena_bytes)
       return fail("buffer outside arena / misaligned");
   }
@@ -270,6 +270,9 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->info_.driver_version = ClInfoStr(chosen->device, CL_DRIVER_VERSION);
   rt->info_.cl_version = ClInfoStr(chosen->device, CL_DEVICE_VERSION);
   rt->info_.is_gpu = chosen->is_gpu;
+  rt->info_.has_fp64 =
+      ClInfoStr(chosen->device, CL_DEVICE_EXTENSIONS).find("cl_khr_fp64") !=
+      std::string::npos;
   clGetDeviceInfo(rt->dev_, CL_DEVICE_MAX_COMPUTE_UNITS,
                   sizeof(rt->info_.compute_units), &rt->info_.compute_units,
                   nullptr);
@@ -329,6 +332,15 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
   lp->rt_ = rt;
   lp->prog_ = std::move(prog);
   const VmProgram& p = lp->prog_;
+
+  // f64 gate: the VM's f64 path is compiled only under cl_khr_fp64, so on a
+  // device without it an f64 program would silently fall back to f32. Refuse.
+  if (!rt->info().has_fp64) {
+    for (const auto& b : p.buffers)
+      if (b.dtype == kDtF64)
+        return fail("program uses f64 but device lacks cl_khr_fp64 "
+                    "(" + rt->info().device_name + ")");
+  }
 
   cl_int cerr;
   lp->arena_ = clCreateBuffer(rt->ctx(), CL_MEM_READ_WRITE,
