@@ -106,3 +106,119 @@ pins all of these):
   fine for current program sizes.
 - Should the service cap artifact size / add a timeout guard? Currently reads stdin to EOF
   unbounded; the C++ side should enforce a subprocess timeout.
+
+## VMProgram v3 (tensor v2 + schedule v2.1) — Phase 1.3 (2026-07-15)
+
+Upgraded the python producer from v1 to **version 3** (v2 tensor sections + v2.1 schedule
+sections). Files: `lowering.py` (v3 tensor writer), new `scheduler.py` (tensor→schedule),
+`vmreader.py` (parses v3 + two validators), `lower_service.py` (runs the scheduler),
+`tests/test_lowering.py` (updated goldens + schedule tests). Consumer is the C++ VLIW engine
+being built in parallel against the SAME spec (docs/vmprogram.md).
+
+### Spec readings implemented byte-exactly (goldens pin these)
+
+1. **`version = 3`.** docs/vmprogram.md v2.1 says "Header version becomes 3"; v2 tensor-only files
+   are never emitted (one repo, no compat). Magic is unchanged (`0x314D5056` / "VPM1") — the spec
+   only bumps the version field. Reader rejects any version != 3.
+2. **48-byte header**: after `n_outputs`, inserted `n_aux u32, pad u32`, then `arena_bytes u64`
+   as before → `<IIIIIIIIIIQ>`. `pad` asserted zero by the reader.
+3. **Aux pool** section is between IO shapes and const pool: `n_aux × u32`, then pad to 8B. For
+   the current EW-only op set `n_aux == 0`, so the section is empty (0 bytes). Instructions carry
+   the aux word offset in the field formerly `pad0`, now **`aux`**; `pad1` stays reserved and is
+   asserted zero. EW ops emit `aux = 0`.
+4. **Schedule sections** follow the instruction array (already 8B-aligned since instrs are 32B).
+   Layout exactly per spec: `sched header {n_tasks,n_entries,n_flags,n_lanes}` (16B), tasks
+   (32B each), **lane table** (n_lanes × {entry_off u32, entry_count u32}), entries (32B each,
+   `{task,tile_lo,tile_hi,wait_flag,wait_count,signal_flag,slots,pad}`). Entries are stored as one
+   flat array; the lane table indexes into it (mirrors poc/04's host layout).
+5. **v0 scheduling contract**: BARRIER (`task=0xFFFFFFFE`) appended to EVERY lane's stream after
+   EVERY dataflow level, **including the last** (per task spec). Consequence: all lanes have an
+   identical barrier count (= number of levels) and every lane's stream ends with a BARRIER.
+   WAIT/SIGNAL unused: `wait_flag = signal_flag = 0xFFFFFFFF`, `wait_count = 0`. `slots = 0`.
+   `n_flags = 0`.
+
+### Ambiguities found + the reading chosen (recorded per hard-rule; no silent deviation)
+
+- **A1 — Levels vs. barrier count / "one barrier phase for empty programs".** The spec defines a
+  BARRIER after each level but doesn't say what an instruction-free root list produces. Chosen:
+  emit a single BARRIER on every lane (one empty phase) so lane streams stay uniform and the
+  executor always has a defined shape. (Current lowering always has ≥1 compute instr, so this is
+  only a defensive corner.)
+- **A2 — Dependency model.** Task spec: "B depends on A if B reads (a/b, +p3 for select later) or
+  writes a buffer that A writes (WAW too)." Implemented RAW (B.reads ∩ A.writes) + WAW
+  (B.writes ∩ A.writes). **WAR is intentionally NOT modeled** — the tensor program is SSA so each
+  buffer is written once; the only writes that alias are the SSA value's own def. If a future
+  buffer-liveness/reuse pass (NOTES "Buffer plan is still naive…") introduces real WAR/WAW on
+  reused arena slots, the WAW edge already covers reuse-of-a-written-slot; WAR would need adding
+  then. Flagged here so the C++ side and the reuse pass author see it.
+- **A3 — Greedy level grouping is order-sensitive but correctness-safe.** "an instr joins the
+  current level iff it has no dependency on any instr in the current level; else new level" is a
+  single forward pass (not optimal bin-of-levels). It never places an instr in the same level as
+  a dependency, so barriers always separate producer/consumer → correct. It can be *suboptimal*
+  (an instr that only depends on an *earlier* level still starts a new level if it conflicts with
+  something in the current one). Matches the spec's literal wording; good enough for v0.
+- **A4 — Lane packing: `n_tasks > n_lanes`.** The spec's packing ("≥1 lane/task, ≤tiles lanes,
+  one entry per (task,lane-range)") implicitly assumes `n_tasks ≤ n_lanes` (else you can't give
+  every task its own disjoint lane block). Current lowering can't produce that (small graphs,
+  default 8 lanes), but for robustness I added an **overflow regime**: LPT bin-pack whole tasks
+  onto lanes (cost-descending onto the least-loaded lane), each task = ONE entry covering all its
+  tiles on a single lane. This keeps "one entry per (task,lane-range)" valid and every task on
+  ≥1 lane, at the cost of multiple entries per lane in one phase (which the async engine already
+  supports — poc/04 test E). Primary regime unchanged. Reader/simulator validate both.
+- **A5 — "LPT by cost" + "proportional to cost share".** Read as: seed 1 lane per task, then hand
+  each remaining lane to the task with the highest current *per-lane* cost (`total_cost/lanes`)
+  that can still absorb one (`lanes < tiles`) — an LPT top-up that converges to proportional
+  shares. A task's tiles then split into contiguous even ranges across its lanes
+  (`lo = tiles*j//k`, poc/04 pattern). NOTE: for the *current* op set every task is EW with the
+  SAME unit cost, so lane bias comes only from **tile count** (n_elems); the cost table only
+  starts to matter once MMA/GATHER/REDUCE tasks (different unit costs) exist. Verified: 8-tile vs
+  2-tile co-scheduled adds → 6 vs 2 lanes; equal tiles → even 4/4 split.
+- **A6 — Cost table units / keys.** `PJRT_OCL_COST_TABLE` JSON keys are exactly
+  `ew_tile_us, mma_tile_us, gather_tile_us, reduce_tile_us`. REDUCE_PART and REDUCE_COMB both map
+  to `reduce_tile_us`; IOTA_DIM reuses `ew_tile_us` (no dedicated key). Missing env, missing file,
+  or unparseable JSON → all unit costs default to 1.0 (per spec). Absolute µs values don't matter
+  for packing — only cost *ratios* — so 1.0-everywhere degrades to tile-count balancing.
+
+### Control-flow scheduling (WHILE/IF) — structured SEAM, not implemented
+
+Current lowering never emits region ops (splat consts are expanded, no control-flow lowering yet).
+The scheduler is structured to recurse on region lists but the recursion body is a seam:
+`schedule_program` raises `ScheduleError` (→ service exit 2) if a WHILE/IF instruction appears,
+and `vmreader._split_phases` / the simulator reject WHILE/IF entries. Tests:
+`test_scheduler_while_loop` (skip skeleton documenting the intended encoding — cond/body region
+lists scheduled into per-lane sub-ranges after the main stream, WHILE entry `task=0xFFFFFFFD`
+uniform in every lane, ranges are entry-index offsets within the lane's OWN stream) and
+`test_scheduler_rejects_region_op_for_now` (asserts the clean rejection). The v1 tensor WHILE
+still round-trips through the reader's **semantic** interpreter (tensor-only serialize,
+`schedule=None`) — `test_vmreader_while_loop`.
+
+### Two reference validators (both run on every e2e case; must agree)
+
+- (a) `vmreader.execute`: numpy interpreter over the TENSOR sections (source of truth), updated for
+  the 48B header + aux field.
+- (b) `vmreader.execute_schedule`: a LANE SIMULATOR over the SCHEDULE sections. Runs barrier-phase
+  by barrier-phase; within a phase it executes the entries in forward AND reverse order on a fresh
+  arena copy and asserts identical results (proves lane order-independence within a phase). Also
+  asserts: every tile of every task covered exactly once (contiguous, in-bounds), identical
+  barrier counts across lanes, task/entry/range bounds. Final outputs must equal (a). This is the
+  python mirror of the C++ VLIW engine and pins the schedule semantics the C++ side must match.
+
+### Verified
+
+`.venv/bin/python -m pytest tests/test_lowering.py -q` → **21 passed, 1 skipped** (PYTHONPATH set
+to the worktree's python/, confirmed `pjrt_ocl.__file__` resolves into the worktree). Coverage:
+v3 golden byte layout (tensor exact bytes + schedule header/task/barrier unpack), jax e2e via the
+lower_service subprocess through BOTH validators, multi-op independence
+(`lambda a,b,c,d:(a+b,c*d)` → both tasks in one barrier phase on 2 distinct lanes), dependent-chain
+serialization (a*b-c → 2 phases), lane allocation (proportional / even-split), device-config &
+cost-table parsing, region-op rejection.
+
+### Follow-ups / open
+
+- Fill the WHILE/IF scheduling seam (Phase 1.5 / M4): needs per-lane sub-stream layout + the
+  entry-relative range encoding; the reader simulator needs a matching frame-stack executor.
+- WAIT/SIGNAL per-op completion counters (tile-isa.md) are the refinement past v0's barrier-per-
+  level; `n_flags` and the wait/signal entry fields are already carried through (as FLAG_NONE/0).
+- Once real int dtypes / non-EW tile ops land, revisit the cost table's role (it becomes load-
+  bearing) and the aux-pool wiring (GATHER/REDUCE/DOT/IOTA_DIM populate it — n_aux > 0 path is
+  written and reader-validated but currently unexercised).
