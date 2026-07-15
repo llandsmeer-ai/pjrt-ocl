@@ -124,7 +124,13 @@ measured bubble % improves; (e) perf vs serial megakernel and streamed launches 
   interpreter overhead amortizes to ~0.
 - Ceiling 1 (engineering): one binary per launch ⇒ fattest tile-op's registers/local tax all
   lanes. Mitigation: typed lanes as CONCURRENT kernel launches syncing via shared atomic flags.
-  🔬 needs PoC: cross-kernel co-residency of spinning groups is driver-dependent.
+  ✅ **poc/05 VALIDATED 2026-07-15**: two different kernels on separate in-order queues DO stay
+  co-resident and sync via shared atomic flags. NVIDIA: works to ~6x CU count (dummy kernels),
+  cross-kernel handshake CHEAPER than intra-kernel barrier (0.58×). PoCL: hard wall at
+  sum(groups) ≤ CUs. RULE: launch geometry = per-kernel occupancy query summed over concurrent
+  typed kernels, NOT a fixed multiplier (real MMA kernel's register use lowers its ceiling).
+  Quirks: clFlush all queues before waiting (else host-stall looks like deadlock); NVIDIA event
+  status stays CL_SUBMITTED during deadlock (not a liveness signal) — use a host watchdog.
 - Ceiling 2 (accept): no SASS/PTX access from OpenCL on NVIDIA ⇒ CLBlast-class 40–70% of SIMT
   peak is the realistic target (cuBLAS ~85–90%).
 - Ceiling 3 (fundamental): matrix units unreachable from OpenCL on NVIDIA (tensor cores) and
