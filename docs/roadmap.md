@@ -173,3 +173,13 @@ Mixed-dtype ops (convert, compare→bool, select(bool pred), bitcast) come with 
 - jax 0.10.2 pin, PJRT C API 0.112, VHLO artifact ingest, subprocess lowering interface
   (exit 0/2/3, options python_exe/lower_service).
 - Env: `. ./env.sh` ALWAYS (root overlay full); 32 GB RAM; PoCL needs POCL_CACHE_DIR.
+
+### TODO — namespace-prefix kernel helper functions (vendor-reserved-name safety)
+
+A user's OpenCL vendor reserves `global_barrier` (injects `void global_barrier()`
+via CTHeader.h), which collided with our static helper -> kernel build failed.
+Fixed by renaming to `vm_barrier`. Other generic helper names (load_f, ew_bin,
+ew_un, cmp_pred, gather_tile, ...) could collide on other vendors. TODO: prefix
+all kernel static helpers with a namespace (e.g. `vmo_`) to be collision-safe for
+public use. Deferred: the op-coverage agents are actively editing the ops/*.cl
+files; do the mass rename after they merge to avoid conflicts.
