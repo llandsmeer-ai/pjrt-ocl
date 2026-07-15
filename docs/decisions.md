@@ -365,3 +365,27 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
   `libnvidia-opencl.so.1` (was missing; clinfo now lists the RTX PRO 6000 Blackwell).
 - ✅ PoCL installed 2026-07-14 (`pocl-opencl-icd`): platform "Portable Computing Language",
   device cpu-haswell (AMD Ryzen 9 3900X).
+
+## 9. First Intel Xe2 bring-up (2026-07-15, Lunar Lake host)
+
+- Environment: Intel Core Ultra 9 288V (Lunar Lake) w/ builtin Arc 140V (**Xe2**, 8 Xe-cores,
+  reports **64 compute units** = XVEs), inside Docker (needed `--device /dev/dri` passthrough +
+  a Lunar-Lake-capable ICD: `intel-opencl-icd` **26.22** from `ppa:kobuk-team/intel-graphics`;
+  24.04-archive 23.43 predates LNL and enumerates nothing).
+- ✅ **Results**: `runtime_test` PASS; full pytest **198 passed / 1 skip** on Xe2 with EITHER
+  engine — megakernel (`PJRT_OCL_VM_LANES=32`) or host-dispatch (`PJRT_OCL_ENGINE=host`).
+  PoCL-on-LNL also 198/1. The `-cl-std` dialect probe (§3b) held up on the real Intel compiler.
+- ❌ **Default lane sizing is wrong on Intel — megakernel deadlock out of the box.** JAX e2e
+  fails `clFinish` = -5 (CL_OUT_OF_RESOURCES) at default `ngroups = 2×CU = 128`. Lane sweep at
+  local=256: **32 lanes PASS, 33 lanes FAIL** — exactly the hardware residency: 8 Xe2-cores ×
+  64 HW threads ÷ (256 items @ SIMD16 = 16 threads/group) = **32 co-resident groups**, i.e.
+  **CU/2**, not 2×CU. Root cause: `CL_DEVICE_MAX_COMPUTE_UNITS` semantics differ per vendor —
+  NVIDIA reports SMs (2×CU validated, poc/01/04), Intel reports **vector engines (XVEs)**, so
+  2×CU oversubscribes 4× and the spin-barrier starves (§1's predicted "occupancy oracle"
+  fragility, now measured on a second vendor).
+- 🧭 Fix direction (not yet implemented): vendor-aware lane sizing — Intel GPUs ⇒
+  `CU × (SIMD width / local_size)`-style formula (CU/2 at 256/SIMD16), or better a one-shot
+  init-time co-residency probe (launch N groups, barrier ping with device-side timeout, shrink
+  until it completes) cached with the program binaries. Until then Xe2 works via
+  `PJRT_OCL_VM_LANES=32` or the host-dispatch engine (which needed no tuning at all —
+  plan-B value confirmed).
