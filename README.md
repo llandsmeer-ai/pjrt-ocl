@@ -136,17 +136,26 @@ GPU-vs-GPU comparison of the VM against a production compiler.
 
 Takeaways (higher = slower; both axes log):
 
-- **Small sizes are dispatch-bound and competitive** — within ~1.3x of CUDA for
-  elementwise/gather, since both are dominated by launch/execute overhead.
-- **Large elementwise / gather** run ~4–8x slower: our megakernel is not yet
-  bandwidth-optimal (note the step near 512K elements — a lane/tile scaling
-  threshold worth tuning).
-- **`dot_general`** is ~7.5x off cuBLAS at 2048³ — expected for a naive
-  register-blocked tile kernel vs a tuned library; the kernel-table override
-  mechanism is the intended path to close this.
-- **`while` loops** are the biggest gap (~10–30x): every iteration pays a
-  cross-workgroup barrier + control round-trip. Loop-body fusion and cheaper
-  per-iteration sync are the obvious wins.
+- **Elementwise (add / mul) is at parity** — within **~1.3x** of CUDA at 16M
+  elements, and actually *faster* than CUDA across the small-to-mid range. Two
+  optimizations got us here: **zero-copy I/O** (input/output buffers are passed
+  straight to the kernel instead of copied through a staging arena) and a
+  **buffer pool** (reused output allocations, which removed a 3.5x step at 512K
+  caused by NVIDIA's lazy ≥2MB allocation). The kernel itself was already
+  bandwidth-competitive.
+- **`gather` (`dynamic_slice`)** ~2.2x at 16M, faster than CUDA below ~64K.
+- **`matrix × vector`** ~3.7x — memory-bound but routed through the tiled MMA
+  kernel, which wastes most of a tile on a width-1 RHS; a dedicated GEMV kernel
+  would close most of this.
+- **`dot_general`** ~6.8x off cuBLAS at 2048³ — expected: cuBLAS uses TF32
+  tensor cores, which OpenCL cannot reach. A tuned OpenCL f32 kernel (kernel-
+  table override) can narrow it, but tensor-core parity isn't attainable here.
+- **`while` loops** are the biggest gap (~28x): every iteration pays a
+  cross-workgroup barrier + host/device control round-trip. Loop-body fusion and
+  cheaper per-iteration sync are the open wins.
+
+The remaining end-to-end gap on the closest ops is largely fixed jax→PJRT
+per-dispatch overhead, which amortizes in real fused programs.
 
 Reproduce (writes `docs/bench_plot.png` + `.csv`; auto-uses native CUDA as the
 reference if a CUDA jaxlib is installed, else JAX CPU):
