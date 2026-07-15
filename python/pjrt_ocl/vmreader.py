@@ -357,9 +357,11 @@ def execute(prog: Program, args: list[np.ndarray]) -> list[np.ndarray]:
         b = prog.buffers[buf_id]
         arena[b.arena_byte_offset:b.arena_byte_offset + len(data)] = \
             np.frombuffer(data, dtype=np.uint8)
-    # execute: write inputs into their arena regions
+    # execute: write inputs into their arena regions (in the buffer's dtype, so
+    # integer/other-typed inputs round-trip; f32 inputs are unchanged).
     for buf_id, shape, arg in zip(prog.inputs, prog.input_shapes, args):
-        flat = np.ascontiguousarray(arg, dtype=np.float32).ravel()
+        dt = DTYPE_NUMPY[prog.buffers[buf_id].dtype]
+        flat = np.ascontiguousarray(arg, dtype=dt).ravel()
         if flat.nbytes != prog.buffers[buf_id].size_bytes:
             raise ValueError(f"arg for buf[{buf_id}] has {flat.nbytes} bytes, "
                              f"buffer is {prog.buffers[buf_id].size_bytes}")
@@ -491,7 +493,8 @@ def execute_schedule(prog: Program, args: list[np.ndarray],
         arena[b.arena_byte_offset:b.arena_byte_offset + len(data)] = \
             np.frombuffer(data, dtype=np.uint8)
     for buf_id, shape, arg in zip(prog.inputs, prog.input_shapes, args):
-        flat = np.ascontiguousarray(arg, dtype=np.float32).ravel()
+        dt = DTYPE_NUMPY[prog.buffers[buf_id].dtype]
+        flat = np.ascontiguousarray(arg, dtype=dt).ravel()
         if flat.nbytes != prog.buffers[buf_id].size_bytes:
             raise ValueError(f"arg for buf[{buf_id}] has {flat.nbytes} bytes, "
                              f"buffer is {prog.buffers[buf_id].size_bytes}")
