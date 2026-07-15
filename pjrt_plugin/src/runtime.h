@@ -104,6 +104,14 @@ class OclRuntime {
   size_t local_size() const { return local_size_; }
   std::mutex& mu() { return mu_; }
 
+  // Device-resident buffer helpers (for device-resident PJRT_Buffers). Each
+  // locks the runtime mutex (single in-order queue). AllocDevice returns a
+  // cl_mem the caller owns (clReleaseMemObject); nullptr + *err on failure.
+  cl_mem AllocDevice(size_t bytes, std::string* err);
+  bool WriteToDevice(cl_mem dst, const void* host, size_t bytes,
+                     std::string* err);
+  bool ReadFromDevice(cl_mem src, void* host, size_t bytes, std::string* err);
+
  private:
   OclRuntime() = default;
   DeviceInfo info_;
@@ -128,14 +136,23 @@ class LoadedProgram {
 
   const VmProgram& prog() const { return prog_; }
 
-  // Synchronous execute: writes inputs into the arena, runs the VM, reads
-  // outputs. inputs[i] must hold prog().buffers[prog().inputs[i]].size_bytes
-  // bytes; outputs[i] is resized accordingly. Thread-safe (runtime mutex).
+  // Synchronous execute from HOST inputs to HOST outputs (H2D + D2H). Used by
+  // runtime_test. inputs[i] must hold buffers[inputs[i]].size_bytes bytes.
   bool Execute(const std::vector<const void*>& inputs,
                std::vector<std::vector<uint8_t>>* outputs, std::string* err);
 
+  // Synchronous execute keeping data ON DEVICE: inputs are device cl_mems
+  // (device->device copied into the arena), outputs are freshly-allocated
+  // device cl_mems (caller owns; released via clReleaseMemObject). No host
+  // round-trip — this is the plugin's hot path. Thread-safe (runtime mutex).
+  bool ExecuteDevice(const std::vector<cl_mem>& inputs,
+                     std::vector<cl_mem>* outputs, std::string* err);
+
  private:
   LoadedProgram() = default;
+  // Barrier reset + kernel launch on the arena (already populated). Caller
+  // holds the runtime mutex. Does not clFinish.
+  bool LaunchKernel(cl_command_queue q, std::string* err);
   OclRuntime* rt_ = nullptr;  // borrowed; client outlives executables
   VmProgram prog_;
   cl_mem arena_ = nullptr;

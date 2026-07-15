@@ -423,31 +423,7 @@ bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
     }
   }
 
-  if (!p.entries.empty()) {
-    // Reset barrier/rank state each execute.
-    const uint32_t barinit[3] = {0, 0, 0};
-    if (clEnqueueWriteBuffer(q, bar_buf_, CL_FALSE, 0, sizeof(barinit),
-                             barinit, 0, nullptr, nullptr) != CL_SUCCESS) {
-      *err = "Execute: bar reset failed";
-      return false;
-    }
-    cl_kernel k = rt_->vm_kernel();
-    cl_uint nlanes = p.n_lanes;
-    size_t lsz = 256, gsz = size_t{nlanes} * lsz;
-    clSetKernelArg(k, 0, sizeof(arena_), &arena_);
-    clSetKernelArg(k, 1, sizeof(aux_buf_), &aux_buf_);
-    clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
-    clSetKernelArg(k, 3, sizeof(entries_buf_), &entries_buf_);
-    clSetKernelArg(k, 4, sizeof(lane_tab_buf_), &lane_tab_buf_);
-    clSetKernelArg(k, 5, sizeof(bar_buf_), &bar_buf_);
-    clSetKernelArg(k, 6, sizeof(nlanes), &nlanes);
-    clSetKernelArg(k, 7, sizeof(stats_buf_), &stats_buf_);
-    if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
-                               nullptr) != CL_SUCCESS) {
-      *err = "Execute: kernel launch failed";
-      return false;
-    }
-  }
+  if (!LaunchKernel(q, err)) return false;
 
   outputs->resize(p.outputs.size());
   for (size_t i = 0; i < p.outputs.size(); ++i) {
@@ -463,6 +439,127 @@ bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
   }
   if (clFinish(q) != CL_SUCCESS) {
     *err = "Execute: clFinish failed";
+    return false;
+  }
+  return true;
+}
+
+bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
+  const VmProgram& p = prog_;
+  if (p.entries.empty()) return true;
+  const uint32_t barinit[3] = {0, 0, 0};
+  if (clEnqueueWriteBuffer(q, bar_buf_, CL_FALSE, 0, sizeof(barinit), barinit,
+                           0, nullptr, nullptr) != CL_SUCCESS) {
+    *err = "Execute: bar reset failed";
+    return false;
+  }
+  cl_kernel k = rt_->vm_kernel();
+  cl_uint nlanes = p.n_lanes;
+  size_t lsz = 256, gsz = size_t{nlanes} * lsz;
+  clSetKernelArg(k, 0, sizeof(arena_), &arena_);
+  clSetKernelArg(k, 1, sizeof(aux_buf_), &aux_buf_);
+  clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
+  clSetKernelArg(k, 3, sizeof(entries_buf_), &entries_buf_);
+  clSetKernelArg(k, 4, sizeof(lane_tab_buf_), &lane_tab_buf_);
+  clSetKernelArg(k, 5, sizeof(bar_buf_), &bar_buf_);
+  clSetKernelArg(k, 6, sizeof(nlanes), &nlanes);
+  clSetKernelArg(k, 7, sizeof(stats_buf_), &stats_buf_);
+  if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                             nullptr) != CL_SUCCESS) {
+    *err = "Execute: kernel launch failed";
+    return false;
+  }
+  return true;
+}
+
+bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
+                                  std::vector<cl_mem>* outputs,
+                                  std::string* err) {
+  const VmProgram& p = prog_;
+  if (inputs.size() != p.inputs.size()) {
+    *err = "ExecuteDevice: got " + std::to_string(inputs.size()) +
+           " args, want " + std::to_string(p.inputs.size());
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(rt_->mu());
+  cl_command_queue q = rt_->queue();
+
+  // Device->device copy each input into its arena region (on-device bandwidth,
+  // no host round-trip).
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const auto& b = p.buffers[p.inputs[i]];
+    if (b.size_bytes &&
+        clEnqueueCopyBuffer(q, inputs[i], arena_, 0, b.arena_byte_offset,
+                            b.size_bytes, 0, nullptr, nullptr) != CL_SUCCESS) {
+      *err = "ExecuteDevice: input copy failed";
+      return false;
+    }
+  }
+
+  if (!LaunchKernel(q, err)) return false;
+
+  // Each output stays on device: fresh cl_mem, device->device copy from arena.
+  outputs->assign(p.outputs.size(), nullptr);
+  cl_int cerr;
+  for (size_t i = 0; i < p.outputs.size(); ++i) {
+    const auto& b = p.buffers[p.outputs[i]];
+    cl_mem out = clCreateBuffer(rt_->ctx(), CL_MEM_READ_WRITE,
+                                std::max<size_t>(b.size_bytes, 4), nullptr,
+                                &cerr);
+    if (cerr != CL_SUCCESS) {
+      *err = "ExecuteDevice: output alloc failed";
+      for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
+      outputs->clear();
+      return false;
+    }
+    if (b.size_bytes &&
+        clEnqueueCopyBuffer(q, arena_, out, b.arena_byte_offset, 0,
+                            b.size_bytes, 0, nullptr, nullptr) != CL_SUCCESS) {
+      *err = "ExecuteDevice: output copy failed";
+      clReleaseMemObject(out);
+      for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
+      outputs->clear();
+      return false;
+    }
+    (*outputs)[i] = out;
+  }
+  if (clFinish(q) != CL_SUCCESS) {
+    *err = "ExecuteDevice: clFinish failed";
+    return false;
+  }
+  return true;
+}
+
+cl_mem OclRuntime::AllocDevice(size_t bytes, std::string* err) {
+  cl_int cerr;
+  cl_mem m = clCreateBuffer(ctx_, CL_MEM_READ_WRITE, std::max<size_t>(bytes, 4),
+                            nullptr, &cerr);
+  if (cerr != CL_SUCCESS) {
+    *err = "AllocDevice failed: " + std::to_string(cerr);
+    return nullptr;
+  }
+  return m;
+}
+
+bool OclRuntime::WriteToDevice(cl_mem dst, const void* host, size_t bytes,
+                               std::string* err) {
+  if (!bytes) return true;
+  std::lock_guard<std::mutex> lock(mu_);
+  if (clEnqueueWriteBuffer(queue_, dst, CL_TRUE, 0, bytes, host, 0, nullptr,
+                           nullptr) != CL_SUCCESS) {
+    *err = "WriteToDevice failed";
+    return false;
+  }
+  return true;
+}
+
+bool OclRuntime::ReadFromDevice(cl_mem src, void* host, size_t bytes,
+                                std::string* err) {
+  if (!bytes) return true;
+  std::lock_guard<std::mutex> lock(mu_);
+  if (clEnqueueReadBuffer(queue_, src, CL_TRUE, 0, bytes, host, 0, nullptr,
+                          nullptr) != CL_SUCCESS) {
+    *err = "ReadFromDevice failed";
     return false;
   }
   return true;

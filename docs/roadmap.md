@@ -23,6 +23,15 @@ performance mode. Work autonomously. This file is the plan of record for continu
   slot-file fusion, typed lanes integration (poc/05), then 128×128 MMA behind typed lanes.
 - Merged PoCs this session: poc/04 (VLIW), poc/05 (typed-lanes viable), poc/06 (fast MMA).
 
+## Phase 3 perf directives (user, 2026-07-15)
+
+1. **Fix transfers — keep data ON DEVICE.** Investigate H2D/D2H per execute; PJRT input buffers
+   should be device-resident cl_mem and stay on device across executes (device→device or direct
+   VM read, not host round-trips). Buffer donation. This is the #1 next item.
+2. **Per-op perf characterization** (every op): (a) does it actually parallelize? — measure
+   scaling as lanes/execution-units increase; (b) compare to JAX's own CPU + GPU backends
+   (python-level benchmark). Fix any perf bug found.
+
 ## Phase 1 — VLIW engine in the real plugin (main session, critical path)
 
 1. **VMProgram v2.1 format**: v2 tensor sections (aux pool, docs/vmprogram.md) PLUS schedule

@@ -184,12 +184,16 @@ static PJRT_Error* EventError(const PJRT_Event& e) {
 }
 
 // Buffers: v1 host-staging (docs/memory.md §2). Raw bytes + type + dims.
+// Device-resident buffer: the data lives in a device cl_mem and only touches
+// host memory when the framework calls ToHostBuffer. This keeps intermediate
+// results of chained jit calls on the device (no PCIe round-trip per op).
 struct PJRT_Buffer {
   PJRT_Client* client = nullptr;
   PJRT_Device* device = nullptr;
   PJRT_Buffer_Type type = PJRT_Buffer_Type_F32;
   std::vector<int64_t> dims;
-  std::vector<uint8_t> data;
+  cl_mem mem = nullptr;       // device-resident bytes (owned)
+  size_t size_bytes = 0;
   bool deleted = false;
 };
 
@@ -580,11 +584,12 @@ static PJRT_Error* Impl_PJRT_Client_BufferFromHostBuffer(
 
   size_t n = 1;
   for (int64_t d : buf->dims) n *= static_cast<size_t>(d);
-  buf->data.resize(n * elem);
+  buf->size_bytes = n * elem;
 
+  // Stage host-side into a dense contiguous block, then upload once to device.
+  std::vector<uint8_t> staging(buf->size_bytes);
   bool dense = true;
   if (args->num_byte_strides) {
-    // Dense major-to-minor check; anything else takes the strided path.
     int64_t stride = static_cast<int64_t>(elem);
     for (size_t i = args->num_dims; i-- > 0;) {
       if (args->byte_strides[i] != stride) dense = false;
@@ -592,16 +597,15 @@ static PJRT_Error* Impl_PJRT_Client_BufferFromHostBuffer(
     }
   }
   if (dense || n == 0) {
-    std::memcpy(buf->data.data(), args->data, buf->data.size());
+    std::memcpy(staging.data(), args->data, staging.size());
   } else {
-    // Generic strided gather (handles transposed/negative-stride sources).
     std::vector<size_t> idx(args->num_dims, 0);
     const auto* src = static_cast<const uint8_t*>(args->data);
     for (size_t out = 0; out < n; ++out) {
       int64_t off = 0;
       for (size_t d = 0; d < args->num_dims; ++d)
         off += static_cast<int64_t>(idx[d]) * args->byte_strides[d];
-      std::memcpy(buf->data.data() + out * elem, src + off, elem);
+      std::memcpy(staging.data() + out * elem, src + off, elem);
       for (size_t d = args->num_dims; d-- > 0;) {
         if (++idx[d] < static_cast<size_t>(args->dims[d])) break;
         idx[d] = 0;
@@ -609,12 +613,22 @@ static PJRT_Error* Impl_PJRT_Client_BufferFromHostBuffer(
     }
   }
 
+  std::string err;
+  buf->mem = buf->client->runtime->AllocDevice(buf->size_bytes, &err);
+  if (!buf->mem)
+    return MakeError(PJRT_Error_Code_RESOURCE_EXHAUSTED, "pjrt-ocl: " + err);
+  if (!buf->client->runtime->WriteToDevice(buf->mem, staging.data(),
+                                           buf->size_bytes, &err))
+    return MakeError(PJRT_Error_Code_INTERNAL, "pjrt-ocl: " + err);
+
   args->buffer = buf.release();
   args->done_with_host_buffer = new PJRT_Event{};
   return nullptr;
 }
 
 static PJRT_Error* Impl_PJRT_Buffer_Destroy(PJRT_Buffer_Destroy_Args* args) {
+  if (args->buffer && args->buffer->mem)
+    clReleaseMemObject(args->buffer->mem);
   delete args->buffer;
   return nullptr;
 }
@@ -648,7 +662,7 @@ static PJRT_Error* Impl_PJRT_Buffer_DynamicDimensionIndices(
 
 static PJRT_Error* Impl_PJRT_Buffer_OnDeviceSizeInBytes(
     PJRT_Buffer_OnDeviceSizeInBytes_Args* args) {
-  args->on_device_size_in_bytes = args->buffer->data.size();
+  args->on_device_size_in_bytes = args->buffer->size_bytes;
   return nullptr;
 }
 
@@ -664,8 +678,10 @@ static PJRT_Error* Impl_PJRT_Buffer_Memory(PJRT_Buffer_Memory_Args* args) {
 
 static PJRT_Error* Impl_PJRT_Buffer_Delete(PJRT_Buffer_Delete_Args* args) {
   args->buffer->deleted = true;
-  args->buffer->data.clear();
-  args->buffer->data.shrink_to_fit();
+  if (args->buffer->mem) {
+    clReleaseMemObject(args->buffer->mem);
+    args->buffer->mem = nullptr;
+  }
   return nullptr;
 }
 
@@ -693,13 +709,17 @@ static PJRT_Error* Impl_PJRT_Buffer_ToHostBuffer(
     return MakeError(PJRT_Error_Code_INVALID_ARGUMENT,
                      "pjrt-ocl: ToHostBuffer on deleted buffer");
   if (args->dst == nullptr) {
-    args->dst_size = src->data.size();
+    args->dst_size = src->size_bytes;
     return nullptr;
   }
-  if (args->dst_size < src->data.size())
+  if (args->dst_size < src->size_bytes)
     return MakeError(PJRT_Error_Code_INVALID_ARGUMENT,
                      "pjrt-ocl: ToHostBuffer dst too small");
-  std::memcpy(args->dst, src->data.data(), src->data.size());
+  // Lazy D2H: the only point data leaves the device.
+  std::string err;
+  if (src->mem && !src->client->runtime->ReadFromDevice(
+                      src->mem, args->dst, src->size_bytes, &err))
+    return MakeError(PJRT_Error_Code_INTERNAL, "pjrt-ocl: " + err);
   args->event = new PJRT_Event{};
   return nullptr;
 }
@@ -905,34 +925,36 @@ static PJRT_Error* Impl_PJRT_LoadedExecutable_Execute(
                          std::to_string(args->num_devices) + ")");
 
   const VmProgram& prog = lexe->lp->prog();
-  std::vector<const void*> inputs;
+  std::vector<cl_mem> inputs;
   for (size_t i = 0; i < args->num_args; ++i) {
     PJRT_Buffer* b = args->argument_lists[0][i];
-    if (b->deleted)
+    if (b->deleted || !b->mem)
       return MakeError(PJRT_Error_Code_INVALID_ARGUMENT,
                        "pjrt-ocl: Execute with deleted input buffer");
     if (i < prog.inputs.size() &&
-        b->data.size() != prog.buffers[prog.inputs[i]].size_bytes)
+        b->size_bytes != prog.buffers[prog.inputs[i]].size_bytes)
       return MakeError(
           PJRT_Error_Code_INVALID_ARGUMENT,
           "pjrt-ocl: arg " + std::to_string(i) + " byte size " +
-              std::to_string(b->data.size()) + " != expected " +
+              std::to_string(b->size_bytes) + " != expected " +
               std::to_string(prog.buffers[prog.inputs[i]].size_bytes));
-    inputs.push_back(b->data.data());
+    inputs.push_back(b->mem);
   }
 
-  std::vector<std::vector<uint8_t>> outputs;
+  std::vector<cl_mem> outputs;
   std::string err;
-  if (!lexe->lp->Execute(inputs, &outputs, &err))
+  if (!lexe->lp->ExecuteDevice(inputs, &outputs, &err))
     return MakeError(PJRT_Error_Code_INTERNAL, "pjrt-ocl: " + err);
 
+  // Outputs stay on device; wrap each cl_mem in a device-resident buffer.
   for (size_t i = 0; i < outputs.size(); ++i) {
     auto* out = new PJRT_Buffer{};
     out->client = lexe->client;
     out->device = lexe->client->devices[0];
     out->type = PJRT_Buffer_Type_F32;
     out->dims = prog.output_dims[i];
-    out->data = std::move(outputs[i]);
+    out->mem = outputs[i];
+    out->size_bytes = prog.buffers[prog.outputs[i]].size_bytes;
     args->output_lists[0][i] = out;
   }
   if (args->device_complete_events)
