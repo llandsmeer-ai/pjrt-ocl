@@ -16,7 +16,7 @@
  * other dtypes at lowering time.
  */
 
-static void vmo_redwin_tile(__global uchar *arena, __global const int *aux,
+static void vmo_redwin_tile(__global uchar *arena, __global uchar **iop, __global const int *aux,
                         const task_t t, uint tile, uint dt, uint lid, uint lsz)
 {
     __global const int *x = aux + t.p0;

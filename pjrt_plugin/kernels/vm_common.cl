@@ -24,8 +24,26 @@
 
 #define EW_TS 16384u
 
-/* Typed element pointer at byte base `base` into the byte-addressed arena. */
-#define AP(T, base) ((__global T *)(arena + (base)))
+/* Buffer addressing. A buffer's 32-bit `base` is EITHER an arena byte offset
+ * (intermediates, consts) OR — with bit 31 set — an I/O PORT: the low bits index
+ * `iop[]`, a small array of input/output buffers passed straight to the kernel
+ * so the VM reads inputs and writes outputs in place, with no arena copy (the
+ * copies dominated memory-bound ops — profiled ~70% of `a+b` time). Every tile
+ * fn takes `arena` and `iop` in scope, so VMO_BASE resolves either kind. */
+#define VMO_IO_BIT 0x80000000u
+#define VMO_BASE(base) \
+    (((base) & VMO_IO_BIT) ? iop[(base) & 0x7Fu] : (arena + (base)))
+#define AP(T, base) ((__global T *)VMO_BASE(base))
+#define VMO_N_IO 8   /* # of I/O buffers passed direct to the kernel as ports */
+/* The kernel entry points take VMO_N_IO buffer args and pack them into `iop`;
+ * unused ports get a dummy buffer from the host. */
+#define VMO_IO_PARAMS                                                    \
+    __global uchar *io0, __global uchar *io1, __global uchar *io2,        \
+    __global uchar *io3, __global uchar *io4, __global uchar *io5,        \
+    __global uchar *io6, __global uchar *io7
+#define VMO_IO_ARRAY                                                     \
+    __global uchar *iop[VMO_N_IO] =                                       \
+        {io0, io1, io2, io3, io4, io5, io6, io7}
 
 /* dtype enum (matches python DT_* / runtime.h). */
 enum { DT_F32 = 0, DT_I32 = 1, DT_U32 = 2, DT_BOOL = 3,
@@ -34,8 +52,8 @@ enum { DT_F32 = 0, DT_I32 = 1, DT_U32 = 2, DT_BOOL = 3,
 /* f16 and bf16 are 2-byte storage + f32 compute (portable, no cl_khr_fp16):
  * f16 via core vload_half/vstore_half; bf16 via bit shift (top 16 bits of the
  * f32) with round-to-nearest-even. */
-#define LDH(base, i) vload_half((i), (const __global half *)(arena + (base)))
-#define STH(base, i, v) vstore_half((v), (i), (__global half *)(arena + (base)))
+#define LDH(base, i) vload_half((i), (const __global half *)VMO_BASE(base))
+#define STH(base, i, v) vstore_half((v), (i), (__global half *)VMO_BASE(base))
 static float vmo_bf16_to_f32(ushort b) { return as_float(((uint)b) << 16); }
 static ushort vmo_f32_to_bf16(float f)
 {

@@ -51,10 +51,10 @@ static int vmo_ew_is_un(const uint sub)
 #define CMP(p, x, y) ((p)==0?(x)==(y):(p)==1?(x)!=(y):(p)==2?(x)<(y): \
                       (p)==3?(x)<=(y):(p)==4?(x)>(y):(x)>=(y))
 
-static float vmo_load_f(__global uchar *arena, uint base, uint dt, uint i);  /* fwd */
+static float vmo_load_f(__global uchar *arena, __global uchar **iop, uint base, uint dt, uint i);  /* fwd */
 
 /* compare: operands read as adt, result written as 1-byte bool (uchar 0/1). */
-static void vmo_cmp_tile(__global uchar *arena, const task_t t, uint tile,
+static void vmo_cmp_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                      uint adt, uint lid, uint lsz)
 {
     const uint n = t.p1, p = t.p2;
@@ -70,7 +70,7 @@ static void vmo_cmp_tile(__global uchar *arena, const task_t t, uint tile,
 #endif
     } else if (adt == DT_F16 || adt == DT_BF16) {
         for (uint i = lo + lid; i < hi; i += lsz) {
-            float x = vmo_load_f(arena, t.a, adt, i), y = vmo_load_f(arena, t.b, adt, i);
+            float x = vmo_load_f(arena, iop, t.a, adt, i), y = vmo_load_f(arena, iop, t.b, adt, i);
             d[i] = CMP(p, x, y) ? 1 : 0;
         }
     } else {
@@ -80,7 +80,7 @@ static void vmo_cmp_tile(__global uchar *arena, const task_t t, uint tile,
 }
 
 /* select: pred (p3) is 1-byte bool; a/b/dst read/written as dt. */
-static void vmo_select_tile(__global uchar *arena, const task_t t, uint tile,
+static void vmo_select_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                         uint dt, uint lid, uint lsz)
 {
     const uint n = t.p1;
@@ -112,7 +112,7 @@ static void vmo_select_tile(__global uchar *arena, const task_t t, uint tile,
     }
 }
 
-static void vmo_ew_tile_f32(__global uchar *arena, const task_t t, uint tile,
+static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                         uint lid, uint lsz)
 {
     const uint sub = t.p0, n = t.p1;
@@ -131,7 +131,7 @@ static void vmo_ew_tile_f32(__global uchar *arena, const task_t t, uint tile,
 }
 
 #ifdef cl_khr_fp64
-static void vmo_ew_tile_f64(__global uchar *arena, const task_t t, uint tile,
+static void vmo_ew_tile_f64(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                         uint lid, uint lsz)
 {
     const uint sub = t.p0, n = t.p1;
@@ -169,7 +169,7 @@ static void vmo_ew_tile_f64(__global uchar *arena, const task_t t, uint tile,
 }
 #endif
 
-static void vmo_ew_tile_i32(__global uchar *arena, const task_t t, uint tile,
+static void vmo_ew_tile_i32(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                         uint lid, uint lsz)
 {
     const uint sub = t.p0, n = t.p1;
@@ -201,7 +201,7 @@ static void vmo_ew_tile_i32(__global uchar *arena, const task_t t, uint tile,
  * on bool -> stablehlo.and/or/xor/not). Bool is stored as uchar 0/1, so
  * AND/OR/XOR are plain bitwise ops on the byte (only bit 0 is ever set), but
  * NOT must flip 0<->1 rather than bitwise-complement the whole byte. */
-static void vmo_ew_tile_bool(__global uchar *arena, const task_t t, uint tile,
+static void vmo_ew_tile_bool(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                          uint lid, uint lsz)
 {
     const uint sub = t.p0, n = t.p1;
@@ -227,7 +227,7 @@ static void vmo_ew_tile_bool(__global uchar *arena, const task_t t, uint tile,
 /* f16/bf16: 2-byte storage, f32 arithmetic. LOAD/STORE are the half or bf16
  * accessors; only the floating subops apply (jax never emits int ops on them).*/
 #define EW_HALF_TILE(NAME, LOAD, STORE)                                        \
-static void NAME(__global uchar *arena, const task_t t, uint tile,             \
+static void NAME(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,             \
                  uint lid, uint lsz) {                                         \
     const uint sub = t.p0, n = t.p1;                                           \
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);                     \
@@ -246,7 +246,7 @@ EW_HALF_TILE(vmo_ew_tile_f16, LDH, STH)
 EW_HALF_TILE(vmo_ew_tile_bf16, LDB, STB)
 
 /* read element i of buffer `base` as a float, for any float-domain dtype. */
-static float vmo_load_f(__global uchar *arena, uint base, uint dt, uint i)
+static float vmo_load_f(__global uchar *arena, __global uchar **iop, uint base, uint dt, uint i)
 {
     switch (dt) {
     case DT_F16:  return LDH(base, i);
@@ -264,7 +264,7 @@ static float vmo_load_f(__global uchar *arena, uint base, uint dt, uint i)
  * truncates toward zero, matching stablehlo). Via a double intermediate where
  * fp64 exists (exact to 2^53); a float intermediate otherwise (4-byte types).
  * i64 beyond 2^53 loses precision — acceptable for now. */
-static void vmo_convert_tile(__global uchar *arena, const task_t t, uint tile,
+static void vmo_convert_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                          uint dt, uint adt, uint lid, uint lsz)
 {
     const uint n = t.p1;
@@ -291,7 +291,7 @@ static void vmo_convert_tile(__global uchar *arena, const task_t t, uint tile,
         default: AP(float, t.dst)[i] = (float)v; break;
         }
 #else
-        float v = vmo_load_f(arena, t.a, adt, i);
+        float v = vmo_load_f(arena, iop, t.a, adt, i);
         switch (dt) {
         case DT_I32: case DT_U32: AP(int, t.dst)[i] = (int)v; break;
         case DT_BOOL: AP(uchar, t.dst)[i] = (uchar)(v != 0.0f); break;
@@ -307,7 +307,7 @@ static void vmo_convert_tile(__global uchar *arena, const task_t t, uint tile,
  * (same element size). A typed memcpy of the 2/4/8-byte word — NOT a numeric
  * conversion (f32<->i32<->u32; f64<->i64). Width comes from the result dtype;
  * source and dest share the byte width by construction (checked in lowering). */
-static void vmo_bitcast_tile(__global uchar *arena, const task_t t, uint tile,
+static void vmo_bitcast_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                          uint dt, uint lid, uint lsz)
 {
     const uint n = t.p1;
@@ -329,7 +329,7 @@ static void vmo_bitcast_tile(__global uchar *arena, const task_t t, uint tile,
 
 /* is_finite: operand read as adt (float-domain), result written as 1-byte
  * bool (uchar 0/1) — same mixed-dtype shape as vmo_cmp_tile. */
-static void vmo_isfinite_tile(__global uchar *arena, const task_t t, uint tile,
+static void vmo_isfinite_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                           uint adt, uint lid, uint lsz)
 {
     const uint n = t.p1;
@@ -344,29 +344,29 @@ static void vmo_isfinite_tile(__global uchar *arena, const task_t t, uint tile,
 #endif
     if (adt == DT_F16 || adt == DT_BF16) {
         for (uint i = lo + lid; i < hi; i += lsz)
-            d[i] = isfinite(vmo_load_f(arena, t.a, adt, i)) ? 1 : 0;
+            d[i] = isfinite(vmo_load_f(arena, iop, t.a, adt, i)) ? 1 : 0;
         return;
     }
     __global const float *a = AP(const float, t.a);
     for (uint i = lo + lid; i < hi; i += lsz) d[i] = isfinite(a[i]) ? 1 : 0;
 }
 
-static void vmo_ew_tile(__global uchar *arena, const task_t t, uint tile,
+static void vmo_ew_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                     uint dt, uint adt, uint lid, uint lsz)
 {
-    if (t.p0 == SUB_CMP) { vmo_cmp_tile(arena, t, tile, adt, lid, lsz); return; }
-    if (t.p0 == SUB_SELECT) { vmo_select_tile(arena, t, tile, dt, lid, lsz); return; }
-    if (t.p0 == SUB_CONVERT) { vmo_convert_tile(arena, t, tile, dt, adt, lid, lsz); return; }
-    if (t.p0 == SUB_BITCAST) { vmo_bitcast_tile(arena, t, tile, dt, lid, lsz); return; }
-    if (t.p0 == SUB_ISFINITE) { vmo_isfinite_tile(arena, t, tile, adt, lid, lsz); return; }
+    if (t.p0 == SUB_CMP) { vmo_cmp_tile(arena, iop, t, tile, adt, lid, lsz); return; }
+    if (t.p0 == SUB_SELECT) { vmo_select_tile(arena, iop, t, tile, dt, lid, lsz); return; }
+    if (t.p0 == SUB_CONVERT) { vmo_convert_tile(arena, iop, t, tile, dt, adt, lid, lsz); return; }
+    if (t.p0 == SUB_BITCAST) { vmo_bitcast_tile(arena, iop, t, tile, dt, lid, lsz); return; }
+    if (t.p0 == SUB_ISFINITE) { vmo_isfinite_tile(arena, iop, t, tile, adt, lid, lsz); return; }
     switch (dt) {
-    case DT_I32: case DT_U32: vmo_ew_tile_i32(arena, t, tile, lid, lsz); break;
-    case DT_BOOL:             vmo_ew_tile_bool(arena, t, tile, lid, lsz); break;
-    case DT_F16:              vmo_ew_tile_f16(arena, t, tile, lid, lsz); break;
-    case DT_BF16:             vmo_ew_tile_bf16(arena, t, tile, lid, lsz); break;
+    case DT_I32: case DT_U32: vmo_ew_tile_i32(arena, iop, t, tile, lid, lsz); break;
+    case DT_BOOL:             vmo_ew_tile_bool(arena, iop, t, tile, lid, lsz); break;
+    case DT_F16:              vmo_ew_tile_f16(arena, iop, t, tile, lid, lsz); break;
+    case DT_BF16:             vmo_ew_tile_bf16(arena, iop, t, tile, lid, lsz); break;
 #ifdef cl_khr_fp64
-    case DT_F64:              vmo_ew_tile_f64(arena, t, tile, lid, lsz); break;
+    case DT_F64:              vmo_ew_tile_f64(arena, iop, t, tile, lid, lsz); break;
 #endif
-    default:                  vmo_ew_tile_f32(arena, t, tile, lid, lsz); break;
+    default:                  vmo_ew_tile_f32(arena, iop, t, tile, lid, lsz); break;
     }
 }

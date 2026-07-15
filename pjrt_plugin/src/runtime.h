@@ -140,6 +140,9 @@ class OclRuntime {
                      std::string* err);
   bool ReadFromDevice(cl_mem src, void* host, size_t bytes, std::string* err);
 
+  // 1-byte placeholder bound to unused kernel I/O ports (never dereferenced).
+  cl_mem dummy_buf() const { return dummy_buf_; }
+
  private:
   OclRuntime() = default;
   DeviceInfo info_;
@@ -151,6 +154,7 @@ class OclRuntime {
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
   cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
   std::string trace_path_;             // empty = tracing off
+  cl_mem dummy_buf_ = nullptr;         // placeholder for unused I/O ports
   cl_uint ngroups_ = 0;    // co-resident workgroups (poc/01 rule: <= CUs)
   size_t local_size_ = 64;
   bool host_dispatch_ = false;
@@ -204,6 +208,17 @@ class LoadedProgram {
   cl_mem stats_buf_ = nullptr;
   cl_mem seg_tab_buf_ = nullptr;   // host-dispatch: per-lane {off,count} u2
   std::vector<cl_command_queue> trace_queues_;  // trace mode, one per lane
+
+  // Zero-copy I/O ports (docs/decisions.md): up to kNIoPorts input/output
+  // buffers are passed straight to the kernel instead of copied through the
+  // arena. input_port_[i] / output_port_[o] = the port for that I/O buffer, or
+  // -1 to fall back to an arena copy. io_bufs_ is the per-execute cl_mem bound
+  // to each port (dummy for unused), filled by ExecuteDevice and read by the
+  // Launch* helpers.
+  static constexpr int kNIoPorts = 8;   // must match VMO_N_IO in vm_common.cl
+  std::vector<int> input_port_;
+  std::vector<int> output_port_;
+  std::vector<cl_mem> io_bufs_;         // size kNIoPorts
 };
 
 // ---- Lowering subprocess ----------------------------------------------------
