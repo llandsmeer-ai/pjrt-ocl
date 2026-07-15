@@ -1,49 +1,79 @@
 /* Elementwise tile op (TOP_EW). subop in task.p0; n in p1; cmp pred / fill bits
- * in p2; select pred BYTE offset in p3. dst/a/b are BYTE offsets. Dispatched on
- * dtype `dt` by exec_tiles: f32 / f64 (floating) and i32 / u32 / bool (integer,
- * bool stored as i32 0/1). */
+ * in p2; select pred BYTE offset in p3. dst/a/b are BYTE offsets.
+ * Dispatched by exec_tiles on result dtype `dt` and operand dtype `adt`
+ * (compare: operands adt -> bool result; select: bool pred -> operands dt).
+ * bool is 1-byte (uchar 0/1), matching jax PRED. */
 
 static float ew_bin(const uint sub, const float x, const float y)
 {
     switch (sub) {
-    case SUB_ADD: return x + y;
-    case SUB_MUL: return x * y;
-    case SUB_SUB: return x - y;
-    case SUB_DIV: return x / y;
-    case SUB_MAX: return fmax(x, y);
-    case SUB_MIN: return fmin(x, y);
-    case SUB_POW: return pow(x, y);
-    default:      return 0.0f;
+    case SUB_ADD: return x + y;   case SUB_MUL: return x * y;
+    case SUB_SUB: return x - y;   case SUB_DIV: return x / y;
+    case SUB_MAX: return fmax(x, y); case SUB_MIN: return fmin(x, y);
+    case SUB_POW: return pow(x, y); default: return 0.0f;
     }
 }
-
 static float ew_un(const uint sub, const float x)
 {
     switch (sub) {
-    case SUB_COPY:  return x;
-    case SUB_NEG:   return -x;
-    case SUB_EXP:   return exp(x);
-    case SUB_LOG:   return log(x);
-    case SUB_SQRT:  return sqrt(x);
-    case SUB_RSQRT: return rsqrt(x);
-    case SUB_TANH:  return tanh(x);
-    case SUB_ABS:   return fabs(x);
-    case SUB_FLOOR: return floor(x);
-    case SUB_CEIL:  return ceil(x);
-    case SUB_SIGN:  return x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : x);
-    default:        return 0.0f;
+    case SUB_COPY: return x;      case SUB_NEG: return -x;
+    case SUB_EXP: return exp(x);  case SUB_LOG: return log(x);
+    case SUB_SQRT: return sqrt(x); case SUB_RSQRT: return rsqrt(x);
+    case SUB_TANH: return tanh(x); case SUB_ABS: return fabs(x);
+    case SUB_FLOOR: return floor(x); case SUB_CEIL: return ceil(x);
+    case SUB_SIGN: return x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : x);
+    default: return 0.0f;
+    }
+}
+#define CMP(p, x, y) ((p)==0?(x)==(y):(p)==1?(x)!=(y):(p)==2?(x)<(y): \
+                      (p)==3?(x)<=(y):(p)==4?(x)>(y):(x)>=(y))
+
+/* compare: operands read as adt, result written as 1-byte bool (uchar 0/1). */
+static void cmp_tile(__global uchar *arena, const task_t t, uint tile,
+                     uint adt, uint lid, uint lsz)
+{
+    const uint n = t.p1, p = t.p2;
+    const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
+    __global uchar *d = AP(uchar, t.dst);
+    if (adt == DT_I32 || adt == DT_U32 || adt == DT_BOOL) {
+        __global const int *a = AP(const int, t.a), *b = AP(const int, t.b);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = CMP(p, a[i], b[i]) ? 1 : 0;
+#ifdef cl_khr_fp64
+    } else if (adt == DT_F64) {
+        __global const double *a = AP(const double, t.a), *b = AP(const double, t.b);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = CMP(p, a[i], b[i]) ? 1 : 0;
+#endif
+    } else {
+        __global const float *a = AP(const float, t.a), *b = AP(const float, t.b);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = CMP(p, a[i], b[i]) ? 1 : 0;
     }
 }
 
-static int cmp_pred(const uint p, const float x, const float y)
+/* select: pred (p3) is 1-byte bool; a/b/dst read/written as dt. */
+static void select_tile(__global uchar *arena, const task_t t, uint tile,
+                        uint dt, uint lid, uint lsz)
 {
-    switch (p) {
-    case 0:  return x == y;
-    case 1:  return x != y;
-    case 2:  return x < y;
-    case 3:  return x <= y;
-    case 4:  return x > y;
-    default: return x >= y;
+    const uint n = t.p1;
+    const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
+    __global const uchar *p = AP(const uchar, t.p3);
+    if (dt == DT_I32 || dt == DT_U32) {
+        __global int *d = AP(int, t.dst);
+        __global const int *a = AP(const int, t.a), *b = AP(const int, t.b);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = p[i] ? a[i] : b[i];
+    } else if (dt == DT_BOOL) {
+        __global uchar *d = AP(uchar, t.dst);
+        __global const uchar *a = AP(const uchar, t.a), *b = AP(const uchar, t.b);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = p[i] ? a[i] : b[i];
+#ifdef cl_khr_fp64
+    } else if (dt == DT_F64) {
+        __global double *d = AP(double, t.dst);
+        __global const double *a = AP(const double, t.a), *b = AP(const double, t.b);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = p[i] ? a[i] : b[i];
+#endif
+    } else {
+        __global float *d = AP(float, t.dst);
+        __global const float *a = AP(const float, t.a), *b = AP(const float, t.b);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = p[i] ? a[i] : b[i];
     }
 }
 
@@ -53,26 +83,16 @@ static void ew_tile_f32(__global uchar *arena, const task_t t, uint tile,
     const uint sub = t.p0, n = t.p1;
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
     __global float *d = AP(float, t.dst);
-    __global const float *a = AP(const float, t.a);
-    __global const float *b = AP(const float, t.b);
-    if (sub <= SUB_POW) {
+    __global const float *a = AP(const float, t.a), *b = AP(const float, t.b);
+    if (sub <= SUB_POW)
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = ew_bin(sub, a[i], b[i]);
-    } else if (sub <= SUB_SIGN) {
+    else if (sub <= SUB_SIGN)
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = ew_un(sub, a[i]);
-    } else if (sub == SUB_FILL) {
+    else if (sub == SUB_FILL)
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = as_float(t.p2);
-    } else if (sub == SUB_IOTA_FLAT) {
+    else if (sub == SUB_IOTA_FLAT)
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = (float)i;
-    } else if (sub == SUB_CMP) {
-        for (uint i = lo + lid; i < hi; i += lsz)
-            d[i] = cmp_pred(t.p2, a[i], b[i]) ? 1.0f : 0.0f;
-    } else if (sub == SUB_SELECT) {
-        __global const float *p = AP(const float, t.p3);
-        for (uint i = lo + lid; i < hi; i += lsz)
-            d[i] = p[i] != 0.0f ? a[i] : b[i];
-    } else if (sub == SUB_LTS) {
-        if (lid == 0 && lo == 0) d[0] = (a[0] < b[0]) ? 1.0f : 0.0f;
-    }
+    else if (sub == SUB_LTS) { if (lid == 0 && lo == 0) d[0] = (a[0] < b[0]) ? 1.0f : 0.0f; }
 }
 
 #ifdef cl_khr_fp64
@@ -82,26 +102,10 @@ static void ew_tile_f64(__global uchar *arena, const task_t t, uint tile,
     const uint sub = t.p0, n = t.p1;
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
     __global double *d = AP(double, t.dst);
-    __global const double *a = AP(const double, t.a);
-    __global const double *b = AP(const double, t.b);
-    if (sub == SUB_CMP) {
-        /* cmp writes bool (i32 0/1), not f64 */
-        __global int *di = AP(int, t.dst);
-        for (uint i = lo + lid; i < hi; i += lsz) {
-            const double x = a[i], y = b[i];
-            int r;
-            switch (t.p2) {
-            case 0:  r = x == y; break; case 1: r = x != y; break;
-            case 2:  r = x < y;  break; case 3: r = x <= y; break;
-            case 4:  r = x > y;  break; default: r = x >= y; break;
-            }
-            di[i] = r;
-        }
-        return;
-    }
+    __global const double *a = AP(const double, t.a), *b = AP(const double, t.b);
     for (uint i = lo + lid; i < hi; i += lsz) {
-        const double x = a[i], y = (sub <= SUB_POW || sub == SUB_SELECT) ? b[i] : 0.0;
-        double r = 0.0;
+        const double x = a[i], y = (sub <= SUB_POW) ? b[i] : 0.0;
+        double r;
         switch (sub) {
         case SUB_ADD: r = x + y; break;   case SUB_MUL: r = x * y; break;
         case SUB_SUB: r = x - y; break;   case SUB_DIV: r = x / y; break;
@@ -113,10 +117,6 @@ static void ew_tile_f64(__global uchar *arena, const task_t t, uint tile,
         case SUB_ABS: r = fabs(x); break; case SUB_FLOOR: r = floor(x); break;
         case SUB_CEIL: r = ceil(x); break;
         case SUB_SIGN: r = x > 0.0 ? 1.0 : (x < 0.0 ? -1.0 : x); break;
-        case SUB_SELECT: {
-            __global const double *p = AP(const double, t.p3);
-            r = p[i] != 0.0 ? x : y; break;
-        }
         default: r = x; break;
         }
         d[i] = r;
@@ -124,42 +124,15 @@ static void ew_tile_f64(__global uchar *arena, const task_t t, uint tile,
 }
 #endif
 
-/* Integer elementwise (i32/u32/bool). bool is i32 0/1. Transcendentals don't
- * apply to integers (jax never emits them on int types). */
 static void ew_tile_i32(__global uchar *arena, const task_t t, uint tile,
                         uint lid, uint lsz)
 {
     const uint sub = t.p0, n = t.p1;
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
     __global int *d = AP(int, t.dst);
-    __global const int *a = AP(const int, t.a);
-    __global const int *b = AP(const int, t.b);
-    if (sub == SUB_SELECT) {
-        __global const int *p = AP(const int, t.p3);
-        for (uint i = lo + lid; i < hi; i += lsz) d[i] = p[i] != 0 ? a[i] : b[i];
-        return;
-    }
-    if (sub == SUB_FILL) {
-        for (uint i = lo + lid; i < hi; i += lsz) d[i] = (int)t.p2;
-        return;
-    }
-    if (sub == SUB_IOTA_FLAT) {
-        for (uint i = lo + lid; i < hi; i += lsz) d[i] = (int)i;
-        return;
-    }
-    if (sub == SUB_CMP) {
-        for (uint i = lo + lid; i < hi; i += lsz) {
-            const int x = a[i], y = b[i];
-            int r;
-            switch (t.p2) {
-            case 0:  r = x == y; break; case 1: r = x != y; break;
-            case 2:  r = x < y;  break; case 3: r = x <= y; break;
-            case 4:  r = x > y;  break; default: r = x >= y; break;
-            }
-            d[i] = r;
-        }
-        return;
-    }
+    __global const int *a = AP(const int, t.a), *b = AP(const int, t.b);
+    if (sub == SUB_FILL) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (int)t.p2; return; }
+    if (sub == SUB_IOTA_FLAT) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (int)i; return; }
     for (uint i = lo + lid; i < hi; i += lsz) {
         const int x = a[i], y = (sub <= SUB_POW) ? b[i] : 0;
         int r;
@@ -176,17 +149,30 @@ static void ew_tile_i32(__global uchar *arena, const task_t t, uint tile,
     }
 }
 
-static void ew_tile(__global uchar *arena, const task_t t, uint tile,
-                    uint dt, uint lid, uint lsz)
+/* bool (1-byte) elementwise: copy/fill/iota (logical ops arrive as and/or/xor,
+ * added when those ops land). */
+static void ew_tile_bool(__global uchar *arena, const task_t t, uint tile,
+                         uint lid, uint lsz)
 {
+    const uint sub = t.p0, n = t.p1;
+    const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
+    __global uchar *d = AP(uchar, t.dst);
+    __global const uchar *a = AP(const uchar, t.a);
+    if (sub == SUB_FILL) for (uint i = lo + lid; i < hi; i += lsz) d[i] = (uchar)(t.p2 != 0);
+    else for (uint i = lo + lid; i < hi; i += lsz) d[i] = a[i];  /* copy */
+}
+
+static void ew_tile(__global uchar *arena, const task_t t, uint tile,
+                    uint dt, uint adt, uint lid, uint lsz)
+{
+    if (t.p0 == SUB_CMP) { cmp_tile(arena, t, tile, adt, lid, lsz); return; }
+    if (t.p0 == SUB_SELECT) { select_tile(arena, t, tile, dt, lid, lsz); return; }
     switch (dt) {
-    case DT_I32: case DT_U32: case DT_BOOL:
-        ew_tile_i32(arena, t, tile, lid, lsz); break;
+    case DT_I32: case DT_U32: ew_tile_i32(arena, t, tile, lid, lsz); break;
+    case DT_BOOL:             ew_tile_bool(arena, t, tile, lid, lsz); break;
 #ifdef cl_khr_fp64
-    case DT_F64:
-        ew_tile_f64(arena, t, tile, lid, lsz); break;
+    case DT_F64:              ew_tile_f64(arena, t, tile, lid, lsz); break;
 #endif
-    default:
-        ew_tile_f32(arena, t, tile, lid, lsz); break;
+    default:                  ew_tile_f32(arena, t, tile, lid, lsz); break;
     }
 }

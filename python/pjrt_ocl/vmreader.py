@@ -103,7 +103,7 @@ class Program:
 
 @dataclasses.dataclass
 class ParsedTask:
-    tile_op: int
+    tile_op: int          # base op (dtype masked off)
     dst: int
     a: int
     b: int
@@ -111,6 +111,8 @@ class ParsedTask:
     p1: int
     p2: int
     p3: int
+    dtype: int = 0        # result dtype (tile_op bits 8-15)
+    adtype: int = 0       # operand dtype (tile_op bits 16-23)
 
     def n_tiles(self) -> int:
         return S.Task(self.tile_op, self.dst, self.a, self.b,
@@ -283,14 +285,18 @@ def _parse_schedule(data: bytes, pos: int, n_buffers: int) -> ParsedSchedule:
     for i in range(n_tasks):
         fields = S.TASK_STRUCT.unpack_from(data, pos)
         pos += S.TASK_STRUCT.size
-        tile_op, dst, a, b, p0, p1, p2, p3 = fields
+        packed, dst, a, b, p0, p1, p2, p3 = fields
+        tile_op = packed & 0xFF            # base op
+        dtype = (packed >> 8) & 0xFF       # result dtype
+        adtype = (packed >> 16) & 0xFF     # operand dtype
         # dst/a/b are buffer ids for compute tasks; range-check defensively.
         if tile_op == S.TILE_EW:
             for name, bid in (("dst", dst), ("a", a), ("b", b)):
                 if bid >= n_buffers:
                     raise FormatError(
                         f"task[{i}] {name}={bid} out of range ({n_buffers})")
-        tasks.append(ParsedTask(tile_op, dst, a, b, p0, p1, p2, p3))
+        tasks.append(ParsedTask(tile_op, dst, a, b, p0, p1, p2, p3,
+                                dtype=dtype, adtype=adtype))
 
     lane_tab: list[tuple[int, int]] = []
     for i in range(n_lanes):

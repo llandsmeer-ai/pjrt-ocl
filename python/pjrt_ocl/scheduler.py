@@ -136,7 +136,8 @@ class Task:
     p1: int = 0
     p2: int = 0
     p3: int = 0
-    dtype: int = 0        # DT_* — how the VM interprets arena slots
+    dtype: int = 0        # DT_* result dtype (how the VM writes the output)
+    adtype: int = 0       # DT_* operand dtype (compare/convert differ from dtype)
 
     def n_tiles(self) -> int:
         if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM):
@@ -186,8 +187,9 @@ class Schedule:
         out += SCHED_HDR_STRUCT.pack(len(self.tasks), len(flat),
                                      self.n_flags, self.n_lanes)
         for t in self.tasks:
-            out += TASK_STRUCT.pack(t.tile_op | (t.dtype << 8), t.dst, t.a, t.b,
-                                    t.p0, t.p1, t.p2, t.p3)
+            out += TASK_STRUCT.pack(
+            t.tile_op | (t.dtype << 8) | (t.adtype << 16), t.dst, t.a, t.b,
+            t.p0, t.p1, t.p2, t.p3)
         for off, count, root_len in lane_tab:
             out += LANETAB_STRUCT.pack(off, count, root_len, 0)
         for e in flat:
@@ -256,6 +258,9 @@ def _instr_to_task(ins: L.Instr, buffers) -> Task:
     path; other ops register a mapper in opsem.TO_TASK. The task dtype is the
     result buffer's dtype (how the VM interprets its arena slots)."""
     dtype = buffers[ins.dst].dtype
+    # operand dtype: for compare/convert the inputs differ from the bool/output
+    # dtype. `a` is the representative operand for every current op.
+    adtype = buffers[ins.a].dtype if ins.a < len(buffers) else dtype
     if ins.op in _TENSOR_TO_EW:
         subop = _TENSOR_TO_EW[ins.op]
         p2 = ins.imm if ins.op == L.OP_FILL_F32 else 0
@@ -269,6 +274,7 @@ def _instr_to_task(ins: L.Instr, buffers) -> Task:
                 f"({L.OP_NAMES.get(ins.op, hex(ins.op))})")
         task = mapper(ins)
     task.dtype = dtype
+    task.adtype = adtype
     return task
 
 

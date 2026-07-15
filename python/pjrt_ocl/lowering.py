@@ -70,7 +70,7 @@ DTYPE_NUMPY = {
     DT_F32: np.dtype("<f4"),
     DT_I32: np.dtype("<i4"),
     DT_U32: np.dtype("<u4"),
-    DT_BOOL: np.dtype("<i4"),   # our arena repr: i32 0/1
+    DT_BOOL: np.dtype("u1"),    # 1-byte 0/1, matching jax PRED
     DT_I64: np.dtype("<i8"),
     DT_F64: np.dtype("<f8"),
 }

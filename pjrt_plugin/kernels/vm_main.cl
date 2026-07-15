@@ -10,11 +10,13 @@ static void exec_tiles(__global uchar *arena, __global const int *aux,
     const uint lid = get_local_id(0);
     const uint lsz = get_local_size(0);
     const uint op = t.tile_op & 0xFFu;
-    const uint dt = (t.tile_op >> 8) & 0xFFu;
-    const uint esz = (dt == DT_I64 || dt == DT_F64) ? 8u : 4u;
+    const uint dt = (t.tile_op >> 8) & 0xFFu;    /* result dtype */
+    const uint adt = (t.tile_op >> 16) & 0xFFu;  /* operand dtype */
+    const uint esz = (dt == DT_I64 || dt == DT_F64) ? 8u
+                   : (dt == DT_BOOL) ? 1u : 4u;
     for (uint tile = tile_lo; tile < tile_hi; ++tile) {
         switch (op) {
-        case TOP_EW:       ew_tile(arena, t, tile, dt, lid, lsz); break;
+        case TOP_EW:       ew_tile(arena, t, tile, dt, adt, lid, lsz); break;
         case TOP_MMA:      mma_tile(arena, t, tile, As, Bs); break;
         case TOP_GATHER:   gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
         case TOP_RED_PART: reduce_part_tile(arena, t, tile, As, lid, lsz); break;

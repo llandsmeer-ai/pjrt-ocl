@@ -170,8 +170,8 @@ for _name, _opcode, _subop, _npfn in _UNOPS:
 @L.handles("stablehlo.compare")
 def _compare(ctx, op):
     from jaxlib.mlir.dialects import stablehlo
-    # result type is i1 (bool) — tensor_info would reject it (f32-only), so
-    # take shape/n_elems from the (f32) operands instead.
+    # operands share a dtype; the result is bool (1-byte). The VM reads operands
+    # as the operand dtype (task.adtype) and writes bool (task.dtype).
     _, n_elems, dtype = L.tensor_info(op.operands[0].type)
     if L.tensor_info(op.operands[1].type)[1:] != (n_elems, dtype):
         raise L.LoweringError("compare: operand shape mismatch")
@@ -180,12 +180,9 @@ def _compare(ctx, op):
     pred = _CMP_DIRECTION_TO_PRED.get(direction)
     if pred is None:
         raise L.LoweringError(f"compare: unsupported direction {direction}")
-    dst = ctx.new_buffer(n_elems, dtype)
+    dst = ctx.new_buffer(n_elems, L.DT_BOOL)
     ctx.emit(L.Instr(L.OP_CMP_F32, dst=dst, a=ctx.buf_for(op.operands[0]),
                      b=ctx.buf_for(op.operands[1]), n=n_elems, imm=pred))
-    # value has i1 type in the IR; we key value_to_buf by the ir.Value object
-    # itself (not its type), so downstream consumers (e.g. select's pred
-    # operand) look this buffer id up fine despite the type mismatch.
     ctx.value_to_buf[op.results[0]] = dst
 
 
@@ -198,12 +195,12 @@ def _cmp_interp(ins, rt) -> None:
     a = rt.view(ins.a, ins.n)
     b = rt.view(ins.b, ins.n)
     npfn = _CMP_PRED_TO_NPFN[ins.imm]
-    rt.view(ins.dst, ins.n)[:] = npfn(a, b).astype(np.float32)
+    rt.view(ins.dst, ins.n)[:] = npfn(a, b)   # dst is bool (uint8 0/1)
 
 
 def _cmp_ew_sim(a, b, task, rt, lo, hi):
     npfn = _CMP_PRED_TO_NPFN[task.p2]
-    return npfn(a, b).astype(np.float32)
+    return npfn(a, b).astype(np.uint8)
 
 
 opsem.register(L.OP_CMP_F32, to_task=_cmp_to_task, interp=_cmp_interp)
