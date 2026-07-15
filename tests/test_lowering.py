@@ -146,9 +146,9 @@ def test_golden_layout_exact_bytes():
     pos = tensor_len
     n_tasks, n_entries, n_flags, n_lanes = struct.unpack_from("<IIII", blob, pos)
     # add-then-sub => two dataflow levels, each one 1-tile EW task on lane 0;
-    # a BARRIER on all 8 lanes after each level.
+    # one BARRIER between the levels (no trailing barrier after the last).
     assert (n_tasks, n_flags, n_lanes) == (2, 0, 8)
-    assert n_entries == 4 + 7 * 2  # lane0: E,BAR,E,BAR ; lanes1-7: BAR,BAR
+    assert n_entries == 3 + 7 * 1  # lane0: E,BAR,E ; lanes1-7: BAR
     pos += 16
 
     # task 0: EW add, dst=3 a=0 b=1 p0=0(add) p1=3(n_elems)
@@ -156,9 +156,9 @@ def test_golden_layout_exact_bytes():
     assert t0 == (S.TILE_EW, 3, 0, 1, S.EW_ADD, 3, 0, 0)
     pos += 32 * n_tasks  # skip past both tasks
 
-    # lane table (n_lanes x {entry_off, entry_count}); lane 0 owns 4 entries
+    # lane table (n_lanes x {entry_off, entry_count}); lane 0 owns E,BAR,E = 3
     off0, cnt0 = struct.unpack_from("<II", blob, pos)
-    assert (off0, cnt0) == (0, 4)
+    assert (off0, cnt0) == (0, 3)
     pos += 16 * n_lanes
 
     # entries: first is task 0 on tiles [0,1); second is a BARRIER
@@ -217,18 +217,17 @@ def test_golden_layout_jax_lowered_add():
     assert struct.unpack_from("<8I", blob, pos) == (1, 2, 0, 1, 8, 0, 0, 0)
     pos += 32
 
-    # schedule sections: one EW add task, one dataflow level => one barrier
-    # phase; task on lane 0, BARRIER on all 8 lanes.
+    # schedule sections: one EW add task, one dataflow level => a single phase
+    # with NO barrier (trailing barrier omitted); task on lane 0, others empty.
     n_tasks, n_entries, n_flags, n_lanes = struct.unpack_from("<IIII", blob, pos)
     assert (n_tasks, n_flags, n_lanes) == (1, 0, 8)
-    assert n_entries == 1 + 8       # one task entry on lane0 + 8 barriers
+    assert n_entries == 1           # one task entry on lane0, no barrier
     pos += 16
     assert struct.unpack_from("<8I", blob, pos) == (S.TILE_EW, 2, 0, 1,
                                                     S.EW_ADD, 8, 0, 0)
     pos += 32 * n_tasks + 16 * n_lanes
-    # first entry = task 0 tiles [0,1); second entry = BARRIER
+    # the single entry = task 0 tiles [0,1)
     assert struct.unpack_from("<8I", blob, pos)[:3] == (0, 0, 1)
-    assert struct.unpack_from("<I", blob, pos + 32)[0] == 0xFFFFFFFE
     pos += 32 * n_entries
     assert pos == len(blob)
 
@@ -440,7 +439,7 @@ def _tasks_in_phase(prog: R.Program):
     counts = [sum(1 for e in s if e.task == S.TASK_BARRIER)
               for s in sched.lane_streams]
     assert len(set(counts)) == 1, f"barrier counts differ: {counts}"
-    n_phases = counts[0]
+    n_phases = counts[0] + 1     # B barriers separate B+1 phases (no trailing)
     phases = [set() for _ in range(n_phases)]
     for stream in sched.lane_streams:
         p = 0

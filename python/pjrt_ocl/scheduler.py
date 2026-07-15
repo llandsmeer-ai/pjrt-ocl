@@ -374,19 +374,19 @@ def schedule_program(prog: L.VMProgram,
         tasks.append(_instr_to_task(ins, prog.buffers))
 
     sched_indices = [i for i in range(len(main)) if i in instr_task]
-    for level in _levels(main, sched_indices):
+    levels = _levels(main, sched_indices)
+    for li, level in enumerate(levels):
         level_tasks = [(instr_task[i], tasks[instr_task[i]]) for i in level]
         for lane, entry in _pack_level(level_tasks, n_lanes, config):
             lane_streams[lane].append(entry)
-        # v0: global BARRIER after every level (including the last)
-        for lane in range(n_lanes):
-            lane_streams[lane].append(_barrier_entry())
-
-    # a program with no compute instrs still gets one barrier phase so lane
-    # streams are uniform (and the executor has a defined shape)
-    if not sched_indices:
-        for lane in range(n_lanes):
-            lane_streams[lane].append(_barrier_entry())
+        # global BARRIER only BETWEEN levels — the trailing one after the last
+        # level synchronizes nothing (nothing reads it before the kernel ends +
+        # clFinish), so omit it. A single-level program then needs no
+        # cross-workgroup barrier at all — important on devices where the
+        # persistent-thread barrier doesn't co-reside (docs/decisions.md #1).
+        if li < len(levels) - 1:
+            for lane in range(n_lanes):
+                lane_streams[lane].append(_barrier_entry())
 
     return Schedule(n_flags=0, n_lanes=n_lanes, tasks=tasks,
                     lane_streams=lane_streams)

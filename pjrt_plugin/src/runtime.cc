@@ -540,8 +540,10 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
     }
     (*outputs)[i] = out;
   }
-  if (clFinish(q) != CL_SUCCESS) {
-    *err = "ExecuteDevice: clFinish failed";
+  if (cl_int e = clFinish(q); e != CL_SUCCESS) {
+    *err = "ExecuteDevice: clFinish failed (" + std::to_string(e) +
+           "; kernel execution error — likely the cross-workgroup barrier not "
+           "co-residing on this device, or resource limits)";
     return false;
   }
   return true;

@@ -418,7 +418,8 @@ def _split_phases(sched: ParsedSchedule) -> list[list[tuple[int, ParsedEntry]]]:
               for s in sched.lane_streams]
     if len(set(counts)) > 1:
         raise AssertionError(f"barrier counts differ across lanes: {counts}")
-    n_phases = counts[0] if counts else 0
+    # B barriers separate B+1 phases (the last phase has no trailing barrier).
+    n_phases = (counts[0] if counts else 0) + 1
     phases: list[list[tuple[int, ParsedEntry]]] = [[] for _ in range(n_phases)]
     for lane, stream in enumerate(sched.lane_streams):
         p = 0
