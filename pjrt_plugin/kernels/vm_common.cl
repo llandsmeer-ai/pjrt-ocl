@@ -27,9 +27,23 @@
 /* Typed element pointer at byte base `base` into the byte-addressed arena. */
 #define AP(T, base) ((__global T *)(arena + (base)))
 
-/* dtype enum (matches python DT_* / runtime.h). Tier 1 = 4-byte. */
+/* dtype enum (matches python DT_* / runtime.h). */
 enum { DT_F32 = 0, DT_I32 = 1, DT_U32 = 2, DT_BOOL = 3,
-       DT_I64 = 4, DT_F64 = 5 };
+       DT_I64 = 4, DT_F64 = 5, DT_F16 = 6, DT_BF16 = 7 };
+
+/* f16 and bf16 are 2-byte storage + f32 compute (portable, no cl_khr_fp16):
+ * f16 via core vload_half/vstore_half; bf16 via bit shift (top 16 bits of the
+ * f32) with round-to-nearest-even. */
+#define LDH(base, i) vload_half((i), (const __global half *)(arena + (base)))
+#define STH(base, i, v) vstore_half((v), (i), (__global half *)(arena + (base)))
+static float bf16_to_f32(ushort b) { return as_float(((uint)b) << 16); }
+static ushort f32_to_bf16(float f)
+{
+    uint u = as_uint(f);
+    return (ushort)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);  /* round-nearest-even */
+}
+#define LDB(base, i) bf16_to_f32(AP(const ushort, (base))[i])
+#define STB(base, i, v) (AP(ushort, (base))[i] = f32_to_bf16(v))
 
 enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
        TOP_RED_COMB = 4, TOP_IOTA_DIM = 5 };

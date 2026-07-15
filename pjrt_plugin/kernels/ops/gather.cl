@@ -25,6 +25,28 @@ static void gather_tile(__global uchar *arena, __global const int *aux,
             }
             d[i] = a[off];
         }
+    } else if (esz == 2) {
+        __global ushort *d = AP(ushort, t.dst);
+        __global const ushort *a = AP(const ushort, t.a);
+        for (uint i = lo + lid; i < hi; i += lsz) {
+            int rem = (int)i, off = src_off;
+            for (int e = rank - 1; e >= 0; --e) {
+                off += (rem % dims[e]) * strides[e];
+                rem /= dims[e];
+            }
+            d[i] = a[off];
+        }
+    } else if (esz == 1) {
+        __global uchar *d = AP(uchar, t.dst);
+        __global const uchar *a = AP(const uchar, t.a);
+        for (uint i = lo + lid; i < hi; i += lsz) {
+            int rem = (int)i, off = src_off;
+            for (int e = rank - 1; e >= 0; --e) {
+                off += (rem % dims[e]) * strides[e];
+                rem /= dims[e];
+            }
+            d[i] = a[off];
+        }
     } else {
         __global uint *d = AP(uint, t.dst);
         __global const uint *a = AP(const uint, t.a);

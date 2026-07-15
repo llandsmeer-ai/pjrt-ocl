@@ -13,7 +13,8 @@ static void exec_tiles(__global uchar *arena, __global const int *aux,
     const uint dt = (t.tile_op >> 8) & 0xFFu;    /* result dtype */
     const uint adt = (t.tile_op >> 16) & 0xFFu;  /* operand dtype */
     const uint esz = (dt == DT_I64 || dt == DT_F64) ? 8u
-                   : (dt == DT_BOOL) ? 1u : 4u;
+                   : (dt == DT_BOOL) ? 1u
+                   : (dt == DT_F16 || dt == DT_BF16) ? 2u : 4u;
     for (uint tile = tile_lo; tile < tile_hi; ++tile) {
         switch (op) {
         case TOP_EW:       ew_tile(arena, t, tile, dt, adt, lid, lsz); break;

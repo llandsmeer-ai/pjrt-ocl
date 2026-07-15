@@ -33,14 +33,16 @@ def _row_major_strides(shape: tuple[int, ...]) -> list[int]:
     return strides
 
 
-def _emit_gather(ctx, out_shape, in_buf, out_strides, src_off=0):
+def _emit_gather(ctx, out_shape, in_buf, out_strides, src_off=0, dtype=None):
     """Emit a GATHER_STRIDED producing out_shape from in_buf, walking in_buf with
-    `out_strides` (one per output axis) starting at element `src_off`."""
+    `out_strides` (one per output axis) starting at element `src_off`. Gather
+    copies whole elements, so the output dtype = input dtype (must be passed for
+    non-f32 — the element size drives the VM's copy width)."""
     n = math.prod(out_shape) if out_shape else 1
     rank = len(out_shape)
     aux_words = [rank] + list(out_shape) + list(out_strides) + [src_off]
     aux_off = ctx.add_aux(aux_words)
-    dst = ctx.new_buffer(n)
+    dst = ctx.new_buffer(n, L.DT_F32 if dtype is None else dtype)
     ctx.emit(L.Instr(L.OP_GATHER_STRIDED, dst=dst, a=in_buf, n=n, aux=aux_off))
     return dst
 
@@ -48,7 +50,7 @@ def _emit_gather(ctx, out_shape, in_buf, out_strides, src_off=0):
 @L.handles("stablehlo.broadcast_in_dim")
 def _broadcast_in_dim(ctx, op):
     from jaxlib.mlir import ir
-    in_shape, _, _ = L.tensor_info(op.operands[0].type)
+    in_shape, _, in_dt = L.tensor_info(op.operands[0].type)
     out_shape, _, _ = L.tensor_info(op.results[0].type)
     bcast_dims = [int(x) for x in ir.DenseI64ArrayAttr(
         op.attributes["broadcast_dimensions"])]
@@ -65,7 +67,8 @@ def _broadcast_in_dim(ctx, op):
             if out_shape[out_axis] != in_shape[in_axis]:
                 raise L.LoweringError("broadcast_in_dim: non-1 axis size change")
             out_strides[out_axis] = in_strides[in_axis]
-    dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]), out_strides)
+    dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]), out_strides,
+                       dtype=in_dt)
     ctx.value_to_buf[op.results[0]] = dst
 
 
@@ -87,7 +90,7 @@ def _reshape(ctx, op):
 def _slice(ctx, op):
     # dst[i] = a[ start + i*slice_stride ] per axis -> a strided gather.
     from jaxlib.mlir import ir
-    in_shape, _, _ = L.tensor_info(op.operands[0].type)
+    in_shape, _, in_dt = L.tensor_info(op.operands[0].type)
     out_shape, _, _ = L.tensor_info(op.results[0].type)
     starts = [int(x) for x in
               ir.DenseI64ArrayAttr(op.attributes["start_indices"])]
@@ -96,7 +99,7 @@ def _slice(ctx, op):
     out_strides = [in_strides[d] * sstrides[d] for d in range(len(out_shape))]
     src_off = sum(starts[d] * in_strides[d] for d in range(len(in_shape)))
     dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]),
-                       out_strides, src_off)
+                       out_strides, src_off, dtype=in_dt)
     ctx.value_to_buf[op.results[0]] = dst
 
 
@@ -104,7 +107,7 @@ def _slice(ctx, op):
 def _reverse(ctx, op):
     # reversed axes walk with a negative stride, starting at the last element.
     from jaxlib.mlir import ir
-    in_shape, _, _ = L.tensor_info(op.operands[0].type)
+    in_shape, _, in_dt = L.tensor_info(op.operands[0].type)
     dims = {int(x) for x in ir.DenseI64ArrayAttr(op.attributes["dimensions"])}
     in_strides = _row_major_strides(in_shape)
     out_strides = list(in_strides)
@@ -113,14 +116,14 @@ def _reverse(ctx, op):
         out_strides[d] = -in_strides[d]
         src_off += (in_shape[d] - 1) * in_strides[d]
     dst = _emit_gather(ctx, in_shape, ctx.buf_for(op.operands[0]),
-                       out_strides, src_off)
+                       out_strides, src_off, dtype=in_dt)
     ctx.value_to_buf[op.results[0]] = dst
 
 
 @L.handles("stablehlo.transpose")
 def _transpose(ctx, op):
     from jaxlib.mlir import ir
-    in_shape, _, _ = L.tensor_info(op.operands[0].type)
+    in_shape, _, in_dt = L.tensor_info(op.operands[0].type)
     out_shape, _, _ = L.tensor_info(op.results[0].type)
     perm = [int(x) for x in ir.DenseI64ArrayAttr(op.attributes["permutation"])]
     if len(perm) != len(in_shape):
@@ -128,7 +131,8 @@ def _transpose(ctx, op):
     in_strides = _row_major_strides(in_shape)
     # output axis k corresponds to input axis perm[k]; walk that input stride.
     out_strides = [in_strides[perm[k]] for k in range(len(out_shape))]
-    dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]), out_strides)
+    dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]), out_strides,
+                       dtype=in_dt)
     ctx.value_to_buf[op.results[0]] = dst
 
 

@@ -231,6 +231,8 @@ static PJRT_Buffer_Type VmDtypeToPjrt(uint32_t dt) {
     case pjrt_ocl::kDtBool: return PJRT_Buffer_Type_PRED;
     case pjrt_ocl::kDtI64:  return PJRT_Buffer_Type_S64;
     case pjrt_ocl::kDtF64:  return PJRT_Buffer_Type_F64;
+    case pjrt_ocl::kDtF16:  return PJRT_Buffer_Type_F16;
+    case pjrt_ocl::kDtBf16: return PJRT_Buffer_Type_BF16;
     default:                return PJRT_Buffer_Type_F32;
   }
 }

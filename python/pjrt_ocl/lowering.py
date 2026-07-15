@@ -66,6 +66,8 @@ DT_F16 = 6
 DT_BF16 = 7
 DT_C64 = 8
 
+import ml_dtypes as _ml_dtypes  # noqa: E402 (bf16 numpy dtype; ships with jax)
+
 DTYPE_NUMPY = {
     DT_F32: np.dtype("<f4"),
     DT_I32: np.dtype("<i4"),
@@ -73,6 +75,8 @@ DTYPE_NUMPY = {
     DT_BOOL: np.dtype("u1"),    # 1-byte 0/1, matching jax PRED
     DT_I64: np.dtype("<i8"),
     DT_F64: np.dtype("<f8"),
+    DT_F16: np.dtype("<f2"),
+    DT_BF16: np.dtype(_ml_dtypes.bfloat16),
 }
 # 4-byte dtypes (share tile size math); 8-byte need the wide arena path.
 TIER1_DTYPES = frozenset({DT_F32, DT_I32, DT_U32, DT_BOOL})
@@ -291,6 +295,10 @@ def _elem_dtype(element_type) -> int:
         return DT_F32
     if isinstance(element_type, ir.F64Type):
         return DT_F64                      # device-gated (cl_khr_fp64) at load
+    if isinstance(element_type, ir.F16Type):
+        return DT_F16                      # 2-byte, f32 compute (portable)
+    if isinstance(element_type, ir.BF16Type):
+        return DT_BF16                     # 2-byte, f32 compute (portable)
     if isinstance(element_type, ir.IntegerType):
         w = element_type.width
         if w == 1:
@@ -369,12 +377,26 @@ def _lower_constant(ctx: _Ctx, op):
     from jaxlib.mlir import ir
     _, n_elems, dtype = _tensor_info(op.results[0].type)
     value = op.attributes["value"]
+    npdt = DTYPE_NUMPY[dtype]
     # int/bool constants are DenseIntElementsAttr; float are DenseFPElementsAttr.
     if dtype in (DT_I32, DT_U32, DT_BOOL, DT_I64):
-        attr = ir.DenseIntElementsAttr(value)
-    else:
+        arr = np.asarray(ir.DenseIntElementsAttr(value), dtype=npdt).reshape(-1)
+    elif dtype in (DT_F16, DT_BF16):
+        # MLIR's numpy interface can't convert bf16/f16 element attrs; extract
+        # via f32 (splats are the common case: scalars, bias, scale).
         attr = ir.DenseFPElementsAttr(value)
-    arr = np.asarray(attr, dtype=DTYPE_NUMPY[dtype]).reshape(-1)
+        if attr.is_splat:
+            v = float(ir.FloatAttr(attr.get_splat_value()))
+            arr = np.full(n_elems, v, dtype=np.float32).astype(npdt)
+        else:
+            try:
+                arr = np.array([float(x) for x in attr],
+                               dtype=np.float32).astype(npdt)
+            except Exception as e:  # noqa: BLE001
+                raise LoweringError(
+                    f"non-splat {npdt} constant not yet supported: {e}") from e
+    else:
+        arr = np.asarray(ir.DenseFPElementsAttr(value), dtype=npdt).reshape(-1)
     if arr.size == 1 and n_elems != 1:  # splat: expand into the const pool
         arr = np.broadcast_to(arr, (n_elems,)).copy()
     if arr.size != n_elems:
