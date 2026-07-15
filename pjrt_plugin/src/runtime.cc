@@ -302,6 +302,21 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   }
   rt->vm_kernel_ = clCreateKernel(rt->program_, "vm2", &cerr);
   if (cerr != CL_SUCCESS) return fail("clCreateKernel: " + std::to_string(cerr));
+  rt->vm_seg_kernel_ = clCreateKernel(rt->program_, "vm2_seg", &cerr);
+  if (cerr != CL_SUCCESS)
+    return fail("clCreateKernel vm2_seg: " + std::to_string(cerr));
+
+  // Engine selection: the persistent in-kernel spin-barrier requires all lanes
+  // to be co-resident and balanced, which non-GPU (CPU) OpenCL runtimes do NOT
+  // guarantee — it deadlocks on PoCL (imbalance-starvation, docs/decisions.md
+  // #1 / poc/07). Default those devices to host-dispatch (clFinish-per-phase
+  // barrier); GPUs keep the persistent megakernel. PJRT_OCL_ENGINE overrides.
+  rt->host_dispatch_ = !rt->info_.is_gpu;
+  if (const char* e = std::getenv("PJRT_OCL_ENGINE"); e && e[0]) {
+    if (!std::strcmp(e, "host")) rt->host_dispatch_ = true;
+    else if (!std::strcmp(e, "mega")) rt->host_dispatch_ = false;
+    // "auto" (or anything else) keeps the is_gpu-based default.
+  }
 
   // Lanes advertised to the python scheduler (PJRT_OCL_NLANES). Validated
   // co-residency regime: <= 3x CUs at 256 threads (poc/01, poc/04); GPUs get
@@ -316,6 +331,7 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
 
 OclRuntime::~OclRuntime() {
   if (vm_kernel_) clReleaseKernel(vm_kernel_);
+  if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
   if (program_) clReleaseProgram(program_);
   if (queue_) clReleaseCommandQueue(queue_);
   if (ctx_) clReleaseContext(ctx_);
@@ -415,7 +431,7 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
 
 LoadedProgram::~LoadedProgram() {
   for (cl_mem m : {arena_, aux_buf_, tasks_buf_, entries_buf_, lane_tab_buf_,
-                   bar_buf_, stats_buf_})
+                   bar_buf_, stats_buf_, seg_tab_buf_})
     if (m) clReleaseMemObject(m);
 }
 
@@ -442,7 +458,9 @@ bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
     }
   }
 
-  if (!LaunchKernel(q, err)) return false;
+  if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
+                             : LaunchKernel(q, err)))
+    return false;
 
   outputs->resize(p.outputs.size());
   for (size_t i = 0; i < p.outputs.size(); ++i) {
@@ -491,6 +509,158 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
   return true;
 }
 
+// Host-dispatch engine. Mirrors vm2's per-lane frame walk on the HOST, but
+// instead of an in-kernel spin-barrier it launches the barrier-free vm2_seg
+// kernel once per phase and uses clFinish as the barrier (workgroups run their
+// tile entries and EXIT — no co-residency, immune to the CPU spin-barrier
+// starvation deadlock, docs/decisions.md #1). Control is uniform across lanes
+// (the scheduler guarantees matching barrier counts), so all lanes reach the
+// same event each round; a mismatch is a scheduler bug. Because the scheduler
+// puts a barrier at every level boundary and gives WHILE its own level, each
+// inter-barrier segment is a CONTIGUOUS entry range within one frame.
+bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
+  const VmProgram& p = prog_;
+  if (p.entries.empty()) return true;
+  const uint32_t n = p.n_lanes;
+  constexpr uint32_t WIDX_ROOT = 0xFFFFFFFFu;
+  constexpr int MAX_DEPTH = 8;
+
+  if (!seg_tab_buf_) {
+    cl_int cerr;
+    seg_tab_buf_ = clCreateBuffer(rt_->ctx(), CL_MEM_READ_ONLY,
+                                  sizeof(cl_uint) * 2 * n, nullptr, &cerr);
+    if (cerr != CL_SUCCESS) {
+      *err = "host-dispatch: seg_tab alloc failed";
+      return false;
+    }
+  }
+
+  struct Frame { uint32_t pc, end, widx; int phase; };
+  std::vector<std::vector<Frame>> st(n);
+  for (uint32_t L = 0; L < n; ++L)
+    st[L].push_back({0, p.lane_tab[L].root_len, WIDX_ROOT, 0});
+
+  std::vector<cl_uint> seg(2 * n);  // per-lane {off, count}
+  auto lane_entry = [&](uint32_t L, uint32_t pc) -> const VmEntry& {
+    return p.entries[p.lane_tab[L].off + pc];
+  };
+
+  enum Ev { EV_BARRIER, EV_COND_DONE, EV_BODY_DONE, EV_DONE };
+  // Advance lane L to its next barrier/transition, collecting its contiguous
+  // tile-entry run into seg[2L..2L+1]. Direct mirror of vm2's interpreter.
+  auto advance = [&](uint32_t L) -> Ev {
+    seg[2 * L] = 0;
+    seg[2 * L + 1] = 0;
+    bool have = false;
+    for (;;) {
+      Frame& f = st[L].back();
+      if (f.pc >= f.end) {  // frame range exhausted
+        if (f.widx == WIDX_ROOT) return EV_DONE;
+        const VmEntry& w = lane_entry(L, f.widx);
+        if (w.task == kEntIf) {  // branch done: pop, advance parent
+          st[L].pop_back();
+          st[L].back().pc++;
+          continue;
+        }
+        return (f.phase == 0) ? EV_COND_DONE : EV_BODY_DONE;
+      }
+      const VmEntry& en = lane_entry(L, f.pc);
+      if (en.task == kEntBarrier) return EV_BARRIER;
+      if (en.task == kEntWhile) {
+        if (static_cast<int>(st[L].size()) >= MAX_DEPTH) return EV_DONE;
+        st[L].push_back({en.tile_lo, en.tile_lo + en.tile_hi, f.pc, 0});
+        continue;
+      }
+      // tile (or NOP): extend the contiguous segment
+      const uint32_t abs = p.lane_tab[L].off + f.pc;
+      if (!have) { seg[2 * L] = abs; have = true; }
+      seg[2 * L + 1]++;
+      f.pc++;
+    }
+  };
+
+  auto launch_seg = [&]() -> bool {
+    if (clEnqueueWriteBuffer(q, seg_tab_buf_, CL_TRUE, 0,
+                             sizeof(cl_uint) * 2 * n, seg.data(), 0, nullptr,
+                             nullptr) != CL_SUCCESS) {
+      *err = "host-dispatch: seg_tab upload failed";
+      return false;
+    }
+    cl_kernel k = rt_->vm_seg_kernel();
+    clSetKernelArg(k, 0, sizeof(arena_), &arena_);
+    clSetKernelArg(k, 1, sizeof(aux_buf_), &aux_buf_);
+    clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
+    clSetKernelArg(k, 3, sizeof(entries_buf_), &entries_buf_);
+    clSetKernelArg(k, 4, sizeof(seg_tab_buf_), &seg_tab_buf_);
+    size_t lsz = 256, gsz = size_t{n} * lsz;
+    if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                               nullptr) != CL_SUCCESS) {
+      *err = "host-dispatch: segment launch failed";
+      return false;
+    }
+    if (clFinish(q) != CL_SUCCESS) {  // <-- this clFinish IS the phase barrier
+      *err = "host-dispatch: clFinish (phase barrier) failed";
+      return false;
+    }
+    return true;
+  };
+
+  for (long guard = 0;; ++guard) {
+    if (guard > 100000000L) {
+      *err = "host-dispatch: runaway control loop";
+      return false;
+    }
+    const Ev ev = advance(0);
+    bool any = seg[1] > 0;
+    for (uint32_t L = 1; L < n; ++L) {
+      if (advance(L) != ev) {
+        *err = "host-dispatch: non-uniform control across lanes";
+        return false;
+      }
+      if (seg[2 * L + 1] > 0) any = true;
+    }
+    if (any && !launch_seg()) return false;
+
+    if (ev == EV_DONE) break;
+    if (ev == EV_BARRIER) {
+      for (uint32_t L = 0; L < n; ++L) st[L].back().pc++;  // step past barrier
+    } else if (ev == EV_COND_DONE) {
+      // Read the shared loop cond (all lanes' WHILE entries name the same cond
+      // buffer). p.entries keeps buffer ids (only the device copy is patched
+      // to byte offsets), so resolve the arena offset here.
+      const VmEntry& w0 = lane_entry(0, st[0].back().widx);
+      uint32_t cbits = 0;
+      const uint64_t off = p.buffers[w0.signal_flag].arena_byte_offset;
+      if (clEnqueueReadBuffer(q, arena_, CL_TRUE, off, 4, &cbits, 0, nullptr,
+                              nullptr) != CL_SUCCESS) {
+        *err = "host-dispatch: cond read failed";
+        return false;
+      }
+      for (uint32_t L = 0; L < n; ++L) {
+        Frame& f = st[L].back();
+        const VmEntry& w = lane_entry(L, f.widx);
+        if (cbits != 0) {  // loop continues -> body range
+          f.pc = w.wait_flag;
+          f.end = w.wait_flag + w.wait_count;
+          f.phase = 1;
+        } else {  // loop exits -> pop, advance parent
+          st[L].pop_back();
+          st[L].back().pc++;
+        }
+      }
+    } else {  // EV_BODY_DONE -> recheck cond
+      for (uint32_t L = 0; L < n; ++L) {
+        Frame& f = st[L].back();
+        const VmEntry& w = lane_entry(L, f.widx);
+        f.pc = w.tile_lo;
+        f.end = w.tile_lo + w.tile_hi;
+        f.phase = 0;
+      }
+    }
+  }
+  return true;
+}
+
 bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
                                   std::vector<cl_mem>* outputs,
                                   std::string* err) {
@@ -515,7 +685,9 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
     }
   }
 
-  if (!LaunchKernel(q, err)) return false;
+  if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
+                             : LaunchKernel(q, err)))
+    return false;
 
   // Each output stays on device: fresh cl_mem, device->device copy from arena.
   outputs->assign(p.outputs.size(), nullptr);

@@ -58,7 +58,20 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     and exits as barriers" — literally the host-dispatch model. Only in-kernel escape is
     *cooperative kernels* (need a bespoke scheduler that context-switches a waiting group; not
     available to portable OpenCL C or PoCL). Not a PoCL bug, not out-engineerable in-kernel — it is
-    the established state of the art. Supersedes the vaguer fix-options in
+    the established state of the art.
+  - ✅ **SHIPPED 2026-07-15: host-dispatch engine (`vm2_seg` + `LaunchHostDispatch`).** The runtime
+    now carries TWO engines behind one bytecode. GPU (is_gpu) keeps the persistent device-scope
+    megakernel; non-GPU (CPU) defaults to host-dispatch — `PJRT_OCL_ENGINE=host|mega|auto` overrides.
+    Host-dispatch mirrors vm2's per-lane frame walk ON THE HOST and launches the barrier-free
+    `vm2_seg` kernel once per phase, using `clFinish` as the barrier (workgroups run their tile
+    entries and EXIT — no co-residency, immune to the starvation deadlock). Key invariant that keeps
+    it simple: the scheduler puts a barrier at every level boundary and gives WHILE its own level, so
+    each inter-barrier segment is a CONTIGUOUS entry range per lane ({off,count}); while-cond scalars
+    are read host-side between phases. Verified: runtime_test A+B pass 5/5 on PoCL (was 100% deadlock);
+    `(a+b)*a` 300 iters, all 7 while programs, matmul/reduce/broadcast all correct on PoCL via the
+    plugin; NVIDIA megakernel path unchanged; forced host-dispatch on NVIDIA also passes; PoCL+mega
+    still deadlocks (flag works). 197 pytest + 3 e2e pass. **PoCL is deadlock-free for the first time.**
+  - Supersedes the vaguer fix-options in
   the node below.
 - ⚠️ **CONFIRMED #1 RISK 2026-07-15: cross-workgroup spin-barrier is UNRELIABLE on PoCL under
   iteration (LIVENESS axis — still open; poc/07 fixed only the visibility axis above).** The persistent-VLIW engine (vm2.cl) uses the poc/01 global barrier between schedule

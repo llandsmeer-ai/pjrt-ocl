@@ -135,3 +135,30 @@ __kernel void vm2(__global uchar *arena,
         st[sp].pc++;
     }
 }
+
+/* HOST-DISPATCH engine (CPU / non-GPU devices, docs/decisions.md #1): the host
+ * drives control flow and the cross-workgroup barrier via clFinish between
+ * launches, so there is NO in-kernel barrier and no co-residency requirement
+ * (a finished workgroup exits and frees its CPU thread — immune to the
+ * imbalance-starvation deadlock the persistent spin-barrier hits on PoCL,
+ * poc/07). This kernel runs ONE barrier-free segment: each workgroup (lane)
+ * executes its contiguous run of tile entries [seg.x, seg.x+seg.y) — the host
+ * has already resolved all BARRIER/WHILE/IF control, so a segment holds only
+ * tile (or NOP) entries. */
+__kernel void vm2_seg(__global uchar *arena,
+                      __global const int *aux,
+                      __global const task_t *tasks,
+                      __global const entry_t *entries,
+                      __global const uint2 *seg_tab)   /* per-lane {off, count} */
+{
+    const uint lane = get_group_id(0);
+    __local float As[MMA_ASZ];
+    __local float Bs[MMA_BSZ];
+    const uint2 seg = seg_tab[lane];
+    for (uint i = 0; i < seg.y; ++i) {
+        const entry_t en = entries[seg.x + i];
+        if (en.task != ENT_NOP)
+            vmo_exec_tiles(arena, aux, tasks[en.task], en.tile_lo, en.tile_hi,
+                           As, Bs);
+    }
+}

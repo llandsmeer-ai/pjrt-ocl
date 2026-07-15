@@ -108,8 +108,15 @@ class OclRuntime {
   cl_context ctx() const { return ctx_; }
   cl_command_queue queue() const { return queue_; }
   cl_kernel vm_kernel() const { return vm_kernel_; }
+  cl_kernel vm_seg_kernel() const { return vm_seg_kernel_; }
   cl_uint ngroups() const { return ngroups_; }
   size_t local_size() const { return local_size_; }
+  // Host-dispatch engine: the host drives control flow and enforces the
+  // cross-workgroup barrier via clFinish between per-phase launches (no
+  // in-kernel spin-barrier). Default ON for non-GPU (CPU) devices, where the
+  // persistent spin-barrier deadlocks (imbalance-starvation, docs/decisions.md
+  // #1 / poc/07); OFF for GPUs. Overridable via PJRT_OCL_ENGINE=host|mega|auto.
+  bool host_dispatch() const { return host_dispatch_; }
   std::mutex& mu() { return mu_; }
 
   // Device-resident buffer helpers (for device-resident PJRT_Buffers). Each
@@ -128,8 +135,10 @@ class OclRuntime {
   cl_command_queue queue_ = nullptr;
   cl_program program_ = nullptr;
   cl_kernel vm_kernel_ = nullptr;
+  cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
   cl_uint ngroups_ = 0;    // co-resident workgroups (poc/01 rule: <= CUs)
   size_t local_size_ = 64;
+  bool host_dispatch_ = false;
   std::mutex mu_;  // serializes execute (single in-order queue)
 };
 
@@ -161,6 +170,11 @@ class LoadedProgram {
   // Barrier reset + kernel launch on the arena (already populated). Caller
   // holds the runtime mutex. Does not clFinish.
   bool LaunchKernel(cl_command_queue q, std::string* err);
+  // Host-dispatch execution: mirror vm2's frame-walk on the host, launching a
+  // barrier-free segment kernel per phase with clFinish (= the barrier) between
+  // them. Reads while-cond scalars from the arena between phases. Caller holds
+  // the runtime mutex; blocks until the program completes.
+  bool LaunchHostDispatch(cl_command_queue q, std::string* err);
   OclRuntime* rt_ = nullptr;  // borrowed; client outlives executables
   VmProgram prog_;
   cl_mem arena_ = nullptr;
@@ -170,6 +184,7 @@ class LoadedProgram {
   cl_mem lane_tab_buf_ = nullptr;
   cl_mem bar_buf_ = nullptr;
   cl_mem stats_buf_ = nullptr;
+  cl_mem seg_tab_buf_ = nullptr;   // host-dispatch: per-lane {off,count} u2
 };
 
 // ---- Lowering subprocess ----------------------------------------------------

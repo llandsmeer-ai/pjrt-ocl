@@ -18,11 +18,14 @@ BODY = pathlib.Path(__file__).parent / "_e2e_body.py"
 WHILE_BODY = pathlib.Path(__file__).parent / "_while_e2e_body.py"
 
 
-def _run_body(body: pathlib.Path, marker: str) -> None:
+def _run_body(body: pathlib.Path, marker: str, extra_env: dict | None = None
+              ) -> None:
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "opencl"
     # Keep OpenCL compiler caches off the (full) root overlay on the dev box.
     env.setdefault("POCL_CACHE_DIR", str(REPO / "third_party" / "pocl-cache"))
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.run([sys.executable, str(body)], capture_output=True,
                           text=True, env=env, timeout=120)
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
@@ -36,6 +39,15 @@ def test_e2e_subprocess():
 
 @pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
 def test_e2e_while_subprocess():
-    """stablehlo.while end-to-end through the real plugin (single-lane loop
-    scheduling; see scheduler.schedule_program M4 caveat)."""
+    """stablehlo.while end-to-end through the real plugin (multi-lane now that
+    the device-scope barrier fixed the cross-lane race)."""
     _run_body(WHILE_BODY, "WHILE E2E PASS")
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_host_dispatch():
+    """Force the host-dispatch engine (clFinish-per-phase barrier, no in-kernel
+    spin-barrier — the CPU/non-GPU default; docs/decisions.md #1). Works on any
+    device, so this exercises the host-driven frame walk + segment kernel in CI
+    regardless of which OpenCL device is present."""
+    _run_body(WHILE_BODY, "WHILE E2E PASS", {"PJRT_OCL_ENGINE": "host"})

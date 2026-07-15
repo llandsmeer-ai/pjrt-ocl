@@ -151,15 +151,13 @@ core path, and it never assumes fp64. Design decisions and their rationale live 
   (data-dependent) gather/scatter, sort. These raise a clear `LoweringError` today.
 - **Dtypes**: the full JAX matrix (f32/f64/i32/u32/i64/bool/f16/bf16) is in; f64 is gated
   on `cl_khr_fp64`. Still to come: i8/i16 and complex.
-- **PoCL (CPU) is reliable for correctness spot-checks but not heavy iteration**: the
-  device-side cross-workgroup barrier can deadlock under repeated dispatch on PoCL's CPU
-  thread pool. Real GPUs (co-resident workgroups) are unaffected. A host-dispatch fallback
-  engine is planned (see `docs/decisions.md`).
-- **Multi-lane data sharing under iteration**: the cross-workgroup barrier reliably
-  publishes the atomic loop-condition flag, but regular cross-lane data loads can race
-  under iteration on the current kernel. Until the barrier's memory model is hardened,
-  `while`-containing programs run on a single lane (correct, but loop bodies don't yet
-  parallelize across lanes).
+- **Two execution engines, auto-selected.** GPUs run a persistent megakernel with an
+  on-device cross-workgroup barrier (device-scope acquire/release fences — correct even for
+  cross-lane data under iteration). CPU/non-GPU devices (e.g. PoCL) use a **host-dispatch**
+  engine instead: the host drives control flow and enforces the barrier with one kernel
+  launch per phase. This is required on CPU — an in-kernel spin-barrier deadlocks on a
+  non-preemptive CPU runtime (imbalance-starvation; it's why OpenCL mandates kernel
+  boundaries for cross-group sync). Override with `PJRT_OCL_ENGINE=host|mega|auto`.
 - Performance is improving but not yet tuned: matmul runs a register-blocked tile kernel;
   memory-bound ops are currently limited by arena-copy traffic (see
   [`docs/perf-findings.md`](docs/perf-findings.md)).
