@@ -8,8 +8,28 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
 
 ## 1. Execution model
 
+- ✅ **MEMORY-VISIBILITY HALF OF #1 RISK — SOLVED 2026-07-15 (poc/07): device-scope
+  acquire/release fences.** The barrier bug has TWO independent axes; poc/07 separates them and
+  fixes the visibility one. **Axis 1 (memory visibility):** the old `vmo_barrier` used
+  `mem_fence(CLK_GLOBAL_MEM_FENCE)` — work-group-scoped, so a producer lane's *non-atomic* data
+  writes were NOT published to a consumer lane. The atomic phase flag is L2-coherent (lanes agree
+  on *when*), but the data sat in the producer SM's L1. Measured on NVIDIA Blackwell: a persistent
+  loop reading a neighbour's cell across the barrier is **~100% stale** (1599968/200000; test B).
+  Single-shot two-level programs escaped it by cold-L1 accident; iteration (while) keeps L1 warm →
+  the while agent's forced `n_lanes=1`. **Fix (test E): OpenCL-2.0 device-scope acquire/release
+  fences** around the atomic handshake (`atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE,
+  memory_order_release/acquire, memory_scope_device)`) → **0 stale**, plain reads coherent, in
+  spec, megakernel intact. **`clinfo` under-reports:** NVIDIA advertises only work-group atomic
+  scope yet the compiler accepts device scope AND the hardware honours it — so capability must be
+  RUNTIME-PROBED, never trusted from `CL_DEVICE_ATOMIC_FENCE_CAPABILITIES`. Native on PoCL/AMD/
+  Intel. Rejected alternatives kept for the record: `volatile` cross-lane reads (test C) also work
+  on NVIDIA via L1-bypass but kill L1 reuse; no `cl_khr_*` extension provides a grid barrier.
+  Applied to `pjrt_plugin/kernels/vm_common.cl`; runtime_test A+B still PASS on NVIDIA. **Follow-up:
+  this unblocks lifting `n_lanes=1` for while** (multi-lane loop bodies) — needs a cross-lane-under-
+  iteration e2e test before flipping the scheduler gate. **Axis 2 (liveness) is still open** — see
+  next node; device-scope fences do NOT help it.
 - ⚠️ **CONFIRMED #1 RISK 2026-07-15: cross-workgroup spin-barrier is UNRELIABLE on PoCL under
-  iteration.** The persistent-VLIW engine (vm2.cl) uses the poc/01 global barrier between schedule
+  iteration (LIVENESS axis — still open; poc/07 fixed only the visibility axis above).** The persistent-VLIW engine (vm2.cl) uses the poc/01 global barrier between schedule
   phases. On NVIDIA it is rock-solid (500 two-level + 300 chained-matmul back-to-back runs, zero
   hangs). On PoCL (CPU) it deadlocks NONDETERMINISTICALLY within ~30–50 iterations of ANY
   multi-level program (even `(a+b)*a`), at every lane count tried (24 down to 4). Root cause:

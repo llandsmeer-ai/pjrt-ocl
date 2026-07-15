@@ -84,19 +84,36 @@ typedef struct {
  * registers where a GPU might canonicalize a NaN. */
 typedef union { float f; int i; uint u; } slot_t;
 
+/* Cross-workgroup barrier: persistent-thread spin over a global arrival
+ * counter (bar[0]) + phase flag (bar[1]).
+ *
+ * MEMORY MODEL (poc/07): a plain `mem_fence(CLK_GLOBAL_MEM_FENCE)` is only
+ * work-group-scoped, so non-atomic data a lane writes before the barrier is NOT
+ * guaranteed visible to a DIFFERENT lane after it — on NVIDIA that read is
+ * ~100% stale from a warm per-SM L1 once a program iterates (measured; this is
+ * what forced n_lanes=1 for while). The fix is OpenCL-2.0 DEVICE-SCOPE
+ * acquire/release fences: release our data device-wide before signalling
+ * arrival, acquire peers' data device-wide after the phase flips. NVIDIA
+ * honours memory_scope_device even though clinfo advertises only work-group
+ * scope (poc/07 test E), and it's native on PoCL/AMD/Intel. Devices that lack
+ * it need the host-dispatch engine (Plan B) — which also solves PoCL liveness.
+ * This does NOT fix liveness (co-residency); that is a separate axis. */
 static void vmo_barrier(volatile __global uint *bar, const uint ngroups)
 {
     barrier(CLK_GLOBAL_MEM_FENCE);
     if (get_local_id(0) == 0) {
+        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release,
+                               memory_scope_device);
         const uint phase = atomic_add(&bar[1], 0);
         if (atomic_inc(&bar[0]) == ngroups - 1) {
             bar[0] = 0;
-            mem_fence(CLK_GLOBAL_MEM_FENCE);
             atomic_inc(&bar[1]);
         } else {
             while (atomic_add(&bar[1], 0) == phase)
                 ;
         }
+        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire,
+                               memory_scope_device);
     }
     barrier(CLK_GLOBAL_MEM_FENCE);
 }
