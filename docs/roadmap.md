@@ -7,12 +7,13 @@ performance mode. Work autonomously. This file is the plan of record for continu
 
 - **Phase 1 ✅ COMPLETE**: VLIW per-lane-stream engine is the plugin executor (vm2.cl + runtime
   v3). jax.jit runs end-to-end on NVIDIA + PoCL; on-device while validated (runtime_test).
-- **Phase 2 IN PROGRESS**: op-family registry infra landed (opsem: TO_TASK/INTERP/READS/
-  TILE_SIM/EW_SIM; pjrt_ocl/ops/ package; tests/oputil.py check()). Reference family
-  ops/shape.py (broadcast_in_dim, transpose via GATHER) verified both validators + hardware.
-  4 families fanned out to agents: elementwise (div/max/min/pow/unary/cmp/select), making
-  (iota/convert), reduce (full reductions), dot (2D matmul). Each = one ops/<f>.py + one
-  tests/test_ops_<f>.py; only shared edit is a 1-line import in ops/__init__.py (merge-resolve).
+- **Phase 2 ✅ FIRST WAVE COMPLETE**: op-family registry infra (opsem: TO_TASK/INTERP/READS/
+  TILE_SIM/EW_SIM; pjrt_ocl/ops/ package; tests/oputil.py + conftest.py forcing CPU oracle).
+  5 families landed & merged: shape (broadcast/transpose), elementwise (div/max/min/pow/10
+  unary/cmp/select), making (iota/convert), reduce (full sum/max/min/prod), dot (2D matmul).
+  112 pytest pass through BOTH validators; dot/reduce/iota/fused-relu(matmul) verified on
+  NVIDIA + PoCL hardware. Scoreboard: tests/SCOREBOARD.md. Next ops: reshape/slice/concat
+  (GATHER variants), partial-axis reduce, if/case, batched dot.
 - **Phase 3 (perf) pending**: adopt poc/06 fast MMA (26 TFLOPS) into vm2 MMA_TILE; calibration
   slope-fit; slot-file fusion; typed lanes (poc/05).
 - Merged PoCs this session: poc/04 (VLIW), poc/05 (typed-lanes viable), poc/06 (fast MMA).
