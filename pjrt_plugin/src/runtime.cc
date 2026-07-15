@@ -24,6 +24,32 @@ std::string ClInfoStr(cl_device_id dev, cl_device_info param) {
   return s;
 }
 
+// Does the device accept -cl-std=CL<major>.<minor>? On OpenCL 3.0+ drivers
+// CL_DEVICE_OPENCL_C_VERSION is capped at "OpenCL C 1.2" by spec — the real
+// list is CL_DEVICE_OPENCL_C_ALL_VERSIONS (PoCL and NVIDIA both report 3.0
+// only there; verified). Pre-3.0 drivers lack that query; fall back to
+// parsing the version string.
+bool SupportsClC(cl_device_id dev, unsigned major, unsigned minor) {
+  size_t size = 0;
+  if (clGetDeviceInfo(dev, CL_DEVICE_OPENCL_C_ALL_VERSIONS, 0, nullptr,
+                      &size) == CL_SUCCESS &&
+      size >= sizeof(cl_name_version)) {
+    std::vector<cl_name_version> vers(size / sizeof(cl_name_version));
+    clGetDeviceInfo(dev, CL_DEVICE_OPENCL_C_ALL_VERSIONS, size, vers.data(),
+                    nullptr);
+    for (const auto& v : vers)
+      if (CL_VERSION_MAJOR(v.version) == major &&
+          CL_VERSION_MINOR(v.version) >= minor)
+        return true;
+    return false;
+  }
+  unsigned dev_major = 0, dev_minor = 0;
+  std::string s = ClInfoStr(dev, CL_DEVICE_OPENCL_C_VERSION);
+  if (std::sscanf(s.c_str(), "OpenCL C %u.%u", &dev_major, &dev_minor) != 2)
+    return false;
+  return dev_major > major || (dev_major == major && dev_minor >= minor);
+}
+
 }  // namespace
 
 // ---- VmProgram::Parse -------------------------------------------------------
@@ -291,15 +317,38 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->program_ = clCreateProgramWithSource(rt->ctx_, 1, &src, &src_len, &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateProgramWithSource: " + std::to_string(cerr));
-  if (clBuildProgram(rt->program_, 1, &rt->dev_, "", nullptr, nullptr) !=
-      CL_SUCCESS) {
+
+  // Dialect probe (docs/decisions.md): empty options mean OpenCL C 1.2, where
+  // vmo_barrier's device-scope fences (OpenCL C 2.0+) are undeclared — strict
+  // compilers (Intel) reject vm.cl; PoCL/NVIDIA merely tolerated it. Feature
+  // macros can't gate this in-source (NVIDIA accepts the builtins under
+  // -cl-std=CL3.0 without defining __opencl_c_atomic_*), so probe build
+  // variants from the most capable dialect down. The last variant compiles
+  // the fences out and is only safe with the host-dispatch engine.
+  struct BuildVariant { std::string opts; bool fence; };
+  std::vector<BuildVariant> variants;
+  if (SupportsClC(rt->dev_, 3, 0)) variants.push_back({"-cl-std=CL3.0", true});
+  if (SupportsClC(rt->dev_, 2, 0)) variants.push_back({"-cl-std=CL2.0", true});
+  variants.push_back({"", true});                    // lenient pre-3.0 drivers
+  variants.push_back({"-DVMO_NO_DEVICE_FENCE", false});
+  std::string build_log;
+  bool built = false;
+  for (const auto& v : variants) {
+    if (clBuildProgram(rt->program_, 1, &rt->dev_, v.opts.c_str(), nullptr,
+                       nullptr) == CL_SUCCESS) {
+      rt->info_.build_opts = v.opts;
+      rt->info_.has_device_fence = v.fence;
+      built = true;
+      break;
+    }
     std::string log(1 << 16, '\0');
     size_t log_size = 0;
     clGetProgramBuildInfo(rt->program_, rt->dev_, CL_PROGRAM_BUILD_LOG,
                           log.size(), log.data(), &log_size);
     log.resize(std::min(log_size, log.size()));
-    return fail("vm.cl build failed:\n" + log);
+    build_log += "with options '" + v.opts + "':\n" + log + "\n";
   }
+  if (!built) return fail("vm.cl build failed:\n" + build_log);
   rt->vm_kernel_ = clCreateKernel(rt->program_, "vm2", &cerr);
   if (cerr != CL_SUCCESS) return fail("clCreateKernel: " + std::to_string(cerr));
   rt->vm_seg_kernel_ = clCreateKernel(rt->program_, "vm2_seg", &cerr);
@@ -310,12 +359,23 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   // to be co-resident and balanced, which non-GPU (CPU) OpenCL runtimes do NOT
   // guarantee — it deadlocks on PoCL (imbalance-starvation, docs/decisions.md
   // #1 / poc/07). Default those devices to host-dispatch (clFinish-per-phase
-  // barrier); GPUs keep the persistent megakernel. PJRT_OCL_ENGINE overrides.
-  rt->host_dispatch_ = !rt->info_.is_gpu;
+  // barrier); GPUs keep the persistent megakernel. A device whose vm.cl build
+  // lacks device-scope fences (strict OpenCL C 1.2, see dialect probe above)
+  // must ALSO use host-dispatch: its spin-barrier is a data race (poc/07).
+  // PJRT_OCL_ENGINE overrides.
+  rt->host_dispatch_ = !rt->info_.is_gpu || !rt->info_.has_device_fence;
   if (const char* e = std::getenv("PJRT_OCL_ENGINE"); e && e[0]) {
-    if (!std::strcmp(e, "host")) rt->host_dispatch_ = true;
-    else if (!std::strcmp(e, "mega")) rt->host_dispatch_ = false;
-    // "auto" (or anything else) keeps the is_gpu-based default.
+    if (!std::strcmp(e, "host")) {
+      rt->host_dispatch_ = true;
+    } else if (!std::strcmp(e, "mega")) {
+      if (!rt->info_.has_device_fence)
+        return fail(
+            "PJRT_OCL_ENGINE=mega: device's OpenCL C dialect lacks "
+            "device-scope acquire/release fences; the megakernel "
+            "spin-barrier would be a data race (poc/07)");
+      rt->host_dispatch_ = false;
+    }
+    // "auto" (or anything else) keeps the default.
   }
 
   // Lanes advertised to the python scheduler (PJRT_OCL_NLANES). Validated

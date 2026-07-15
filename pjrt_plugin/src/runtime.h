@@ -91,8 +91,13 @@ struct VmProgram {
 
 struct DeviceInfo {
   std::string platform_name, device_name, driver_version, cl_version;
+  std::string build_opts;  // clBuildProgram options that vm.cl was built with
   bool is_gpu = false;
   bool has_fp64 = false;   // cl_khr_fp64 — gates f64 programs
+  // Device-scope acq/rel fences compiled into vmo_barrier (OpenCL C 2.0+).
+  // Without them the vm2 spin-barrier is a data race (poc/07), so the
+  // megakernel engine is refused and host-dispatch is forced.
+  bool has_device_fence = false;
   cl_uint compute_units = 0;
 };
 

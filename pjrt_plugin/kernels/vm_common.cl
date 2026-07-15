@@ -97,13 +97,33 @@ typedef union { float f; int i; uint u; } slot_t;
  * honours memory_scope_device even though clinfo advertises only work-group
  * scope (poc/07 test E), and it's native on PoCL/AMD/Intel. Devices that lack
  * it need the host-dispatch engine (Plan B) — which also solves PoCL liveness.
- * This does NOT fix liveness (co-residency); that is a separate axis. */
+ * This does NOT fix liveness (co-residency); that is a separate axis.
+ *
+ * DIALECT: the fence builtins only exist in OpenCL C 2.0+, and strict
+ * compilers (Intel) reject them under the 1.2 default that empty clBuildProgram
+ * options select. The runtime probes -cl-std variants at init (runtime.cc) and
+ * defines VMO_NO_DEVICE_FENCE for the last-resort strict-1.2 build; that build
+ * compiles the fences out, so vm2's spin-barrier is UNSAFE there and the
+ * runtime forces the host-dispatch engine (vm2_seg never calls vmo_barrier).
+ * Feature macros (__opencl_c_atomic_*) can't be used instead: NVIDIA accepts
+ * the builtins under -cl-std=CL3.0 without defining the macros (verified). */
+#ifdef VMO_NO_DEVICE_FENCE
+#define VMO_FENCE_DEV_REL()
+#define VMO_FENCE_DEV_ACQ()
+#else
+#define VMO_FENCE_DEV_REL() \
+    atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, \
+                           memory_scope_device)
+#define VMO_FENCE_DEV_ACQ() \
+    atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, \
+                           memory_scope_device)
+#endif
+
 static void vmo_barrier(volatile __global uint *bar, const uint ngroups)
 {
     barrier(CLK_GLOBAL_MEM_FENCE);
     if (get_local_id(0) == 0) {
-        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release,
-                               memory_scope_device);
+        VMO_FENCE_DEV_REL();
         const uint phase = atomic_add(&bar[1], 0);
         if (atomic_inc(&bar[0]) == ngroups - 1) {
             bar[0] = 0;
@@ -112,8 +132,7 @@ static void vmo_barrier(volatile __global uint *bar, const uint ngroups)
             while (atomic_add(&bar[1], 0) == phase)
                 ;
         }
-        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire,
-                               memory_scope_device);
+        VMO_FENCE_DEV_ACQ();
     }
     barrier(CLK_GLOBAL_MEM_FENCE);
 }

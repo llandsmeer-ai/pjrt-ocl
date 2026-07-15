@@ -252,6 +252,37 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
   works — user decision 2026-07-14.
   - 🔬 Kernel-table override mechanism for tuned per-vendor variants (M5), incl. specialized matmul.
 
+## 3b. OpenCL C dialect for vm.cl (2026-07-15, first external-machine bug report)
+
+- **Bug**: `clBuildProgram(prog, dev, "")` compiles **OpenCL C 1.2** (spec default), where
+  `vmo_barrier`'s `atomic_work_item_fence` / `memory_order_*` / `memory_scope_device`
+  (OpenCL C 2.0+) are *undeclared identifiers*. Strict compilers (Intel, user's laptop) reject
+  vm.cl at plugin init; it only ever built here because PoCL and NVIDIA **non-conformantly expose
+  the 2.0 atomics in their default dialect** (verified: forcing `-cl-std=CL1.2` on PoCL reproduces
+  the exact 6-error report). No user-side workaround existed — the build ran before engine
+  selection, so even host-dispatch CPU devices (which never execute the fences) died.
+- Facts that shaped the fix (all measured on this machine, 2026-07-15):
+  - On OpenCL 3.0 drivers `CL_DEVICE_OPENCL_C_VERSION` is **capped at "OpenCL C 1.2" by spec**;
+    the real list is `CL_DEVICE_OPENCL_C_ALL_VERSIONS` (PoCL + NVIDIA report 3.0 only there).
+  - ❌ In-source feature-macro guard (`__opencl_c_atomic_order_acq_rel` &&
+    `__opencl_c_atomic_scope_device`): NVIDIA accepts the fence builtins under `-cl-std=CL3.0`
+    but does **not define the macros** (`#error` probe) nor advertise the features in
+    `CL_DEVICE_OPENCL_C_FEATURES` — the guard would silently compile the fences out and
+    reintroduce the poc/07 cross-lane race on our primary GPU. Same under-advertising axis as
+    poc/07 test E.
+  - ❌ `-cl-std=CL2.0` can't be assumed: PoCL rejects it ("device doesn't support that version")
+    despite supporting 3.0.
+- ✅ **Probe cascade at init** (`runtime.cc`), most capable dialect first, first successful build
+  wins: `-cl-std=CL3.0` (if in ALL_VERSIONS) → `-cl-std=CL2.0` (if supported) → `""` (lenient
+  pre-3.0 drivers, old behavior) → `"" + -DVMO_NO_DEVICE_FENCE` (strict-1.2 last resort; compiles
+  the fences out via macros in vm_common.cl). The winning variant sets
+  `DeviceInfo::has_device_fence`; without it the runtime **forces host-dispatch** and
+  `PJRT_OCL_ENGINE=mega` fails loudly (fence-less spin-barrier = poc/07 data race, never silent).
+  Verified: 195/195 e2e on PoCL and NVIDIA (both pick CL3.0), NVIDIA `ENGINE=mega` still runs the
+  megakernel, strict-CL1.2 simulation builds via the last-resort variant.
+- **Rule**: never call `clBuildProgram` with empty options and 2.0+ features in the source —
+  leniency of the dev machines masks it until the first strict compiler (Intel) sees the code.
+
 ## 4. PJRT layer
 
 - ✅ **Hand-rolled PJRT C API — VALIDATED 2026-07-14** (`poc/02-pjrt-skeleton`): `jax.devices()`
