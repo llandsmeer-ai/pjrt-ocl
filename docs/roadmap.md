@@ -49,6 +49,22 @@ dispatches on a per-task dtype. Alignment is fine (arena buffers are 64B-aligned
 through both validators + jax tests; (3) Tier 2 behind feature-detection; (4) Tier 3 emulation.
 Mixed-dtype ops (convert, compare→bool, select(bool pred), bitcast) come with Tier 1.
 
+**Design decisions (user, 2026-07-15):**
+- ✅ **Modular kernel files** (DONE): the VM is split into kernels/vm_common.cl + ops/*.cl +
+  vm_main.cl, concatenated into one program at build (CMakeLists VM_CL_SOURCES). One op family
+  = one .cl file with a static tile function; parallel-safe like python/pjrt_ocl/ops/. No
+  clLinkProgram (functions inline). This is where per-dtype/per-op work now lands.
+- **f64 IS in scope** ⇒ the arena must be **byte-addressed** (`__global uchar*`, byte offsets,
+  typed-pointer casts) — the 4-byte-slot shortcut can't hold 8-byte types. So do the
+  byte-addressed refactor FIRST (behavior-preserving for f32), then dtypes are additive.
+  f64 (and f16) **gated behind cl_khr_fp64 / cl_khr_fp16** feature-detection at init (both our
+  dev devices have fp64+int64+byte_addressable_store; Intel Xe2 consumer lacks fp64 → clean
+  error, not a crash). Enable the extension pragma conditionally in vm_common.cl.
+- **Bit-recast via `union { float f; int i; uint u; }`** (slot_t, already in vm_common.cl) — not
+  as_int/as_float — for bitcast_convert and NaN-safe integer handling.
+- Loader: patch **byte** offsets (currently f32-element ÷4). Task carries a **dtype** (pack into
+  tile_op high bits or a task field). exec_tiles dispatches per (tile_op, dtype).
+
 ## Phase 3 perf directives (user, 2026-07-15)
 
 1. ✅ **Transfers fixed — data stays ON DEVICE.** PJRT_Buffer holds a device cl_mem;
