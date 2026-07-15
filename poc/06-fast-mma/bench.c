@@ -156,14 +156,24 @@ int main(void) {
 
     /* progression steps: {label, kernel, build opts, TM, TN, BK} */
     struct { step_t s; int tm, tn, bk; } steps[] = {
-      {{"1 naive 16x16 (poc/04)",       "bench_naive", ""},                                          16, 16, 16},
-      {{"2 reg 64x64 4x4  BK16",        "bench_fast",  "-DFAST -DTM=64  -DTN=64  -DBK=16"},          64, 64, 16},
-      {{"3 reg 128x128 8x8 BK8",        "bench_fast",  "-DFAST -DTM=128 -DTN=128 -DBK=8"},          128,128,  8},
-      {{"4 +float4 loads",              "bench_fast",  "-DFAST -DTM=128 -DTN=128 -DBK=8  -DVECW=4"},128,128,  8},
-      {{"5 +double buffer",             "bench_fast",  "-DFAST -DTM=128 -DTN=128 -DBK=8  -DVECW=4 -DDB=1"},128,128,8},
+      {{"1 naive 16x16 (poc/04)",       "bench_naive", ""},                                         16, 16, 16},
+      {{"2 reg 64x64 4x4 BK16",         "bench_fast",  "-DFAST -DTM=64  -DTN=64  -DBK=16"},         64, 64, 16},
+      {{"3 reg 128x128 8x8 BK8",        "bench_fast",  "-DFAST -DTM=128 -DTN=128 -DBK=8"},         128,128,  8},
+      {{"4 128x128 BK16 (portable)",    "bench_fast",  "-DFAST -DTM=128 -DTN=128 -DBK=16"},        128,128, 16},
+      {{"5 128x128 BK32 v4 (NV-only)",  "bench_fast",  "-DFAST -DTM=128 -DTN=128 -DBK=32 -DVECW=4"},128,128,32},
     };
     int nsteps = (int)(sizeof steps / sizeof steps[0]);
     const char *only = getenv("ONLY");   /* substring filter on label */
+
+    /* warm up GPU boost clocks: ~1.5s of matmul before any measurement.
+     * WARMUP=0 skips it (e.g. PoCL correctness runs, where perf is irrelevant
+     * and the big 4096^3 warmup would take minutes on CPU). */
+    if (envi("WARMUP", 1)) {
+        cl_kernel wk = build("-DFAST -DTM=128 -DTN=128 -DBK=8 -DVECW=4",
+                             "bench_fast");
+        for (int r = 0; r < 20; r++) run_once(wk, 4096, 4096, 4096, 128, 128, 8);
+        clReleaseKernel(wk);
+    }
 
     printf("\n%-30s  %8s  %10s  %10s\n", "step", "512 OK", "2048 GF/s",
            "4096 GF/s");

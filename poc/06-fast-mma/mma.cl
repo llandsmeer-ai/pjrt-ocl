@@ -81,27 +81,30 @@ __kernel void bench_naive(__global float *arena, uint aoff, uint boff,
 #ifndef DB
 #define DB 0
 #endif
-#define ASZ (BK * TM)        /* As holds BK x TM, transposed: As[k*TM + m] */
-#define BSZ (BK * TN)        /* Bs holds BK x TN:            Bs[k*TN + n] */
+#define ASZ (BK * TM)        /* As holds TM x BK (row-major): As[m*BK + k] */
+#define BSZ (BK * TN)        /* Bs holds BK x TN (row-major): Bs[k*TN + n] */
 
-/* Stage one BK-deep K-panel of A (transposed) and B into local buffers. */
+/* Stage one BK-deep K-panel of A and B into local buffers. A is stored
+ * un-transposed (As[m][k]) so both the load and the store stay contiguous ->
+ * vstore4 works with no scatter and no local bank conflicts. */
 static void stage_panel(__global float *arena, uint aoff, uint boff,
                         uint M, uint N, uint K, uint row0, uint col0,
                         uint k0, __local float *As, __local float *Bs,
                         uint full)
 {
     const uint lid = get_local_id(0);
+    /* NOTE: single-exit if/else (no early return). An early `return` in the
+     * fast path made PoCL's barrier-region former assert
+     * (region_entry_barrier != NULL) because the barrier in the caller then
+     * had two inlined predecessor paths. `full` is workgroup-uniform. */
 #if VECW == 4
     if (full) {
-        /* A: contiguous float4 along K, scatter-store into transposed As */
+        /* A: contiguous float4 along K -> contiguous vstore4 into As[m][k] */
         for (uint idx = lid; idx < TM * (BK / 4); idx += 256) {
             const uint m  = idx / (BK / 4);
             const uint kb = (idx % (BK / 4)) * 4;
             const float4 v = vload4(0, arena + aoff + (row0 + m) * K + k0 + kb);
-            As[(kb + 0) * TM + m] = v.s0;
-            As[(kb + 1) * TM + m] = v.s1;
-            As[(kb + 2) * TM + m] = v.s2;
-            As[(kb + 3) * TM + m] = v.s3;
+            vstore4(v, 0, As + m * BK + kb);
         }
         /* B: contiguous float4 along N, vector-store into Bs */
         for (uint idx = lid; idx < BK * (TN / 4); idx += 256) {
@@ -110,25 +113,30 @@ static void stage_panel(__global float *arena, uint aoff, uint boff,
             const float4 v = vload4(0, arena + boff + (k0 + kk) * N + col0 + nb);
             vstore4(v, 0, Bs + kk * TN + nb);
         }
-        return;
-    }
+    } else
 #endif
-    /* scalar, edge-guarded path (also the VECW==1 path) */
-    for (uint idx = lid; idx < TM * BK; idx += 256) {
-        const uint m  = idx / BK;
-        const uint kk = idx % BK;
-        const uint gr = row0 + m, gk = k0 + kk;
-        As[kk * TM + m] = (gr < M && gk < K) ? arena[aoff + gr * K + gk] : 0.0f;
-    }
-    for (uint idx = lid; idx < BK * TN; idx += 256) {
-        const uint kk = idx / TN;
-        const uint n  = idx % TN;
-        const uint gk = k0 + kk, gc = col0 + n;
-        Bs[kk * TN + n] = (gk < K && gc < N) ? arena[boff + gk * N + gc] : 0.0f;
+    {
+        /* scalar, edge-guarded path (also the VECW==1 path) */
+        for (uint idx = lid; idx < TM * BK; idx += 256) {
+            const uint m  = idx / BK;
+            const uint kk = idx % BK;
+            const uint gr = row0 + m, gk = k0 + kk;
+            As[m * BK + kk] =
+                (gr < M && gk < K) ? arena[aoff + gr * K + gk] : 0.0f;
+        }
+        for (uint idx = lid; idx < BK * TN; idx += 256) {
+            const uint kk = idx / TN;
+            const uint n  = idx % TN;
+            const uint gk = k0 + kk, gc = col0 + n;
+            Bs[kk * TN + n] =
+                (gk < K && gc < N) ? arena[boff + gk * N + gc] : 0.0f;
+        }
     }
 }
 
-/* Multiply the staged BK-panel into the register accumulators. */
+/* Multiply the staged BK-panel into the register accumulators. Threads sharing
+ * a ty read the same A slot (warp broadcast); threads sharing a tx the same B
+ * slot. */
 static void compute_panel(__local float *As, __local float *Bs,
                           uint ty, uint tx, float acc[RM][RN])
 {
@@ -136,7 +144,7 @@ static void compute_panel(__local float *As, __local float *Bs,
     for (uint kk = 0; kk < BK; ++kk) {
         float a[RM], b[RN];
         #pragma unroll
-        for (int i = 0; i < RM; i++) a[i] = As[kk * TM + ty * RM + i];
+        for (int i = 0; i < RM; i++) a[i] = As[(ty * RM + i) * BK + kk];
         #pragma unroll
         for (int j = 0; j < RN; j++) b[j] = Bs[kk * TN + tx * RN + j];
         #pragma unroll
