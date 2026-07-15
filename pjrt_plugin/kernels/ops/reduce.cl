@@ -8,7 +8,7 @@
 /* Integer (i32/u32) partial reduce: integer accumulation; max/min via
  * max()/min(); identities INT_MIN/INT_MAX. The local tree buffer `As` (float)
  * is aliased as int — same 4-byte storage, no numeric use. */
-static void reduce_part_tile_i32(__global uchar *arena, const task_t t,
+static void vmo_reduce_part_tile_i32(__global uchar *arena, const task_t t,
                                  uint tile, __local float *As, uint lid,
                                  uint lsz)
 {
@@ -37,7 +37,7 @@ static void reduce_part_tile_i32(__global uchar *arena, const task_t t,
     if (lid == 0) AP(int, t.dst)[tile] = Ai[0];
 }
 
-static void reduce_comb_tile_i32(__global uchar *arena, const task_t t,
+static void vmo_reduce_comb_tile_i32(__global uchar *arena, const task_t t,
                                  uint lid)
 {
     if (lid != 0) return;
@@ -53,11 +53,11 @@ static void reduce_comb_tile_i32(__global uchar *arena, const task_t t,
     AP(int, t.dst)[0] = acc;
 }
 
-static void reduce_part_tile(__global uchar *arena, const task_t t, uint tile,
+static void vmo_reduce_part_tile(__global uchar *arena, const task_t t, uint tile,
                              __local float *As, uint dt, uint lid, uint lsz)
 {
     if (dt == DT_I32 || dt == DT_U32) {
-        reduce_part_tile_i32(arena, t, tile, As, lid, lsz);
+        vmo_reduce_part_tile_i32(arena, t, tile, As, lid, lsz);
         return;
     }
     const uint n = t.p0, chunk = t.p1, kind = t.p2;
@@ -86,11 +86,11 @@ static void reduce_part_tile(__global uchar *arena, const task_t t, uint tile,
     if (lid == 0) AP(float, t.dst)[tile] = As[0];
 }
 
-static void reduce_comb_tile(__global uchar *arena, const task_t t, uint dt,
+static void vmo_reduce_comb_tile(__global uchar *arena, const task_t t, uint dt,
                              uint lid)
 {
     if (dt == DT_I32 || dt == DT_U32) {
-        reduce_comb_tile_i32(arena, t, lid);
+        vmo_reduce_comb_tile_i32(arena, t, lid);
         return;
     }
     if (lid != 0) return;

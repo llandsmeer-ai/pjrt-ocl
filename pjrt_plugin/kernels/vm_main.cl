@@ -1,9 +1,9 @@
 /* pjrt-ocl VLIW engine — dispatcher + interpreter (concatenated last).
- * exec_tiles routes a task to its op-family tile function (ops/ *.cl above);
+ * vmo_exec_tiles routes a task to its op-family tile function (ops/ *.cl above);
  * vm2 is the per-lane interpreter over the schedule stream. */
 
 /* tile_op packs the base op in bits 0-7 and the dtype in bits 8-15. */
-static void exec_tiles(__global uchar *arena, __global const int *aux,
+static void vmo_exec_tiles(__global uchar *arena, __global const int *aux,
                        const task_t t, uint tile_lo, uint tile_hi,
                        __local float *As, __local float *Bs)
 {
@@ -17,16 +17,16 @@ static void exec_tiles(__global uchar *arena, __global const int *aux,
                    : (dt == DT_F16 || dt == DT_BF16) ? 2u : 4u;
     for (uint tile = tile_lo; tile < tile_hi; ++tile) {
         switch (op) {
-        case TOP_EW:       ew_tile(arena, t, tile, dt, adt, lid, lsz); break;
-        case TOP_MMA:      mma_tile(arena, t, tile, As, Bs); break;
-        case TOP_GATHER:   gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
-        case TOP_RED_PART: reduce_part_tile(arena, t, tile, As, dt, lid, lsz); break;
-        case TOP_RED_COMB: reduce_comb_tile(arena, t, dt, lid); break;
-        case TOP_IOTA_DIM: iota_tile(arena, aux, t, tile, lid, lsz); break;
-        case TOP_SCATTER:  scatter_tile(arena, aux, t, tile, esz, lid, lsz); break;
-        case TOP_DYN_GATHER:  dyn_gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
-        case TOP_DYN_SCATTER: dyn_scatter_tile(arena, aux, t, tile, esz, lid, lsz); break;
-        case TOP_RED_WINDOW:  redwin_tile(arena, aux, t, tile, dt, lid, lsz); break;
+        case TOP_EW:       vmo_ew_tile(arena, t, tile, dt, adt, lid, lsz); break;
+        case TOP_MMA:      vmo_mma_tile(arena, t, tile, As, Bs); break;
+        case TOP_GATHER:   vmo_gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
+        case TOP_RED_PART: vmo_reduce_part_tile(arena, t, tile, As, dt, lid, lsz); break;
+        case TOP_RED_COMB: vmo_reduce_comb_tile(arena, t, dt, lid); break;
+        case TOP_IOTA_DIM: vmo_iota_tile(arena, aux, t, tile, lid, lsz); break;
+        case TOP_SCATTER:  vmo_scatter_tile(arena, aux, t, tile, esz, lid, lsz); break;
+        case TOP_DYN_GATHER:  vmo_dyn_gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
+        case TOP_DYN_SCATTER: vmo_dyn_scatter_tile(arena, aux, t, tile, esz, lid, lsz); break;
+        case TOP_RED_WINDOW:  vmo_redwin_tile(arena, aux, t, tile, dt, lid, lsz); break;
         default: break;
         }
     }
@@ -72,7 +72,7 @@ __kernel void vm2(__global uchar *arena,
                 continue;
             }
             if (st[sp].phase == 0) {           /* while-cond range done */
-                vm_barrier(bar, nlanes);
+                vmo_barrier(bar, nlanes);
                 barrier_i++;
                 const uint cbits = atomic_add(
                     (volatile __global uint *)(arena + w.signal_flag), 0u);
@@ -85,7 +85,7 @@ __kernel void vm2(__global uchar *arena,
                     st[sp].pc++;
                 }
             } else {                           /* while-body done: recheck */
-                vm_barrier(bar, nlanes);
+                vmo_barrier(bar, nlanes);
                 barrier_i++;
                 st[sp].pc = w.tile_lo;
                 st[sp].end = w.tile_lo + w.tile_hi;
@@ -100,7 +100,7 @@ __kernel void vm2(__global uchar *arena,
         if (en.task == ENT_BARRIER) {
             if (lid == 0 && barrier_i < 4096u)
                 stats[barrier_i * nlanes + lane] = atomic_inc(&bar[2]) % nlanes;
-            vm_barrier(bar, nlanes);
+            vmo_barrier(bar, nlanes);
             barrier_i++;
             st[sp].pc++;
             continue;
@@ -129,7 +129,7 @@ __kernel void vm2(__global uchar *arena,
         if (en.task != ENT_NOP) {
             /* wait_flag/signal_flag per-op counters are reserved (v0 emits
              * FLAG_NONE); wire a flags buffer through before enabling. */
-            exec_tiles(arena, aux, tasks[en.task], en.tile_lo, en.tile_hi,
+            vmo_exec_tiles(arena, aux, tasks[en.task], en.tile_lo, en.tile_hi,
                        As, Bs);
         }
         st[sp].pc++;

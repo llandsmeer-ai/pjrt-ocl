@@ -6,7 +6,7 @@
 /* Gather copies whole elements, so it is dtype-agnostic for a given element
  * size. `esz` (bytes) picks the mover: 4-byte types copy as uint bits; 8-byte
  * as ulong. dst/a are BYTE offsets. */
-static void gather_tile(__global uchar *arena, __global const int *aux,
+static void vmo_gather_tile(__global uchar *arena, __global const int *aux,
                         const task_t t, uint tile, uint esz, uint lid, uint lsz)
 {
     __global const int *x = aux + t.p0;

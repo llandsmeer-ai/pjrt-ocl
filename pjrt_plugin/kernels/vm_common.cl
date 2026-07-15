@@ -4,7 +4,7 @@
  * CMakeLists.txt VM_CL_SOURCES):
  *   vm_common.cl  (this file: defines, structs, helpers, barrier)
  *   ops/ew.cl ops/gather.cl ops/reduce.cl ops/mma.cl ops/iota.cl
- *   vm_main.cl    (exec_tiles dispatch + the vm2 interpreter kernel)
+ *   vm_main.cl    (vmo_exec_tiles dispatch + the vm2 interpreter kernel)
  * One translation unit, functions inlined — file-level modularity for parallel
  * op work (mirrors python/pjrt_ocl/ops/), no clLinkProgram needed.
  *
@@ -36,14 +36,14 @@ enum { DT_F32 = 0, DT_I32 = 1, DT_U32 = 2, DT_BOOL = 3,
  * f32) with round-to-nearest-even. */
 #define LDH(base, i) vload_half((i), (const __global half *)(arena + (base)))
 #define STH(base, i, v) vstore_half((v), (i), (__global half *)(arena + (base)))
-static float bf16_to_f32(ushort b) { return as_float(((uint)b) << 16); }
-static ushort f32_to_bf16(float f)
+static float vmo_bf16_to_f32(ushort b) { return as_float(((uint)b) << 16); }
+static ushort vmo_f32_to_bf16(float f)
 {
     uint u = as_uint(f);
     return (ushort)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);  /* round-nearest-even */
 }
-#define LDB(base, i) bf16_to_f32(AP(const ushort, (base))[i])
-#define STB(base, i, v) (AP(ushort, (base))[i] = f32_to_bf16(v))
+#define LDB(base, i) vmo_bf16_to_f32(AP(const ushort, (base))[i])
+#define STB(base, i, v) (AP(ushort, (base))[i] = vmo_f32_to_bf16(v))
 
 enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
        TOP_RED_COMB = 4, TOP_IOTA_DIM = 5, TOP_SCATTER = 6,
@@ -52,16 +52,16 @@ enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,
        SUB_ABS, SUB_FLOOR, SUB_CEIL, SUB_SIGN, SUB_FILL, SUB_IOTA_FLAT,
        SUB_CMP, SUB_SELECT, SUB_LTS, SUB_CONVERT, SUB_BITCAST,
-       /* new float binary (routed through ew_bin; ew_is_bin() range-checks
+       /* new float binary (routed through vmo_ew_bin; vmo_ew_is_bin() range-checks
         * SUB_ATAN2..SUB_REMAINDER) */
        SUB_ATAN2, SUB_REMAINDER,
-       /* new float unary (routed through ew_un; ew_is_un() range-checks
+       /* new float unary (routed through vmo_ew_un; vmo_ew_is_un() range-checks
         * SUB_LOG1P..SUB_ROUND) */
        SUB_LOG1P, SUB_EXPM1, SUB_CBRT, SUB_SIN, SUB_COS, SUB_TAN,
        SUB_RINT /* round_nearest_even */, SUB_ROUND /* round_nearest_afz */,
-       /* bitwise int32/bool — dedicated dispatch in ew_tile_i32/ew_tile_bool */
+       /* bitwise int32/bool — dedicated dispatch in vmo_ew_tile_i32/vmo_ew_tile_bool */
        SUB_AND, SUB_OR, SUB_XOR, SUB_NOT,
-       /* mixed-dtype: float operand -> bool result (own dispatch in ew_tile) */
+       /* mixed-dtype: float operand -> bool result (own dispatch in vmo_ew_tile) */
        SUB_ISFINITE };
 
 #define ENT_NOP     0xFFFFFFFFu
@@ -84,7 +84,7 @@ typedef struct {
  * registers where a GPU might canonicalize a NaN. */
 typedef union { float f; int i; uint u; } slot_t;
 
-static void vm_barrier(volatile __global uint *bar, const uint ngroups)
+static void vmo_barrier(volatile __global uint *bar, const uint ngroups)
 {
     barrier(CLK_GLOBAL_MEM_FENCE);
     if (get_local_id(0) == 0) {

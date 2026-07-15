@@ -14,7 +14,7 @@
 #define MMA_ASZ (MMA_BK * MMA_TM)    /* As[m*BK + k] */
 #define MMA_BSZ (MMA_BK * MMA_TN)    /* Bs[k*TN + n] */
 
-static void mma_tile(__global uchar *arena, const task_t t, uint tile,
+static void vmo_mma_tile(__global uchar *arena, const task_t t, uint tile,
                      __local float *As, __local float *Bs)
 {
     const uint M = t.p0, N = t.p1, K = t.p2;

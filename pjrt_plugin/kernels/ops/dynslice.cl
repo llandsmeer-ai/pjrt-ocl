@@ -22,7 +22,7 @@
  * Both copy whole elements, so they are dtype-agnostic (esz picks the mover).
  */
 
-static int dyn_base(__global uchar *arena, __global const int *x, int rank,
+static int vmo_dyn_base(__global uchar *arena, __global const int *x, int rank,
                     int is64)
 {
     __global const int *strides = x + 1 + rank;
@@ -51,7 +51,7 @@ static int dyn_base(__global uchar *arena, __global const int *x, int rank,
         }                                                                     \
     } while (0)
 
-static void dyn_gather_tile(__global uchar *arena, __global const int *aux,
+static void vmo_dyn_gather_tile(__global uchar *arena, __global const int *aux,
                             const task_t t, uint tile, uint esz, uint lid,
                             uint lsz)
 {
@@ -59,7 +59,7 @@ static void dyn_gather_tile(__global uchar *arena, __global const int *aux,
     const int rank = x[0];
     __global const int *dims = x + 1, *strides = x + 1 + rank;
     const int is64 = x[1 + 5 * rank];
-    const int base = dyn_base(arena, x, rank, is64);
+    const int base = vmo_dyn_base(arena, x, rank, is64);
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, t.p1);
     if (esz == 8)      DYN_GATHER_BODY(ulong);
     else if (esz == 2) DYN_GATHER_BODY(ushort);
@@ -80,7 +80,7 @@ static void dyn_gather_tile(__global uchar *arena, __global const int *aux,
         }                                                                     \
     } while (0)
 
-static void dyn_scatter_tile(__global uchar *arena, __global const int *aux,
+static void vmo_dyn_scatter_tile(__global uchar *arena, __global const int *aux,
                              const task_t t, uint tile, uint esz, uint lid,
                              uint lsz)
 {
@@ -88,7 +88,7 @@ static void dyn_scatter_tile(__global uchar *arena, __global const int *aux,
     const int rank = x[0];
     __global const int *dims = x + 1, *strides = x + 1 + rank;
     const int is64 = x[1 + 5 * rank];
-    const int base = dyn_base(arena, x, rank, is64);
+    const int base = vmo_dyn_base(arena, x, rank, is64);
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, t.p1);
     if (esz == 8)      DYN_SCATTER_BODY(ulong);
     else if (esz == 2) DYN_SCATTER_BODY(ushort);
