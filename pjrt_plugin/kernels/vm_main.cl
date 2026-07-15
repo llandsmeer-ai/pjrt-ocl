@@ -1,5 +1,5 @@
 /* pjrt-ocl VLIW engine — dispatcher + interpreter (concatenated last).
- * exec_tiles routes a task to its op-family tile function (ops/*.cl above);
+ * exec_tiles routes a task to its op-family tile function (ops/ *.cl above);
  * vm2 is the per-lane interpreter over the schedule stream. */
 
 /* tile_op packs the base op in bits 0-7 and the dtype in bits 8-15. */
@@ -69,7 +69,7 @@ __kernel void vm2(__global uchar *arena,
                 continue;
             }
             if (st[sp].phase == 0) {           /* while-cond range done */
-                global_barrier(bar, nlanes);
+                vm_barrier(bar, nlanes);
                 barrier_i++;
                 const uint cbits = atomic_add(
                     (volatile __global uint *)(arena + w.signal_flag), 0u);
@@ -82,7 +82,7 @@ __kernel void vm2(__global uchar *arena,
                     st[sp].pc++;
                 }
             } else {                           /* while-body done: recheck */
-                global_barrier(bar, nlanes);
+                vm_barrier(bar, nlanes);
                 barrier_i++;
                 st[sp].pc = w.tile_lo;
                 st[sp].end = w.tile_lo + w.tile_hi;
@@ -97,7 +97,7 @@ __kernel void vm2(__global uchar *arena,
         if (en.task == ENT_BARRIER) {
             if (lid == 0 && barrier_i < 4096u)
                 stats[barrier_i * nlanes + lane] = atomic_inc(&bar[2]) % nlanes;
-            global_barrier(bar, nlanes);
+            vm_barrier(bar, nlanes);
             barrier_i++;
             st[sp].pc++;
             continue;

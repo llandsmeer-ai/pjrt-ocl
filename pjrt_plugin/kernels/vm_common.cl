@@ -83,7 +83,7 @@ typedef struct {
  * registers where a GPU might canonicalize a NaN. */
 typedef union { float f; int i; uint u; } slot_t;
 
-static void global_barrier(volatile __global uint *bar, const uint ngroups)
+static void vm_barrier(volatile __global uint *bar, const uint ngroups)
 {
     barrier(CLK_GLOBAL_MEM_FENCE);
     if (get_local_id(0) == 0) {
