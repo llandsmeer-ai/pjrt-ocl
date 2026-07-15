@@ -8,3 +8,4 @@ poc/01-device-vm/vm
 poc/04-vliw-vm/vliw
 poc/05-typed-lanes/poc
 poc/06-fast-mma/bench
+.claude/worktrees/
