@@ -54,12 +54,14 @@ landed: the loader now searches PJRT_OCL_PLUGIN_PATH → bundled-in-package → 
 tree, raises a clear actionable error (not silent), and shouts to stderr when
 JAX_PLATFORMS names opencl; README now says plainly that a bare pip-from-git does NOT
 work and gives the clone+build+`pip install -e python/` path (verified working).
-PROPER fix (needs a clean-env pip flow to test — do NOT ship untested): a
-scikit-build-core (or setuptools+cmake) build backend at the repo root that runs cmake,
-builds libpjrt_ocl.so, and installs it into the wheel at `pjrt_ocl/libpjrt_ocl.so`
-(the loader already checks that bundled location). Requires cmake + OpenCL dev headers
-at install time (document as prerequisites). Then `pip install git+https://…` works
-end-to-end.
+✅ **PROPER fix DONE 2026-07-15**: root `pyproject.toml` (scikit-build-core) + root
+`CMakeLists.txt` build libpjrt_ocl.so via cmake and install it into the wheel at
+`pjrt_ocl/libpjrt_ocl.so`. VERIFIED end-to-end: `pip wheel .` bundles the .so + package
++ jax_plugins entry point; installed into a FRESH venv (no dev tree, no env vars, run
+from an unrelated cwd) the README example runs and lists the OpenCL device. Prereqs:
+cmake + ninja (pulled as build deps) + OpenCL dev headers (system). runtime_test guarded
+behind PJRT_OCL_BUILD_TESTS (OFF for the wheel). python/pyproject.toml kept for the
+`pip install -e python/` dev flow.
 
 ### TODO — refresh README.md once coverage work settles (user, 2026-07-15)
 

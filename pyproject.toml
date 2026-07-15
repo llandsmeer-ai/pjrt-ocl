@@ -1,0 +1,27 @@
+# Full build: `pip install .` (or `pip install git+https://github.com/llandsmeer-ai/pjrt-ocl.git`)
+# runs cmake (scikit-build-core), builds libpjrt_ocl.so, and bundles it into the
+# wheel at pjrt_ocl/libpjrt_ocl.so. Requires cmake + ninja (pulled as build deps)
+# and OpenCL dev headers on the system (e.g. `ocl-icd-opencl-dev opencl-headers`).
+#
+# The python-only setuptools project lives in python/pyproject.toml for the
+# `pip install -e python/` dev flow (which needs the .so built separately).
+[build-system]
+requires = ["scikit-build-core>=0.8", "numpy"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pjrt-ocl"
+version = "0.1.0"
+description = "JAX PJRT plugin executing StableHLO on OpenCL devices via a device-side bytecode VM"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["jax", "numpy", "ml_dtypes"]
+
+[project.entry-points.'jax_plugins']
+opencl = "pjrt_ocl"
+
+[tool.scikit-build]
+# The python package source lives under python/; map it to `pjrt_ocl` in the wheel.
+wheel.packages = ["python/pjrt_ocl"]
+cmake.version = ">=3.22"
+# The .so is installed by CMake (root CMakeLists) into pjrt_ocl/.

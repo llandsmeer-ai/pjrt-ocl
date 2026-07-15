@@ -38,41 +38,34 @@ jax.jit(f)  ──►  StableHLO  ──►  lowering (Python)  ──►  VMPro
 
 ## Installation
 
-The plugin has two parts: a Python package (lowering + JAX registration) and a
-compiled C++ shared library (the OpenCL runtime + VM). **A plain `pip install` does
-not build the `.so`** — you must build it and install from the clone. (Automatic
-`pip install`-builds-the-`.so` packaging is planned; see the roadmap.)
-
-### 1. Clone and build the C++ plugin
-
-```bash
-git clone https://github.com/llandsmeer-ai/pjrt-ocl.git
-cd pjrt-ocl
-cmake -S pjrt_plugin -B pjrt_plugin/build -G Ninja
-cmake --build pjrt_plugin/build          # -> pjrt_plugin/build/libpjrt_ocl.so
-```
-
-### 2. Install the Python package (editable, from the clone)
+`pip install` builds the C++ plugin (via cmake/scikit-build-core) and bundles it with
+the Python package — no manual build step. You need the build prerequisites on the
+system first: **cmake, ninja, and OpenCL dev headers** (Ubuntu:
+`sudo apt install cmake ninja-build opencl-headers ocl-icd-opencl-dev`), plus an ICD
+for your device (see [Requirements](#requirements)).
 
 ```bash
-pip install -e python/
+pip install "git+https://github.com/llandsmeer-ai/pjrt-ocl.git"
 ```
 
-Installed editable from the clone, the package finds the `.so` you just built
-automatically (via its build-tree location). That's the whole install — the
-`JAX_PLATFORMS=opencl` example below now works.
+That's it — the `JAX_PLATFORMS=opencl` example below works immediately.
 
-> **Do not** `pip install git+https://…` on its own: that installs only the Python
-> package into `site-packages` with no `.so`, and JAX will report
-> `Backend 'opencl' is not in the list of known backends`. If you must install that
-> way, build the `.so` (step 1) and point the package at it:
-> ```bash
-> export PJRT_OCL_PLUGIN_PATH=/path/to/pjrt-ocl/pjrt_plugin/build/libpjrt_ocl.so
-> ```
-> (The package also loads a `libpjrt_ocl.so` bundled next to itself, if a future
-> packaged build puts one there.)
+<details>
+<summary>Development install (editable, no rebuild-on-edit for the C++)</summary>
 
-### 3. Check JAX sees the device
+For hacking on the plugin, build the `.so` and use an editable Python install:
+
+```bash
+git clone https://github.com/llandsmeer-ai/pjrt-ocl.git && cd pjrt-ocl
+cmake -S pjrt_plugin -B pjrt_plugin/build -G Ninja && cmake --build pjrt_plugin/build
+pip install -e python/    # finds the .so in the build tree automatically
+```
+
+The loader searches `PJRT_OCL_PLUGIN_PATH` → the `.so` bundled in the package → the
+dev build tree, and prints a clear error if none is found.
+</details>
+
+Check JAX sees the device:
 
 ```bash
 JAX_PLATFORMS=opencl python -c "import jax; print(jax.devices())"

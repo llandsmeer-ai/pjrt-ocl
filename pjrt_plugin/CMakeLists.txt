@@ -38,7 +38,11 @@ target_compile_options(pjrt_ocl PRIVATE -Wall -fvisibility=hidden)
 set_target_properties(pjrt_ocl PROPERTIES PREFIX "lib" OUTPUT_NAME "pjrt_ocl")
 
 # Standalone runtime test: hand-encoded VMProgram, no PJRT/python involved.
-add_executable(runtime_test src/runtime_test.cc src/runtime.cc ${VM_CL_OUT})
-target_include_directories(runtime_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(runtime_test PRIVATE OpenCL::OpenCL)
+# Skipped for the pip/wheel build (root CMakeLists sets this OFF).
+option(PJRT_OCL_BUILD_TESTS "Build the C++ runtime_test executable" ON)
+if(PJRT_OCL_BUILD_TESTS)
+  add_executable(runtime_test src/runtime_test.cc src/runtime.cc ${VM_CL_OUT})
+  target_include_directories(runtime_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+  target_link_libraries(runtime_test PRIVATE OpenCL::OpenCL)
+endif()
