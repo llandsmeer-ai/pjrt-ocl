@@ -1,11 +1,10 @@
 build/
+.venv/
+third_party/
 __pycache__/
-*.so
-.cache/
+*.pyc
+poc/*/poc
 poc/01-device-vm/vm
-.claude/
-poc/02-pjrt-skeleton/build/
-*.egg-info/
-.pytest_cache/
 poc/04-vliw-vm/vliw
 poc/05-typed-lanes/poc
+poc/06-fast-mma/bench
