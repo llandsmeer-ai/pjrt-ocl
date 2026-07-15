@@ -264,12 +264,14 @@ def _parse_schedule(data: bytes, pos: int, n_buffers: int) -> ParsedSchedule:
 
     lane_tab: list[tuple[int, int]] = []
     for i in range(n_lanes):
-        off, count = S.LANETAB_STRUCT.unpack_from(data, pos)
+        off, count, root_len, _pad = S.LANETAB_STRUCT.unpack_from(data, pos)
         pos += S.LANETAB_STRUCT.size
         if off + count > n_entries:
             raise FormatError(
                 f"lane[{i}] stream [{off},{off + count}) exceeds n_entries "
                 f"{n_entries}")
+        if root_len > count:
+            raise FormatError(f"lane[{i}] root_len {root_len} > count {count}")
         lane_tab.append((off, count))
 
     entries: list[ParsedEntry] = []

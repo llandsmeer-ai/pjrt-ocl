@@ -69,11 +69,11 @@ _REGION_OPS = {L.OP_WHILE}
 
 SCHED_HDR_STRUCT = struct.Struct("<IIII")      # n_tasks,n_entries,n_flags,n_lanes
 TASK_STRUCT = struct.Struct("<IIIIIIII")       # 32B
-LANETAB_STRUCT = struct.Struct("<II")          # 8B: entry_off, entry_count
+LANETAB_STRUCT = struct.Struct("<IIII")        # 16B: off, count, root_len, pad
 ENTRY_STRUCT = struct.Struct("<IIIIIIII")      # 32B
 assert SCHED_HDR_STRUCT.size == 16
 assert TASK_STRUCT.size == 32
-assert LANETAB_STRUCT.size == 8
+assert LANETAB_STRUCT.size == 16
 assert ENTRY_STRUCT.size == 32
 
 
@@ -174,9 +174,11 @@ class Schedule:
     def serialize_sections(self) -> bytes:
         assert len(self.lane_streams) == self.n_lanes
         flat: list[Entry] = []
-        lane_tab: list[tuple[int, int]] = []
+        lane_tab: list[tuple[int, int, int]] = []
         for stream in self.lane_streams:
-            lane_tab.append((len(flat), len(stream)))
+            # root_len == len(stream): no control flow yet (region ops raise
+            # ScheduleError). WHILE/IF sub-ranges will live at [root_len:count).
+            lane_tab.append((len(flat), len(stream), len(stream)))
             flat.extend(stream)
         out = bytearray()
         out += SCHED_HDR_STRUCT.pack(len(self.tasks), len(flat),
@@ -184,8 +186,8 @@ class Schedule:
         for t in self.tasks:
             out += TASK_STRUCT.pack(t.tile_op, t.dst, t.a, t.b,
                                     t.p0, t.p1, t.p2, t.p3)
-        for off, count in lane_tab:
-            out += LANETAB_STRUCT.pack(off, count)
+        for off, count, root_len in lane_tab:
+            out += LANETAB_STRUCT.pack(off, count, root_len, 0)
         for e in flat:
             out += ENTRY_STRUCT.pack(e.task, e.tile_lo, e.tile_hi,
                                      e.wait_flag, e.wait_count, e.signal_flag,

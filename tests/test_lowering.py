@@ -159,7 +159,7 @@ def test_golden_layout_exact_bytes():
     # lane table (n_lanes x {entry_off, entry_count}); lane 0 owns 4 entries
     off0, cnt0 = struct.unpack_from("<II", blob, pos)
     assert (off0, cnt0) == (0, 4)
-    pos += 8 * n_lanes
+    pos += 16 * n_lanes
 
     # entries: first is task 0 on tiles [0,1); second is a BARRIER
     e0 = struct.unpack_from("<8I", blob, pos)
@@ -167,7 +167,7 @@ def test_golden_layout_exact_bytes():
     e1 = struct.unpack_from("<8I", blob, pos + 32)
     assert e1 == (BARRIER, 0, 0, FLAG_NONE, 0, FLAG_NONE, 0, 0)
 
-    assert len(blob) == tensor_len + 16 + 32 * n_tasks + 8 * n_lanes + 32 * n_entries
+    assert len(blob) == tensor_len + 16 + 32 * n_tasks + 16 * n_lanes + 32 * n_entries
 
 
 def test_golden_layout_jax_lowered_add():
@@ -225,7 +225,7 @@ def test_golden_layout_jax_lowered_add():
     pos += 16
     assert struct.unpack_from("<8I", blob, pos) == (S.TILE_EW, 2, 0, 1,
                                                     S.EW_ADD, 8, 0, 0)
-    pos += 32 * n_tasks + 8 * n_lanes
+    pos += 32 * n_tasks + 16 * n_lanes
     # first entry = task 0 tiles [0,1); second entry = BARRIER
     assert struct.unpack_from("<8I", blob, pos)[:3] == (0, 0, 1)
     assert struct.unpack_from("<I", blob, pos + 32)[0] == 0xFFFFFFFE
