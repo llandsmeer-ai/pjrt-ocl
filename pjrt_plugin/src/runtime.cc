@@ -157,16 +157,18 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
   if (n_entries && !r.Bytes(out->entries.data(), n_entries * sizeof(VmEntry)))
     return fail("truncated entries");
 
-  // Validate schedule.
+  // Validate schedule. tile_op packs the base op (low byte) + dtype (bits 8-15).
   for (const VmTask& t : out->tasks) {
-    if (t.tile_op > kMaxTileOp)
-      return fail("unknown tile_op " + std::to_string(t.tile_op));
+    const uint32_t base_op = t.tile_op & 0xFFu;
+    const uint32_t dt = (t.tile_op >> 8) & 0xFFu;
+    if (base_op > kMaxTileOp)
+      return fail("unknown tile_op " + std::to_string(base_op));
+    if (dt > kDtMax) return fail("unknown dtype " + std::to_string(dt));
     for (uint32_t id : {t.dst, t.a, t.b})
       if (id >= n_buffers) return fail("task buffer id out of range");
-    if (t.tile_op == kTopEw && t.p0 == kEwSubSelect && t.p3 >= n_buffers)
+    if (base_op == kTopEw && t.p0 == kEwSubSelect && t.p3 >= n_buffers)
       return fail("select pred id out of range");
-    if ((t.tile_op == kTopGather || t.tile_op == kTopIotaDim) &&
-        t.p0 >= n_aux)
+    if ((base_op == kTopGather || base_op == kTopIotaDim) && t.p0 >= n_aux)
       return fail("task aux offset out of range");
   }
   uint32_t barrier_count_ref = 0;
@@ -334,8 +336,10 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
                               &cerr);
   if (cerr != CL_SUCCESS) return fail("arena alloc: " + std::to_string(cerr));
 
+  // Byte offset into the arena (the VM is byte-addressed; each op casts a
+  // typed pointer at this base). Was f32-element (÷4) before dtypes.
   auto elem_off = [&](uint32_t id) {
-    return static_cast<uint32_t>(p.buffers[id].arena_byte_offset / 4);
+    return static_cast<uint32_t>(p.buffers[id].arena_byte_offset);
   };
   auto make_buf = [&](const void* data, size_t bytes, const char* what) {
     static const uint64_t kZero = 0;
@@ -355,7 +359,8 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
     t.dst = elem_off(t.dst);
     t.a = elem_off(t.a);
     t.b = elem_off(t.b);
-    if (t.tile_op == kTopEw && t.p0 == kEwSubSelect) t.p3 = elem_off(t.p3);
+    if ((t.tile_op & 0xFFu) == kTopEw && t.p0 == kEwSubSelect)
+      t.p3 = elem_off(t.p3);
   }
   // Patch control-entry cond buffer ids.
   std::vector<VmEntry> entries = p.entries;

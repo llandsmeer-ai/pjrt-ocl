@@ -2,17 +2,21 @@
  * exec_tiles routes a task to its op-family tile function (ops/*.cl above);
  * vm2 is the per-lane interpreter over the schedule stream. */
 
-static void exec_tiles(__global float *arena, __global const int *aux,
+/* tile_op packs the base op in bits 0-7 and the dtype in bits 8-15. */
+static void exec_tiles(__global uchar *arena, __global const int *aux,
                        const task_t t, uint tile_lo, uint tile_hi,
                        __local float *As, __local float *Bs)
 {
     const uint lid = get_local_id(0);
     const uint lsz = get_local_size(0);
+    const uint op = t.tile_op & 0xFFu;
+    const uint dt = (t.tile_op >> 8) & 0xFFu;
+    const uint esz = (dt == DT_I64 || dt == DT_F64) ? 8u : 4u;
     for (uint tile = tile_lo; tile < tile_hi; ++tile) {
-        switch (t.tile_op) {
-        case TOP_EW:       ew_tile(arena, t, tile, lid, lsz); break;
+        switch (op) {
+        case TOP_EW:       ew_tile(arena, t, tile, dt, lid, lsz); break;
         case TOP_MMA:      mma_tile(arena, t, tile, As, Bs); break;
-        case TOP_GATHER:   gather_tile(arena, aux, t, tile, lid, lsz); break;
+        case TOP_GATHER:   gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
         case TOP_RED_PART: reduce_part_tile(arena, t, tile, As, lid, lsz); break;
         case TOP_RED_COMB: reduce_comb_tile(arena, t, lid); break;
         case TOP_IOTA_DIM: iota_tile(arena, aux, t, tile, lid, lsz); break;
@@ -26,7 +30,7 @@ static void exec_tiles(__global float *arena, __global const int *aux,
 #define WIDX_ROOT 0xFFFFFFFFu
 typedef struct { uint pc, end, widx, phase; } frame_t; /* phase: 0 cond,1 body,2 if */
 
-__kernel void vm2(__global float *arena,
+__kernel void vm2(__global uchar *arena,
                   __global const int *aux,
                   __global const task_t *tasks,
                   __global const entry_t *entries,   /* flattened */
@@ -64,7 +68,7 @@ __kernel void vm2(__global float *arena,
                 global_barrier(bar, nlanes);
                 barrier_i++;
                 const uint cbits = atomic_add(
-                    (volatile __global uint *)arena + w.signal_flag, 0u);
+                    (volatile __global uint *)(arena + w.signal_flag), 0u);
                 if (cbits != 0u) {
                     st[sp].pc = w.wait_flag;
                     st[sp].end = w.wait_flag + w.wait_count;
@@ -104,7 +108,7 @@ __kernel void vm2(__global float *arena,
         }
         if (en.task == ENT_IF) {
             const uint cbits = atomic_add(
-                (volatile __global uint *)arena + en.signal_flag, 0u);
+                (volatile __global uint *)(arena + en.signal_flag), 0u);
             const uint start = cbits != 0u ? en.tile_lo : en.wait_flag;
             const uint len = cbits != 0u ? en.tile_hi : en.wait_count;
             if (len == 0) { st[sp].pc++; continue; }

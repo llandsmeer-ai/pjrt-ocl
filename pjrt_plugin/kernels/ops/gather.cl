@@ -3,20 +3,38 @@
  * Covers broadcast_in_dim / transpose / slice / reverse (via strides+src_off).
  */
 
-static void gather_tile(__global float *arena, __global const int *aux,
-                        const task_t t, uint tile, uint lid, uint lsz)
+/* Gather copies whole elements, so it is dtype-agnostic for a given element
+ * size. `esz` (bytes) picks the mover: 4-byte types copy as uint bits; 8-byte
+ * as ulong. dst/a are BYTE offsets. */
+static void gather_tile(__global uchar *arena, __global const int *aux,
+                        const task_t t, uint tile, uint esz, uint lid, uint lsz)
 {
     __global const int *x = aux + t.p0;
     const int rank = x[0];
     __global const int *dims = x + 1, *strides = x + 1 + rank;
     const int src_off = x[1 + 2 * rank];
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, t.p1);
-    for (uint i = lo + lid; i < hi; i += lsz) {
-        int rem = (int)i, off = src_off;
-        for (int d = rank - 1; d >= 0; --d) {
-            off += (rem % dims[d]) * strides[d];
-            rem /= dims[d];
+    if (esz == 8) {
+        __global ulong *d = AP(ulong, t.dst);
+        __global const ulong *a = AP(const ulong, t.a);
+        for (uint i = lo + lid; i < hi; i += lsz) {
+            int rem = (int)i, off = src_off;
+            for (int e = rank - 1; e >= 0; --e) {
+                off += (rem % dims[e]) * strides[e];
+                rem /= dims[e];
+            }
+            d[i] = a[off];
         }
-        arena[t.dst + i] = arena[t.a + off];
+    } else {
+        __global uint *d = AP(uint, t.dst);
+        __global const uint *a = AP(const uint, t.a);
+        for (uint i = lo + lid; i < hi; i += lsz) {
+            int rem = (int)i, off = src_off;
+            for (int e = rank - 1; e >= 0; --e) {
+                off += (rem % dims[e]) * strides[e];
+                rem /= dims[e];
+            }
+            d[i] = a[off];
+        }
     }
 }

@@ -43,6 +43,11 @@ enum TileOp : uint32_t {
   kTopEw = 0, kTopMma = 1, kTopGather = 2, kTopRedPart = 3, kTopRedComb = 4,
   kTopIotaDim = 5, kMaxTileOp = kTopIotaDim,
 };
+// dtype packed in tile_op bits 8-15 (matches python DT_* / vm_common.cl).
+enum VmDtype : uint32_t {
+  kDtF32 = 0, kDtI32 = 1, kDtU32 = 2, kDtBool = 3, kDtI64 = 4, kDtF64 = 5,
+  kDtMax = kDtF64,
+};
 enum EntSentinel : uint32_t {
   kEntNop = 0xFFFFFFFFu, kEntBarrier = 0xFFFFFFFEu,
   kEntWhile = 0xFFFFFFFDu, kEntIf = 0xFFFFFFFCu,

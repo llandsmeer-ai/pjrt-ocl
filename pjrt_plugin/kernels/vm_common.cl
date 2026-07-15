@@ -8,11 +8,28 @@
  * One translation unit, functions inlined — file-level modularity for parallel
  * op work (mirrors python/pjrt_ocl/ops/), no clLinkProgram needed.
  *
- * Loader pre-patches task dst/a/b (+ select p3) and WHILE/IF cond to f32
- * ELEMENT offsets into the arena (dtype work will move these to byte offsets).
+ * Arena is BYTE-addressed: `__global uchar *arena`, and the loader patches task
+ * dst/a/b (+ select p3) and WHILE/IF cond to BYTE offsets. A tile op reaches
+ * element `i` of a buffer at byte base `base` via AP(T, base)[i] (base is
+ * 64B-aligned, so any T is naturally aligned). This lets one arena hold mixed
+ * dtypes; ops dispatch on a per-task dtype (packed in tile_op's high byte).
  */
 
+/* Enable fp64 where the device supports it (feature-detected at init; the
+ * runtime only builds this program on such devices, and only f64 programs use
+ * it). Harmless #pragma on devices that expose the extension. */
+#ifdef cl_khr_fp64
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#endif
+
 #define EW_TS 16384u
+
+/* Typed element pointer at byte base `base` into the byte-addressed arena. */
+#define AP(T, base) ((__global T *)(arena + (base)))
+
+/* dtype enum (matches python DT_* / runtime.h). Tier 1 = 4-byte. */
+enum { DT_F32 = 0, DT_I32 = 1, DT_U32 = 2, DT_BOOL = 3,
+       DT_I64 = 4, DT_F64 = 5 };
 
 enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
        TOP_RED_COMB = 4, TOP_IOTA_DIM = 5 };

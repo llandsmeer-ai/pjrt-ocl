@@ -14,7 +14,7 @@
 #define MMA_ASZ (MMA_BK * MMA_TM)    /* As[m*BK + k] */
 #define MMA_BSZ (MMA_BK * MMA_TN)    /* Bs[k*TN + n] */
 
-static void mma_tile(__global float *arena, const task_t t, uint tile,
+static void mma_tile(__global uchar *arena, const task_t t, uint tile,
                      __local float *As, __local float *Bs)
 {
     const uint M = t.p0, N = t.p1, K = t.p2;
@@ -23,6 +23,8 @@ static void mma_tile(__global float *arena, const task_t t, uint tile,
     const uint row0 = tr * MMA_TM, col0 = tc * MMA_TN;
     const uint lid = get_local_id(0);
     const uint ty = lid / MMA_TDIM, tx = lid % MMA_TDIM;
+    __global const float *ga = AP(const float, t.a);
+    __global const float *gb = AP(const float, t.b);
 
     float acc[MMA_RM][MMA_RN];
     for (int i = 0; i < MMA_RM; i++)
@@ -33,13 +35,13 @@ static void mma_tile(__global float *arena, const task_t t, uint tile,
             const uint m = idx / MMA_BK, kk = idx % MMA_BK;
             const uint gr = row0 + m, gk = k0 + kk;
             As[m * MMA_BK + kk] =
-                (gr < M && gk < K) ? arena[t.a + gr * K + gk] : 0.0f;
+                (gr < M && gk < K) ? ga[gr * K + gk] : 0.0f;
         }
         for (uint idx = lid; idx < MMA_BK * MMA_TN; idx += 256) {
             const uint kk = idx / MMA_TN, n = idx % MMA_TN;
             const uint gk = k0 + kk, gc = col0 + n;
             Bs[kk * MMA_TN + n] =
-                (gk < K && gc < N) ? arena[t.b + gk * N + gc] : 0.0f;
+                (gk < K && gc < N) ? gb[gk * N + gc] : 0.0f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint kk = 0; kk < MMA_BK; ++kk) {
@@ -55,12 +57,13 @@ static void mma_tile(__global float *arena, const task_t t, uint tile,
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
+    __global float *gd = AP(float, t.dst);
     for (int i = 0; i < MMA_RM; i++) {
         const uint gr = row0 + ty * MMA_RM + i;
         if (gr >= M) continue;
         for (int j = 0; j < MMA_RN; j++) {
             const uint gc = col0 + tx * MMA_RN + j;
-            if (gc < N) arena[t.dst + gr * N + gc] = acc[i][j];
+            if (gc < N) gd[gr * N + gc] = acc[i][j];
         }
     }
 }

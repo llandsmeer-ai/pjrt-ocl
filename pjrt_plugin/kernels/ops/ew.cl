@@ -33,27 +33,28 @@ static float ew_un(const uint sub, const float x)
     }
 }
 
-static void ew_tile(__global float *arena, const task_t t, uint tile,
-                    uint lid, uint lsz)
+/* f32 elementwise. dt selects the arithmetic type (Tier 1 + f64); dst/a/b/p3
+ * are BYTE offsets into the arena. */
+static void ew_tile_f32(__global uchar *arena, const task_t t, uint tile,
+                        uint lid, uint lsz)
 {
     const uint sub = t.p0, n = t.p1;
     const uint lo = tile * EW_TS;
     const uint hi = min(lo + EW_TS, n);
+    __global float *d = AP(float, t.dst);
+    __global const float *a = AP(const float, t.a);
+    __global const float *b = AP(const float, t.b);
     if (sub <= SUB_POW) {
-        for (uint i = lo + lid; i < hi; i += lsz)
-            arena[t.dst + i] = ew_bin(sub, arena[t.a + i], arena[t.b + i]);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = ew_bin(sub, a[i], b[i]);
     } else if (sub <= SUB_SIGN) {
-        for (uint i = lo + lid; i < hi; i += lsz)
-            arena[t.dst + i] = ew_un(sub, arena[t.a + i]);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = ew_un(sub, a[i]);
     } else if (sub == SUB_FILL) {
-        for (uint i = lo + lid; i < hi; i += lsz)
-            arena[t.dst + i] = as_float(t.p2);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = as_float(t.p2);
     } else if (sub == SUB_IOTA_FLAT) {
-        for (uint i = lo + lid; i < hi; i += lsz)
-            arena[t.dst + i] = (float)i;
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = (float)i;
     } else if (sub == SUB_CMP) {
         for (uint i = lo + lid; i < hi; i += lsz) {
-            const float x = arena[t.a + i], y = arena[t.b + i];
+            const float x = a[i], y = b[i];
             int r;
             switch (t.p2) {
             case 0:  r = x == y; break;
@@ -63,14 +64,19 @@ static void ew_tile(__global float *arena, const task_t t, uint tile,
             case 4:  r = x > y;  break;
             default: r = x >= y; break;
             }
-            arena[t.dst + i] = r ? 1.0f : 0.0f;
+            d[i] = r ? 1.0f : 0.0f;
         }
     } else if (sub == SUB_SELECT) {
+        __global const float *p = AP(const float, t.p3);
         for (uint i = lo + lid; i < hi; i += lsz)
-            arena[t.dst + i] = arena[t.p3 + i] != 0.0f ? arena[t.a + i]
-                                                       : arena[t.b + i];
+            d[i] = p[i] != 0.0f ? a[i] : b[i];
     } else if (sub == SUB_LTS) {
-        if (lid == 0 && lo == 0)
-            arena[t.dst] = (arena[t.a] < arena[t.b]) ? 1.0f : 0.0f;
+        if (lid == 0 && lo == 0) d[0] = (a[0] < b[0]) ? 1.0f : 0.0f;
     }
+}
+
+static void ew_tile(__global uchar *arena, const task_t t, uint tile,
+                    uint dt, uint lid, uint lsz)
+{
+    ew_tile_f32(arena, t, tile, lid, lsz);
 }
