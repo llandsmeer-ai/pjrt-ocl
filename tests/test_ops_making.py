@@ -145,38 +145,6 @@ def test_convert_in_expression():
     _check_hand_built(shape, build, x, expected=x + x)
 
 
-def test_convert_unsupported_dtype_raises():
-    """stablehlo.convert to a non-f32 dtype is not supported: there is no
-    real int/bool arena dtype yet, and f32->int truncation has no
-    round-toward-zero op in vm2.cl (only floor/ceil/sign) — must raise
-    LoweringError with a clear message rather than silently misinterpreting
-    bits."""
-    from jaxlib.mlir import ir
-    from jaxlib.mlir.dialects import func as func_dialect, stablehlo
-
-    from pjrt_ocl import lowering as L
-
-    shape = (4,)
-    ctx = ir.Context()
-    stablehlo.register_dialect(ctx)
-    with ctx, ir.Location.unknown():
-        module = ir.Module.create()
-        f32 = ir.F32Type.get()
-        i32 = ir.IntegerType.get_signless(32)
-        in_t = ir.RankedTensorType.get(list(shape), f32)
-        out_t = ir.RankedTensorType.get(list(shape), i32)
-        fn_type = ir.FunctionType.get([in_t], [out_t])
-        with ir.InsertionPoint(module.body):
-            fop = func_dialect.FuncOp("main", fn_type)
-            fop.attributes["sym_visibility"] = ir.StringAttr.get("public")
-            fop.attributes["arg_attrs"] = ir.ArrayAttr.get([ir.DictAttr.get({})])
-            fop.attributes["res_attrs"] = ir.ArrayAttr.get([ir.DictAttr.get({})])
-            entry = fop.add_entry_block()
-            with ir.InsertionPoint(entry):
-                conv = stablehlo.ConvertOp(out_t, entry.arguments[0])
-                func_dialect.ReturnOp([conv.result])
-        artifact = stablehlo.serialize_portable_artifact(
-            module, stablehlo.get_current_version())
-
-    with pytest.raises(L.LoweringError):
-        L.lower_artifact(artifact)
+# convert (f32<->i32<->f64, bool) now lowers real dtype casts; dtype-changing
+# ops can't go through the f32-only oputil.check, so they're verified directly
+# on hardware (see the dtype hardware tests / docs/coverage-baseline.md).

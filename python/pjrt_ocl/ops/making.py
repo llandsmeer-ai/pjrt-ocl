@@ -140,29 +140,49 @@ opsem.register_tile_sim(TILE_IOTA_DIM, _iota_tile_sim)
 
 @L.handles("stablehlo.convert")
 def _convert(ctx, op):
-    from jaxlib.mlir import ir
-    in_type = op.operands[0].type
-    out_type = op.results[0].type
-    is_f32 = [isinstance(t, ir.RankedTensorType)
-              and isinstance(t.element_type, ir.F32Type)
-              for t in (in_type, out_type)]
-    if not all(is_f32):
-        in_et = getattr(in_type, "element_type", in_type)
-        out_et = getattr(out_type, "element_type", out_type)
-        raise L.LoweringError(
-            f"stablehlo.convert: unsupported dtype change {in_et} -> "
-            f"{out_et} (only f32 -> f32 identity is implemented; there is "
-            "no real int/bool arena dtype yet and f32->int truncation has "
-            "no round-toward-zero op in vm2.cl — see ops/making.py docstring)")
-    in_shape, n_elems, _ = L.tensor_info(in_type)
-    out_shape, _, _ = L.tensor_info(out_type)
+    # Real dtype cast: the VM reads the input as its dtype (task.adtype) and
+    # writes the result dtype (task.dtype) with a C cast (float->int truncates
+    # toward zero, matching stablehlo). f64 casts are device-gated at load.
+    in_shape, n_elems, _ = L.tensor_info(op.operands[0].type)
+    out_shape, _, _ = L.tensor_info(op.results[0].type)
     if in_shape != out_shape:
-        raise L.LoweringError(
-            "stablehlo.convert: shape mismatch (not a pure dtype cast)")
-    dst = ctx.new_buffer(n_elems)
-    ctx.emit(L.Instr(L.OP_COPY_F32, dst=dst, a=ctx.buf_for(op.operands[0]),
+        raise L.LoweringError("convert: shape mismatch (not a pure cast)")
+    dst = ctx.new_buffer(n_elems, L.tensor_info(op.results[0].type)[2])
+    ctx.emit(L.Instr(L.OP_CONVERT, dst=dst, a=ctx.buf_for(op.operands[0]),
                      n=n_elems))
     ctx.value_to_buf[op.results[0]] = dst
+
+
+def _convert_to_task(ins) -> Task:
+    from ..scheduler import TILE_EW
+    return Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.a, p0=23, p1=ins.n)
+
+
+def _convert_interp(ins, rt) -> None:
+    # dst view uses the result dtype; a view uses the operand dtype -> numpy
+    # assignment performs the cast (float->int truncates toward zero via astype
+    # after trunc? numpy astype truncates toward zero for float->int).
+    import numpy as np
+    src = rt.view(ins.a, ins.n)
+    dst = rt.view(ins.dst, ins.n)
+    if np.issubdtype(src.dtype, np.floating) and np.issubdtype(dst.dtype,
+                                                              np.integer):
+        dst[:] = np.trunc(src).astype(dst.dtype)
+    else:
+        dst[:] = src.astype(dst.dtype)
+
+
+def _convert_ew_sim(a, b, task, rt, lo, hi):
+    import numpy as np
+    dst_dt = rt.view(task.dst).dtype
+    if np.issubdtype(a.dtype, np.floating) and np.issubdtype(dst_dt, np.integer):
+        return np.trunc(a).astype(dst_dt)
+    return a.astype(dst_dt)
+
+
+opsem.register(L.OP_CONVERT, to_task=_convert_to_task, interp=_convert_interp,
+               reads=lambda ins: {ins.a})
+opsem.register_ew_sim(23, _convert_ew_sim)   # SUB_CONVERT
 
 
 def _copy_to_task(ins) -> Task:

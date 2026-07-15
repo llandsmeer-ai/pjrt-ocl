@@ -110,6 +110,7 @@ OP_REDUCE = 26           # aux: kind,out_rank,out_dims[],kept_strides[],red_rank
 OP_DOT = 27              # aux: M, N, K
 OP_IOTA_DIM = 28         # aux: rank, out_dims[], dim
 OP_IF = 29
+OP_CONVERT = 30          # dtype cast: read a as operand dtype, write dst dtype
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -121,7 +122,7 @@ OP_NAMES = {
     OP_FLOOR_F32: "floor_f32", OP_CEIL_F32: "ceil_f32", OP_SIGN_F32: "sign_f32",
     OP_CMP_F32: "cmp_f32", OP_SELECT_F32: "select_f32",
     OP_GATHER_STRIDED: "gather_strided", OP_REDUCE: "reduce", OP_DOT: "dot",
-    OP_IOTA_DIM: "iota_dim", OP_IF: "if",
+    OP_IOTA_DIM: "iota_dim", OP_IF: "if", OP_CONVERT: "convert",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the

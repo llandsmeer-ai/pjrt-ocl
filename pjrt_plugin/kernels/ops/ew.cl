@@ -162,11 +162,54 @@ static void ew_tile_bool(__global uchar *arena, const task_t t, uint tile,
     else for (uint i = lo + lid; i < hi; i += lsz) d[i] = a[i];  /* copy */
 }
 
+/* convert: read a[i] as adt, write dst[i] as dt with a C cast (float->int
+ * truncates toward zero, matching stablehlo). Via a double intermediate where
+ * fp64 exists (exact to 2^53); a float intermediate otherwise (4-byte types).
+ * i64 beyond 2^53 loses precision — acceptable for now. */
+static void convert_tile(__global uchar *arena, const task_t t, uint tile,
+                         uint dt, uint adt, uint lid, uint lsz)
+{
+    const uint n = t.p1;
+    const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
+    for (uint i = lo + lid; i < hi; i += lsz) {
+#ifdef cl_khr_fp64
+        double v;
+        switch (adt) {
+        case DT_I32: case DT_U32: v = (double)AP(const int, t.a)[i]; break;
+        case DT_BOOL: v = (double)AP(const uchar, t.a)[i]; break;
+        case DT_I64: v = (double)AP(const long, t.a)[i]; break;
+        case DT_F64: v = AP(const double, t.a)[i]; break;
+        default: v = (double)AP(const float, t.a)[i]; break;
+        }
+        switch (dt) {
+        case DT_I32: case DT_U32: AP(int, t.dst)[i] = (int)v; break;
+        case DT_BOOL: AP(uchar, t.dst)[i] = (uchar)(v != 0.0); break;
+        case DT_I64: AP(long, t.dst)[i] = (long)v; break;
+        case DT_F64: AP(double, t.dst)[i] = v; break;
+        default: AP(float, t.dst)[i] = (float)v; break;
+        }
+#else
+        float v;
+        switch (adt) {
+        case DT_I32: case DT_U32: v = (float)AP(const int, t.a)[i]; break;
+        case DT_BOOL: v = (float)AP(const uchar, t.a)[i]; break;
+        default: v = AP(const float, t.a)[i]; break;
+        }
+        switch (dt) {
+        case DT_I32: case DT_U32: AP(int, t.dst)[i] = (int)v; break;
+        case DT_BOOL: AP(uchar, t.dst)[i] = (uchar)(v != 0.0f); break;
+        default: AP(float, t.dst)[i] = v; break;
+        }
+#endif
+    }
+}
+
 static void ew_tile(__global uchar *arena, const task_t t, uint tile,
                     uint dt, uint adt, uint lid, uint lsz)
 {
     if (t.p0 == SUB_CMP) { cmp_tile(arena, t, tile, adt, lid, lsz); return; }
     if (t.p0 == SUB_SELECT) { select_tile(arena, t, tile, dt, lid, lsz); return; }
+    if (t.p0 == SUB_CONVERT) { convert_tile(arena, t, tile, dt, adt, lid, lsz); return; }
     switch (dt) {
     case DT_I32: case DT_U32: ew_tile_i32(arena, t, tile, lid, lsz); break;
     case DT_BOOL:             ew_tile_bool(arena, t, tile, lid, lsz); break;
