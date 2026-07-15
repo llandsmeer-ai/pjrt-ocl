@@ -475,28 +475,24 @@ class _Scheduler:
 
 def schedule_program(prog: L.VMProgram,
                      config: DeviceConfig | None = None,
-                     allow_multilane_while: bool = False) -> Schedule:
+                     allow_multilane_while: bool = True) -> Schedule:
     """Schedule the tensor VMProgram into per-lane streams. Root instrs schedule
     with a global BARRIER between levels; each WHILE becomes a uniform control
     entry whose cond/body sub-lists are appended after the root (root_len rule).
     v0 contract: WAIT/SIGNAL unused; n_flags = 0.
 
-    WHILE + cross-lane data (M4 caveat): the global barrier reliably publishes
-    the *atomic* cond-flag read across workgroups, but regular cross-lane data
-    loads race UNDER ITERATION on the current kernel (measured on NVIDIA — a
-    loop-carried value read by a different lane than wrote it gives a
-    nondeterministic result; docs/decisions.md, project risk #1). Until the
-    barrier is hardened (M5), while-containing programs schedule on a SINGLE
-    lane so every loop-carried buffer's producer/consumer share a lane (no
-    cross-lane data movement). Correctness-first; loop-body parallelism is a
-    later perf item. `allow_multilane_while=True` keeps the multi-lane path (for
-    the python simulator, where cross-lane is exact) — do NOT use it for device
-    schedules."""
+    WHILE + cross-lane data: loop-carried buffers written by one lane and read by
+    another in a later iteration used to race — the barrier published the atomic
+    cond flag but NOT non-atomic data (work-group-scoped fence; docs/decisions.md
+    #1, quantified in poc/07). RESOLVED by the device-scope acquire/release fence
+    barrier (poc/07 test E): plain cross-lane reads are now coherent, so while
+    bodies schedule across ALL lanes like any other op. `allow_multilane_while`
+    is retained (now default True) only for callers that pinned it; it no longer
+    gates anything. (Multi-lane on PoCL still deadlocks on the LIVENESS axis —
+    the spin-barrier needs co-resident workgroups — but that affects every
+    multi-lane program, not just while; CPU needs the host-dispatch engine.)"""
     config = config or DeviceConfig.from_env()
     n_lanes = config.nlanes
-    if (n_lanes > 1 and not allow_multilane_while
-            and any(ins.op == L.OP_WHILE for ins in prog.instrs)):
-        n_lanes = 1
     sc = _Scheduler(prog, config, n_lanes)
 
     # Root schedules with a global BARRIER only BETWEEN levels (trailing_barrier

@@ -112,14 +112,15 @@ def test_while_multilane_schedule_simulator():
                                rtol=1e-5, atol=1e-5)
 
 
-def test_while_forces_single_lane_on_device_config():
-    """A while program with a normally-multi-lane config schedules to 1 lane
-    (the M4 cross-lane-barrier guard)."""
+def test_while_schedules_multilane_on_device_config():
+    """A while program now schedules across ALL lanes (the device-scope-fence
+    barrier fixed the cross-lane data race that used to force a single lane;
+    poc/07 / docs/decisions.md #1)."""
     def f(x):
         return jax.lax.fori_loop(0, 3, lambda i, a: a + 1.0, x)
-    prog = L.lower_artifact(to_artifact(f, np.float32(1.0)))
+    prog = L.lower_artifact(to_artifact(f, np.linspace(0, 1, 50000, np.float32)))
     sched = S.schedule_program(prog, S.DeviceConfig(nlanes=32, costs={}))
-    assert sched.n_lanes == 1
+    assert sched.n_lanes == 32
 
 
 def test_while_then_elementwise():
