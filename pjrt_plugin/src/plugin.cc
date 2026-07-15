@@ -730,9 +730,13 @@ static PJRT_Error* Impl_PJRT_Client_Compile(PJRT_Client_Compile_Args* args) {
   std::vector<uint8_t> vmp_bytes;
   std::string err;
   bool unsupported = false;
+  std::vector<std::pair<std::string, std::string>> sub_env = {
+      {"PJRT_OCL_NLANES", std::to_string(client->runtime->ngroups())}};
+  if (const char* ct = std::getenv("PJRT_OCL_COST_TABLE"); ct && ct[0])
+    sub_env.push_back({"PJRT_OCL_COST_TABLE", ct});
   if (!pjrt_ocl::RunLoweringSubprocess(client->python_exe,
                                        client->lower_service, artifact,
-                                       &vmp_bytes, &err, &unsupported))
+                                       sub_env, &vmp_bytes, &err, &unsupported))
     return MakeError(unsupported ? PJRT_Error_Code_UNIMPLEMENTED
                                  : PJRT_Error_Code_INTERNAL,
                      "pjrt-ocl lowering: " + err);

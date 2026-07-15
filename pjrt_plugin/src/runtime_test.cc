@@ -1,5 +1,8 @@
-// Standalone runtime test: hand-encodes a VMProgram v1 blob (docs/vmprogram.md)
-// and executes it — validates parser + loader + VM with no PJRT/python.
+// Standalone runtime test: hand-encodes VMProgram v3 blobs (docs/vmprogram.md
+// v2.1) and executes them on the VLIW engine — no PJRT/python involved.
+//
+// A: c = (a+b)*a across 4 lanes, two levels with barriers.
+// B: while-loop doubling (scalar cond, on-device control entries), 2 lanes.
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -9,6 +12,9 @@
 using namespace pjrt_ocl;
 
 namespace {
+
+constexpr uint32_t NOPE = 0xFFFFFFFFu, BARR = 0xFFFFFFFEu, WHIL = 0xFFFFFFFDu;
+constexpr uint32_t FLAGN = 0xFFFFFFFFu;
 
 struct Blob {
   std::vector<uint8_t> b;
@@ -21,80 +27,181 @@ struct Blob {
   void Align8() { while (b.size() % 8) b.push_back(0); }
 };
 
-}  // namespace
+struct Builder {
+  uint32_t n_lanes;
+  std::vector<std::pair<uint64_t, uint64_t>> bufs;  // offset,size
+  uint64_t arena = 0;
+  std::vector<uint32_t> inputs, outputs;
+  std::vector<std::vector<uint64_t>> in_dims, out_dims;
+  std::vector<std::pair<uint32_t, std::vector<float>>> consts;
+  std::vector<VmTask> tasks;
+  std::vector<std::vector<VmEntry>> lanes;
+  std::vector<uint32_t> root_lens;  // 0 = whole stream (no control flow)
 
-int main() {
-  // Program: out = (a + b) * a  on f32[8], plus a while-loop doubling:
-  //   i = 0; while (i < 3) { out = out + out; i = i + 1 }
-  // Buffers: 0=a(in) 1=b(in) 2=out 3=i 4=three 5=one 6=cond  (64B-aligned)
-  const uint32_t N = 8;
-  Blob p;
-  const uint32_t n_buffers = 7, n_consts = 2, n_inputs = 2, n_outputs = 1;
-  const uint32_t main_len = 4;   // add, mul, fill i=0, while
-  const uint32_t n_instrs = 7;   // + cond lts, body add, body add-one
-  p.U32(0x314D5056u); p.U32(1);
-  p.U32(n_buffers); p.U32(n_instrs); p.U32(n_consts); p.U32(main_len);
-  p.U32(n_inputs); p.U32(n_outputs);
-  uint64_t off = 0;
-  std::vector<std::pair<uint64_t, uint64_t>> bufs;
-  for (uint64_t size : std::vector<uint64_t>{N * 4, N * 4, N * 4, 4, 4, 4, 4}) {
-    bufs.push_back({off, size});
-    off = (off + size + 63) & ~uint64_t{63};
+  explicit Builder(uint32_t nl) : n_lanes(nl) {
+    lanes.resize(nl);
+    root_lens.assign(nl, 0);
   }
-  p.U64(off);  // arena_bytes
-  for (auto [o, s] : bufs) { p.U64(o); p.U64(s); p.U32(0); p.U32(0); }
-  p.U32(0); p.U32(1); p.Align8();          // inputs
-  p.U32(2); p.Align8();                    // outputs
-  for (int i = 0; i < 2; ++i) { p.U32(1); p.U32(0); p.U64(N); p.Align8(); }  // in shapes
-  p.U32(1); p.U32(0); p.U64(N); p.Align8();                                  // out shape
-  const float three = 3.0f, one = 1.0f;
-  p.U32(4); p.U32(4); p.Raw(&three, 4); p.Align8();   // const: three
-  p.U32(5); p.U32(4); p.Raw(&one, 4); p.Align8();     // const: one
-  auto instr = [&](uint32_t op, uint32_t dst, uint32_t a, uint32_t b,
-                   uint32_t n, uint32_t imm) {
-    p.U32(op); p.U32(dst); p.U32(a); p.U32(b); p.U32(n); p.U32(imm);
-    p.U32(0); p.U32(0);
-  };
-  // main [0,4)
-  instr(kAddF32, 2, 0, 1, N, 0);
-  instr(kMulF32, 2, 2, 0, N, 0);
-  instr(kFillF32, 3, 0, 0, 1, 0);          // i = 0.0f (bits of 0.0 = 0)
-  instr(kWhile, 6, 4, 1, 5, 2);            // cond=[4,5) body=[5,7)
-  // cond [4]
-  instr(kLtsF32, 6, 3, 4, 1, 0);
-  // body [5,7)
-  instr(kAddF32, 2, 2, 2, N, 0);
-  instr(kAddF32, 3, 3, 5, 1, 0);
+  uint32_t buf(uint64_t elems) {
+    bufs.push_back({arena, elems * 4});
+    arena = (arena + elems * 4 + 63) & ~uint64_t{63};
+    return bufs.size() - 1;
+  }
+  uint32_t task(VmTask t) { tasks.push_back(t); return tasks.size() - 1; }
+  void ent(uint32_t lane, VmEntry e) { lanes[lane].push_back(e); }
+  void barrier_all() {
+    for (auto& l : lanes)
+      l.push_back({BARR, 0, 0, FLAGN, 0, FLAGN, 0, 0});
+  }
+  std::vector<uint8_t> Serialize() {
+    Blob p;
+    uint32_t n_entries = 0;
+    for (auto& l : lanes) n_entries += l.size();
+    p.U32(0x314D5056u); p.U32(3);
+    p.U32(bufs.size()); p.U32(0); p.U32(consts.size()); p.U32(0);
+    p.U32(inputs.size()); p.U32(outputs.size());
+    p.U32(0); p.U32(0);              // n_aux, pad
+    p.U64(arena);
+    for (auto [o, s] : bufs) { p.U64(o); p.U64(s); p.U32(0); p.U32(0); }
+    for (uint32_t i : inputs) p.U32(i);
+    p.Align8();
+    for (uint32_t i : outputs) p.U32(i);
+    p.Align8();
+    for (auto& d : in_dims) {
+      p.U32(d.size()); p.U32(0);
+      for (uint64_t v : d) p.U64(v);
+      p.Align8();
+    }
+    for (auto& d : out_dims) {
+      p.U32(d.size()); p.U32(0);
+      for (uint64_t v : d) p.U64(v);
+      p.Align8();
+    }
+    for (auto& [id, vals] : consts) {
+      p.U32(id); p.U32(vals.size() * 4);
+      p.Raw(vals.data(), vals.size() * 4);
+      p.Align8();
+    }
+    // no instrs; sched sections
+    p.U32(tasks.size()); p.U32(n_entries); p.U32(0); p.U32(n_lanes);
+    p.Raw(tasks.data(), tasks.size() * sizeof(VmTask));
+    uint32_t off = 0;
+    for (size_t l = 0; l < lanes.size(); ++l) {
+      p.U32(off); p.U32(lanes[l].size());
+      p.U32(root_lens[l] ? root_lens[l] : (uint32_t)lanes[l].size());
+      p.U32(0);
+      off += lanes[l].size();
+    }
+    p.Align8();
+    for (auto& l : lanes) p.Raw(l.data(), l.size() * sizeof(VmEntry));
+    return p.b;
+  }
+};
 
+int RunProg(OclRuntime* rt, Builder& bld,
+            const std::vector<const void*>& ins,
+            std::vector<std::vector<uint8_t>>* outs) {
   std::string err;
+  auto bytes = bld.Serialize();
   VmProgram prog;
-  if (!VmProgram::Parse(p.b.data(), p.b.size(), &prog, &err)) {
+  if (!VmProgram::Parse(bytes.data(), bytes.size(), &prog, &err)) {
     std::fprintf(stderr, "FAIL parse: %s\n", err.c_str());
     return 1;
   }
-  auto rt = OclRuntime::Create(&err);
-  if (!rt) { std::fprintf(stderr, "FAIL runtime: %s\n", err.c_str()); return 1; }
-  std::printf("device: %s / %s\n", rt->info().platform_name.c_str(),
-              rt->info().device_name.c_str());
-  auto lp = LoadedProgram::Load(rt.get(), std::move(prog), &err);
+  auto lp = LoadedProgram::Load(rt, std::move(prog), &err);
   if (!lp) { std::fprintf(stderr, "FAIL load: %s\n", err.c_str()); return 1; }
-
-  float a[N], b[N];
-  for (uint32_t i = 0; i < N; ++i) { a[i] = i + 1.0f; b[i] = 2.0f * i; }
-  std::vector<std::vector<uint8_t>> outputs;
-  if (!lp->Execute({a, b}, &outputs, &err)) {
+  if (!lp->Execute(ins, outs, &err)) {
     std::fprintf(stderr, "FAIL execute: %s\n", err.c_str());
     return 1;
   }
-  int bad = 0;
-  const float* out = reinterpret_cast<const float*>(outputs[0].data());
-  for (uint32_t i = 0; i < N; ++i) {
-    float want = (a[i] + b[i]) * a[i] * 8.0f;  // 2^3 from the while loop
-    if (out[i] != want) {
-      ++bad;
-      std::fprintf(stderr, "  out[%u]=%g want %g\n", i, out[i], want);
-    }
+  return 0;
+}
+
+}  // namespace
+
+int main() {
+  std::string err;
+  auto rt = OclRuntime::Create(&err);
+  if (!rt) { std::fprintf(stderr, "FAIL runtime: %s\n", err.c_str()); return 1; }
+  std::printf("device: %s / %s (%u lanes advertised)\n",
+              rt->info().platform_name.c_str(), rt->info().device_name.c_str(),
+              rt->ngroups());
+  int fails = 0;
+
+  {  // ---- A: c = (a+b)*a, 4 lanes, 2 levels ----
+    const uint32_t N = 1 << 16, LANES = 4;
+    const uint32_t TILES = (N + 16383) / 16384;  // 4
+    Builder b(LANES);
+    uint32_t ba = b.buf(N), bb = b.buf(N), bt = b.buf(N), bc = b.buf(N);
+    b.inputs = {ba, bb};
+    b.outputs = {bc};
+    b.in_dims = {{N}, {N}};
+    b.out_dims = {{N}};
+    uint32_t t0 = b.task({kTopEw, bt, ba, bb, 0 /*add*/, N, 0, 0});
+    uint32_t t1 = b.task({kTopEw, bc, bt, ba, 1 /*mul*/, N, 0, 0});
+    for (uint32_t l = 0; l < LANES && l < TILES; ++l)
+      b.ent(l, {t0, l, l + 1, FLAGN, 0, FLAGN, 0, 0});
+    b.barrier_all();
+    for (uint32_t l = 0; l < LANES && l < TILES; ++l)
+      b.ent(l, {t1, l, l + 1, FLAGN, 0, FLAGN, 0, 0});
+    b.barrier_all();
+
+    std::vector<float> a(N), bb_h(N);
+    for (uint32_t i = 0; i < N; ++i) { a[i] = i % 251; bb_h[i] = (i % 83) + 1; }
+    std::vector<std::vector<uint8_t>> outs;
+    if (RunProg(rt.get(), b, {a.data(), bb_h.data()}, &outs)) return 1;
+    const float* c = reinterpret_cast<const float*>(outs[0].data());
+    int bad = 0;
+    for (uint32_t i = 0; i < N; ++i)
+      if (c[i] != (a[i] + bb_h[i]) * a[i]) bad++;
+    std::printf("A two-level EW (4 lanes): %s (%d bad)\n",
+                bad ? "FAIL" : "PASS", bad);
+    fails += bad != 0;
   }
-  std::printf("runtime_test: %s\n", bad ? "FAIL" : "PASS");
-  return bad ? 1 : 0;
+
+  {  // ---- B: while (i < 10) { x += x; i += 1 } on 2 lanes ----
+    const uint32_t N = 1 << 15, LANES = 2;  // 2 tiles
+    Builder b(LANES);
+    uint32_t bx = b.buf(N), bi = b.buf(1), bk = b.buf(1), bone = b.buf(1),
+             bcond = b.buf(1);
+    b.inputs = {bx};
+    b.outputs = {bx};
+    b.in_dims = {{N}};
+    b.out_dims = {{N}};
+    b.consts = {{bi, {0.0f}}, {bk, {10.0f}}, {bone, {1.0f}}};
+    uint32_t tdbl = b.task({kTopEw, bx, bx, bx, 0 /*add*/, N, 0, 0});
+    uint32_t tinc = b.task({kTopEw, bi, bi, bone, 0 /*add*/, 1, 0, 0});
+    uint32_t tlts = b.task({kTopEw, bcond, bi, bk, 22 /*lts*/, 1, 0, 0});
+    // Per-lane streams: [0]=WHILE, [1]=cond entry, [2..4)=body entries.
+    // lane 0: cond = LTS; body = dbl tile 0 + inc.  lane 1: cond = NOP;
+    // body = dbl tile 1 + NOP (uniform lengths keep ranges simple).
+    VmEntry wh = {WHIL, /*cond_start=*/1, /*cond_len=*/1,
+                  /*body_start=*/2, /*body_len=*/2, /*cond buf id=*/bcond,
+                  0, 0};
+    b.ent(0, wh);
+    b.ent(0, {tlts, 0, 1, FLAGN, 0, FLAGN, 0, 0});
+    b.ent(0, {tdbl, 0, 1, FLAGN, 0, FLAGN, 0, 0});
+    b.ent(0, {tinc, 0, 1, FLAGN, 0, FLAGN, 0, 0});
+    b.ent(1, wh);
+    b.ent(1, {NOPE, 0, 0, FLAGN, 0, FLAGN, 0, 0});
+    b.ent(1, {tdbl, 1, 2, FLAGN, 0, FLAGN, 0, 0});
+    b.ent(1, {NOPE, 0, 0, FLAGN, 0, FLAGN, 0, 0});
+    b.root_lens[0] = 1;  // root = just the WHILE; cond/body live beyond it
+    b.root_lens[1] = 1;
+
+    std::vector<float> x(N);
+    for (uint32_t i = 0; i < N; ++i) x[i] = (i % 13) + 1;
+    std::vector<std::vector<uint8_t>> outs;
+    if (RunProg(rt.get(), b, {x.data()}, &outs)) return 1;
+    const float* xo = reinterpret_cast<const float*>(outs[0].data());
+    int bad = 0;
+    for (uint32_t i = 0; i < N; ++i)
+      if (xo[i] != x[i] * 1024.0f) bad++;
+    std::printf("B on-device while (2 lanes): %s (%d bad)\n",
+                bad ? "FAIL" : "PASS", bad);
+    fails += bad != 0;
+  }
+
+  std::printf("%s\n", fails ? "SOME FAILED" : "runtime_test: PASS");
+  return fails ? 1 : 0;
 }

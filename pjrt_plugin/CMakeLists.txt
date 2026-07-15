@@ -8,7 +8,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(OpenCL REQUIRED)
 
 # Embed kernels/vm.cl as a C string (recompiled when the .cl changes).
-set(VM_CL_IN ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vm.cl)
+set(VM_CL_IN ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vm2.cl)
 set(VM_CL_OUT ${CMAKE_CURRENT_BINARY_DIR}/vm_cl_source.h)
 add_custom_command(
   OUTPUT ${VM_CL_OUT}

@@ -66,13 +66,15 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
   };
 
   uint32_t magic, version, n_buffers, n_instrs, n_consts, main_len, n_inputs,
-      n_outputs;
+      n_outputs, n_aux, hpad;
   if (!r.U32(&magic) || !r.U32(&version)) return fail("truncated header");
   if (magic != 0x314D5056u) return fail("bad magic");
-  if (version != 1) return fail("unsupported version " + std::to_string(version));
+  if (version != 3)
+    return fail("unsupported version " + std::to_string(version) +
+                " (executor expects 3)");
   if (!r.U32(&n_buffers) || !r.U32(&n_instrs) || !r.U32(&n_consts) ||
       !r.U32(&main_len) || !r.U32(&n_inputs) || !r.U32(&n_outputs) ||
-      !r.U64(&out->arena_bytes))
+      !r.U32(&n_aux) || !r.U32(&hpad) || !r.U64(&out->arena_bytes))
     return fail("truncated header");
   out->main_len = main_len;
 
@@ -114,6 +116,10 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
   if (!read_shapes(n_inputs, &out->input_dims)) return fail("bad input shapes");
   if (!read_shapes(n_outputs, &out->output_dims)) return fail("bad output shapes");
 
+  out->aux.resize(n_aux);
+  if (n_aux && !r.Bytes(out->aux.data(), n_aux * 4)) return fail("truncated aux");
+  if (!r.Align8()) return fail("aux align");
+
   out->consts.resize(n_consts);
   for (auto& [id, bytes] : out->consts) {
     uint32_t byte_len;
@@ -129,24 +135,66 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
   out->instrs.resize(n_instrs);
   if (n_instrs && !r.Bytes(out->instrs.data(), n_instrs * sizeof(VmInstr)))
     return fail("truncated instructions");
+  if (!r.Align8()) return fail("instr align");
 
-  // Validate instructions (buffer ids, ranges) before any id->offset patching.
-  for (const VmInstr& ins : out->instrs) {
-    if (ins.op > kMaxOp) return fail("unknown opcode " + std::to_string(ins.op));
-    if (ins.op == kWhile) {
-      if (ins.dst >= n_buffers) return fail("WHILE cond id out of range");
-      if (uint64_t(ins.a) + ins.b > n_instrs || uint64_t(ins.n) + ins.imm > n_instrs)
-        return fail("WHILE sub-list out of range");
-    } else if (ins.op != kNop) {
-      for (uint32_t id : {ins.dst, ins.a, ins.b})
-        if (id >= n_buffers) return fail("buffer id out of range");
-      for (uint32_t id : {ins.dst, ins.a, ins.b})
-        if (uint64_t(ins.n) * 4 > out->buffers[id].size_bytes &&
-            (ins.op == kAddF32 || ins.op == kMulF32 || ins.op == kSubF32 ||
-             (id == ins.dst)))
-          return fail("instruction n exceeds buffer size");
-    }
+  // ---- v2.1 schedule sections: what the VLIW engine actually executes ----
+  uint32_t n_tasks, n_entries;
+  if (!r.U32(&n_tasks) || !r.U32(&n_entries) || !r.U32(&out->n_flags) ||
+      !r.U32(&out->n_lanes))
+    return fail("truncated sched header");
+  if (out->n_lanes == 0 || out->n_lanes > 4096) return fail("bad n_lanes");
+
+  out->tasks.resize(n_tasks);
+  if (n_tasks && !r.Bytes(out->tasks.data(), n_tasks * sizeof(VmTask)))
+    return fail("truncated tasks");
+  out->lane_tab.resize(out->n_lanes);
+  for (auto& l : out->lane_tab)
+    if (!r.U32(&l.off) || !r.U32(&l.count) || !r.U32(&l.root_len) ||
+        !r.U32(&l.pad) || l.root_len > l.count)
+      return fail("truncated/bad lane tab");
+  if (!r.Align8()) return fail("lane tab align");
+  out->entries.resize(n_entries);
+  if (n_entries && !r.Bytes(out->entries.data(), n_entries * sizeof(VmEntry)))
+    return fail("truncated entries");
+
+  // Validate schedule.
+  for (const VmTask& t : out->tasks) {
+    if (t.tile_op > kMaxTileOp)
+      return fail("unknown tile_op " + std::to_string(t.tile_op));
+    for (uint32_t id : {t.dst, t.a, t.b})
+      if (id >= n_buffers) return fail("task buffer id out of range");
+    if (t.tile_op == kTopEw && t.p0 == kEwSubSelect && t.p3 >= n_buffers)
+      return fail("select pred id out of range");
+    if ((t.tile_op == kTopGather || t.tile_op == kTopIotaDim) &&
+        t.p0 >= n_aux)
+      return fail("task aux offset out of range");
   }
+  uint32_t barrier_count_ref = 0;
+  bool first_lane = true;
+  for (auto& l : out->lane_tab) {
+    const uint32_t off = l.off, count = l.count;
+    if (uint64_t(off) + count > n_entries) return fail("lane range oob");
+    uint32_t barriers = 0;
+    for (uint32_t e = off; e < off + count; ++e) {
+      const VmEntry& en = out->entries[e];
+      if (en.task == kEntBarrier) barriers++;
+      else if (en.task == kEntWhile || en.task == kEntIf) {
+        if (en.signal_flag >= n_buffers)
+          return fail("control cond buffer id out of range");
+        if (uint64_t(en.tile_lo) + en.tile_hi > count ||
+            uint64_t(en.wait_flag) + en.wait_count > count)
+          return fail("control sub-range out of lane stream");
+      } else if (en.task != kEntNop && en.task >= n_tasks) {
+        return fail("entry task index out of range");
+      }
+    }
+    if (first_lane) { barrier_count_ref = barriers; first_lane = false; }
+    else if (barriers != barrier_count_ref)
+      return fail("non-uniform top-level barrier counts across lanes");
+    if (barriers > out->n_barriers) out->n_barriers = barriers;
+  }
+  // Loops multiply barrier count at runtime; reserve generous stats space.
+  out->n_barriers = out->n_barriers ? out->n_barriers : 1;
   return true;
 }
 
@@ -245,15 +293,17 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
     log.resize(std::min(log_size, log.size()));
     return fail("vm.cl build failed:\n" + log);
   }
-  rt->vm_kernel_ = clCreateKernel(rt->program_, "vm", &cerr);
+  rt->vm_kernel_ = clCreateKernel(rt->program_, "vm2", &cerr);
   if (cerr != CL_SUCCESS) return fail("clCreateKernel: " + std::to_string(cerr));
 
-  // poc/01 co-residency rule; overridable for experiments.
-  rt->ngroups_ = rt->info_.compute_units ? rt->info_.compute_units : 1;
-  if (const char* g = std::getenv("PJRT_OCL_VM_GROUPS"); g && g[0])
+  // Lanes advertised to the python scheduler (PJRT_OCL_NLANES). Validated
+  // co-residency regime: <= 3x CUs at 256 threads (poc/01, poc/04); GPUs get
+  // 2 lanes/CU, CPUs 1/CU.
+  cl_uint cu = rt->info_.compute_units ? rt->info_.compute_units : 1;
+  rt->ngroups_ = rt->info_.is_gpu ? 2 * cu : cu;
+  if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
-  if (const char* l = std::getenv("PJRT_OCL_VM_LOCAL"); l && l[0])
-    rt->local_size_ = std::max(1, std::atoi(l));
+  rt->local_size_ = 256;
   return rt;
 }
 
@@ -284,31 +334,54 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
                               &cerr);
   if (cerr != CL_SUCCESS) return fail("arena alloc: " + std::to_string(cerr));
 
-  // Patch buffer-table indices -> f32 element offsets (WHILE: dst only).
-  std::vector<VmInstr> patched = p.instrs;
-  for (VmInstr& ins : patched) {
-    auto elem_off = [&](uint32_t id) {
-      return static_cast<uint32_t>(p.buffers[id].arena_byte_offset / 4);
-    };
-    if (ins.op == kWhile) {
-      ins.dst = elem_off(ins.dst);
-    } else if (ins.op != kNop) {
-      ins.dst = elem_off(ins.dst);
-      ins.a = elem_off(ins.a);
-      ins.b = elem_off(ins.b);
-    }
-  }
-  lp->instr_buf_ = clCreateBuffer(
-      rt->ctx(), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-      std::max<size_t>(patched.size(), 1) * sizeof(VmInstr),
-      patched.empty() ? std::vector<VmInstr>(1).data() : patched.data(), &cerr);
-  if (cerr != CL_SUCCESS) return fail("instr alloc: " + std::to_string(cerr));
+  auto elem_off = [&](uint32_t id) {
+    return static_cast<uint32_t>(p.buffers[id].arena_byte_offset / 4);
+  };
+  auto make_buf = [&](const void* data, size_t bytes, const char* what) {
+    static const uint64_t kZero = 0;
+    cl_mem m = clCreateBuffer(
+        rt->ctx(), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        bytes ? bytes : 8, bytes ? const_cast<void*>(data)
+                                 : const_cast<uint64_t*>(&kZero), &cerr);
+    if (cerr != CL_SUCCESS)
+      *err = std::string("LoadedProgram: ") + what + " alloc: " +
+             std::to_string(cerr);
+    return m;
+  };
 
-  uint32_t barinit[2] = {0, 0};
+  // Patch task buffer ids -> f32 element offsets (+ select pred in p3).
+  std::vector<VmTask> tasks = p.tasks;
+  for (VmTask& t : tasks) {
+    t.dst = elem_off(t.dst);
+    t.a = elem_off(t.a);
+    t.b = elem_off(t.b);
+    if (t.tile_op == kTopEw && t.p0 == kEwSubSelect) t.p3 = elem_off(t.p3);
+  }
+  // Patch control-entry cond buffer ids.
+  std::vector<VmEntry> entries = p.entries;
+  for (VmEntry& en : entries)
+    if (en.task == kEntWhile || en.task == kEntIf)
+      en.signal_flag = elem_off(en.signal_flag);
+  lp->tasks_buf_ = make_buf(tasks.data(), tasks.size() * sizeof(VmTask), "tasks");
+  if (!lp->tasks_buf_) return nullptr;
+  lp->entries_buf_ =
+      make_buf(entries.data(), entries.size() * sizeof(VmEntry), "entries");
+  if (!lp->entries_buf_) return nullptr;
+  lp->lane_tab_buf_ = make_buf(p.lane_tab.data(),
+                               p.lane_tab.size() * sizeof(VmProgram::Lane),
+                               "lane_tab");
+  if (!lp->lane_tab_buf_) return nullptr;
+  lp->aux_buf_ = make_buf(p.aux.data(), p.aux.size() * 4, "aux");
+  if (!lp->aux_buf_) return nullptr;
+
+  uint32_t barinit[3] = {0, 0, 0};
   lp->bar_buf_ = clCreateBuffer(rt->ctx(),
                                 CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                 sizeof(barinit), barinit, &cerr);
   if (cerr != CL_SUCCESS) return fail("bar alloc: " + std::to_string(cerr));
+  lp->stats_buf_ = clCreateBuffer(rt->ctx(), CL_MEM_READ_WRITE,
+                                  4096u * p.n_lanes * 4, nullptr, &cerr);
+  if (cerr != CL_SUCCESS) return fail("stats alloc: " + std::to_string(cerr));
 
   // Upload constants once.
   for (const auto& [id, bytes] : p.consts) {
@@ -322,9 +395,9 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
 }
 
 LoadedProgram::~LoadedProgram() {
-  if (arena_) clReleaseMemObject(arena_);
-  if (instr_buf_) clReleaseMemObject(instr_buf_);
-  if (bar_buf_) clReleaseMemObject(bar_buf_);
+  for (cl_mem m : {arena_, aux_buf_, tasks_buf_, entries_buf_, lane_tab_buf_,
+                   bar_buf_, stats_buf_})
+    if (m) clReleaseMemObject(m);
 }
 
 bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
@@ -350,15 +423,25 @@ bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
     }
   }
 
-  if (p.main_len) {
+  if (!p.entries.empty()) {
+    // Reset barrier/rank state each execute.
+    const uint32_t barinit[3] = {0, 0, 0};
+    if (clEnqueueWriteBuffer(q, bar_buf_, CL_FALSE, 0, sizeof(barinit),
+                             barinit, 0, nullptr, nullptr) != CL_SUCCESS) {
+      *err = "Execute: bar reset failed";
+      return false;
+    }
     cl_kernel k = rt_->vm_kernel();
-    cl_uint main_len = p.main_len, ngroups = rt_->ngroups();
-    size_t lsz = rt_->local_size(), gsz = ngroups * lsz;
+    cl_uint nlanes = p.n_lanes;
+    size_t lsz = 256, gsz = size_t{nlanes} * lsz;
     clSetKernelArg(k, 0, sizeof(arena_), &arena_);
-    clSetKernelArg(k, 1, sizeof(instr_buf_), &instr_buf_);
-    clSetKernelArg(k, 2, sizeof(main_len), &main_len);
-    clSetKernelArg(k, 3, sizeof(bar_buf_), &bar_buf_);
-    clSetKernelArg(k, 4, sizeof(ngroups), &ngroups);
+    clSetKernelArg(k, 1, sizeof(aux_buf_), &aux_buf_);
+    clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
+    clSetKernelArg(k, 3, sizeof(entries_buf_), &entries_buf_);
+    clSetKernelArg(k, 4, sizeof(lane_tab_buf_), &lane_tab_buf_);
+    clSetKernelArg(k, 5, sizeof(bar_buf_), &bar_buf_);
+    clSetKernelArg(k, 6, sizeof(nlanes), &nlanes);
+    clSetKernelArg(k, 7, sizeof(stats_buf_), &stats_buf_);
     if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
                                nullptr) != CL_SUCCESS) {
       *err = "Execute: kernel launch failed";
@@ -387,11 +470,11 @@ bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
 
 // ---- Lowering subprocess ----------------------------------------------------
 
-bool RunLoweringSubprocess(const std::string& python_exe,
-                           const std::string& lower_service_path,
-                           const std::vector<uint8_t>& input,
-                           std::vector<uint8_t>* output, std::string* err,
-                           bool* unsupported) {
+bool RunLoweringSubprocess(
+    const std::string& python_exe, const std::string& lower_service_path,
+    const std::vector<uint8_t>& input,
+    const std::vector<std::pair<std::string, std::string>>& env,
+    std::vector<uint8_t>* output, std::string* err, bool* unsupported) {
   *unsupported = false;
   int in_pipe[2], out_pipe[2], err_pipe[2];
   if (pipe(in_pipe) || pipe(out_pipe) || pipe(err_pipe)) {
@@ -404,6 +487,7 @@ bool RunLoweringSubprocess(const std::string& python_exe,
     return false;
   }
   if (pid == 0) {
+    for (const auto& [k, v] : env) setenv(k.c_str(), v.c_str(), 1);
     dup2(in_pipe[0], 0);
     dup2(out_pipe[1], 1);
     dup2(err_pipe[1], 2);

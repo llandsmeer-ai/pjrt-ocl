@@ -27,6 +27,28 @@ enum VmOp : uint32_t {
   kMaxOp = kWhile,
 };
 
+// Schedule sections (v2.1 spec in docs/vmprogram.md).
+struct VmTask {
+  uint32_t tile_op, dst, a, b, p0, p1, p2, p3;
+};
+static_assert(sizeof(VmTask) == 32);
+
+struct VmEntry {
+  uint32_t task, tile_lo, tile_hi, wait_flag, wait_count, signal_flag,
+      slots, pad;
+};
+static_assert(sizeof(VmEntry) == 32);
+
+enum TileOp : uint32_t {
+  kTopEw = 0, kTopMma = 1, kTopGather = 2, kTopRedPart = 3, kTopRedComb = 4,
+  kTopIotaDim = 5, kMaxTileOp = kTopIotaDim,
+};
+enum EntSentinel : uint32_t {
+  kEntNop = 0xFFFFFFFFu, kEntBarrier = 0xFFFFFFFEu,
+  kEntWhile = 0xFFFFFFFDu, kEntIf = 0xFFFFFFFCu,
+};
+constexpr uint32_t kEwSubSelect = 21;
+
 struct VmProgram {
   struct Buffer {
     uint64_t arena_byte_offset = 0;
@@ -41,9 +63,19 @@ struct VmProgram {
   std::vector<std::vector<int64_t>> input_dims;   // parallel to inputs
   std::vector<std::vector<int64_t>> output_dims;  // parallel to outputs
   std::vector<std::pair<uint32_t, std::vector<uint8_t>>> consts;
-  std::vector<VmInstr> instrs;
+  std::vector<int32_t> aux;      // v2: shape/stride metadata pool
+  std::vector<VmInstr> instrs;   // tensor ISA (reference semantics)
+  // v2.1 schedule sections — what the VLIW engine executes.
+  uint32_t n_flags = 0;
+  uint32_t n_lanes = 0;
+  std::vector<VmTask> tasks;
+  struct Lane { uint32_t off, count, root_len, pad; };
+  std::vector<Lane> lane_tab;
+  std::vector<VmEntry> entries;
+  uint32_t n_barriers = 0;  // max barrier count (stats sizing), derived
 
-  // Parses + validates a serialized VMProgram. Returns false with *err set.
+  // Parses + validates a serialized VMProgram (version 3). Returns false
+  // with *err set.
   static bool Parse(const uint8_t* data, size_t len, VmProgram* out,
                     std::string* err);
 };
@@ -107,20 +139,26 @@ class LoadedProgram {
   OclRuntime* rt_ = nullptr;  // borrowed; client outlives executables
   VmProgram prog_;
   cl_mem arena_ = nullptr;
-  cl_mem instr_buf_ = nullptr;
+  cl_mem aux_buf_ = nullptr;
+  cl_mem tasks_buf_ = nullptr;
+  cl_mem entries_buf_ = nullptr;
+  cl_mem lane_tab_buf_ = nullptr;
   cl_mem bar_buf_ = nullptr;
+  cl_mem stats_buf_ = nullptr;
 };
 
 // ---- Lowering subprocess ----------------------------------------------------
 
-// Runs `python_exe lower_service_path` with `input` on stdin. Returns true and
-// fills *output (stdout bytes) on exit 0; else false with *err set from stderr
+// Runs `python_exe lower_service_path` with `input` on stdin, with `env`
+// key=value pairs added to the child environment (device config for the
+// scheduler: PJRT_OCL_NLANES, PJRT_OCL_COST_TABLE). Returns true and fills
+// *output (stdout bytes) on exit 0; else false with *err set from stderr
 // (JSON {error,message} passed through) and *unsupported=true on exit 2.
-bool RunLoweringSubprocess(const std::string& python_exe,
-                           const std::string& lower_service_path,
-                           const std::vector<uint8_t>& input,
-                           std::vector<uint8_t>* output, std::string* err,
-                           bool* unsupported);
+bool RunLoweringSubprocess(
+    const std::string& python_exe, const std::string& lower_service_path,
+    const std::vector<uint8_t>& input,
+    const std::vector<std::pair<std::string, std::string>>& env,
+    std::vector<uint8_t>* output, std::string* err, bool* unsupported);
 
 }  // namespace pjrt_ocl
 

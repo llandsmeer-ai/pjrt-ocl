@@ -9,7 +9,12 @@ Header gains nothing; schedule sections follow the instruction array, 8B-aligned
 ```
 sched header (16B): { n_tasks u32, n_entries u32, n_flags u32, n_lanes u32 }
 tasks:   n_tasks   × 32B { tile_op u32, dst u32, a u32, b u32, p0 u32, p1 u32, p2 u32, p3 u32 }
-lane tab: n_lanes  ×  8B { entry_off u32, entry_count u32 }   (offsets into entries[])
+lane tab: n_lanes  × 16B { entry_off u32, entry_count u32, root_len u32, pad u32 }
+  - entry_count = the lane's WHOLE stream storage (root + all control sub-ranges);
+  - root_len = length of the TOP-LEVEL walk, `root_len <= entry_count`. WHILE/IF sub-ranges
+    MUST live in [root_len, entry_count) (or nested further) — the interpreter's root frame
+    walks [0, root_len) only. (Added after runtime_test B caught the parent walking into
+    sub-range entries — do not place sub-ranges inside any parent's walk range.)
 entries: n_entries × 32B { task u32, tile_lo u32, tile_hi u32,
                            wait_flag u32, wait_count u32, signal_flag u32,
                            slots u32 (reserved, 0 in v0 — 4×8b tile-slot refs, tile-isa v1.1),
