@@ -338,25 +338,20 @@ def test_e2e_direct_script_invocation():
 
 def test_unsupported_op_exit2_json():
     import jax.numpy as jnp
+    import jax.lax as lax
 
-    def f(x, y):
-        # stablehlo.concatenate: beyond current coverage (docs/coverage-
-        # baseline.md). NOTE: jnp.sin used to be the example op here, but
-        # elementwise coverage work added stablehlo.sine support, so it no
-        # longer exercises this path — swapped for concatenate, which (unlike
-        # e.g. jnp.sort/jnp.pad) lowers to a single un-wrapped stablehlo op
-        # with no func.call indirection, keeping the error message assertion
-        # below meaningful.
-        return jnp.concatenate([x, y])
+    def f(x):
+        # stablehlo.sort: beyond current coverage. (The example op here has been
+        # updated repeatedly as coverage grew: sin -> concatenate -> sort.)
+        return lax.sort(x)
 
-    artifact = serialize_as_plugin_would_receive(
-        f, jnp.zeros(8, jnp.float32), jnp.zeros(8, jnp.float32))
+    artifact = serialize_as_plugin_would_receive(f, jnp.zeros(8, jnp.float32))
     proc = run_service(artifact)
     assert proc.returncode == 2
     assert proc.stdout == b""
     err = json.loads(proc.stderr.decode())
     assert err["error"] == "LoweringError"
-    assert "stablehlo.concatenate" in err["message"]
+    assert "stablehlo.sort" in err["message"]
     assert "stablehlo.add" in err["message"]  # known-ops list included
 
 

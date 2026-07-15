@@ -132,6 +132,7 @@ OP_OR = 43               # stablehlo.or
 OP_XOR = 44              # stablehlo.xor
 OP_NOT = 45              # stablehlo.not
 OP_IS_FINITE = 46        # stablehlo.is_finite (float -> bool)
+OP_SCATTER = 47          # strided scatter (concatenate/pad); aux = rank,in_dims,out_strides,out_off
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",

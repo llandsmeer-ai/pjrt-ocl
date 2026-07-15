@@ -42,6 +42,7 @@ TILE_GATHER = 2
 TILE_REDUCE_PART = 3
 TILE_REDUCE_COMB = 4
 TILE_IOTA_DIM = 5
+TILE_SCATTER = 6      # strided scatter: dst[out_off + affine(i)] = a[i]
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -140,7 +141,7 @@ class Task:
     adtype: int = 0       # DT_* operand dtype (compare/convert differ from dtype)
 
     def n_tiles(self) -> int:
-        if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM):
+        if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM, TILE_SCATTER):
             return max(1, math.ceil(self.p1 / TILE_SIZE))
         if self.tile_op == TILE_MMA:
             return math.ceil(self.p0 / MMA_T) * math.ceil(self.p1 / MMA_T)

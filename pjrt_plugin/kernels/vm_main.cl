@@ -23,6 +23,7 @@ static void exec_tiles(__global uchar *arena, __global const int *aux,
         case TOP_RED_PART: reduce_part_tile(arena, t, tile, As, dt, lid, lsz); break;
         case TOP_RED_COMB: reduce_comb_tile(arena, t, dt, lid); break;
         case TOP_IOTA_DIM: iota_tile(arena, aux, t, tile, lid, lsz); break;
+        case TOP_SCATTER:  scatter_tile(arena, aux, t, tile, esz, lid, lsz); break;
         default: break;
         }
     }

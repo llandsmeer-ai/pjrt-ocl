@@ -46,7 +46,7 @@ static ushort f32_to_bf16(float f)
 #define STB(base, i, v) (AP(ushort, (base))[i] = f32_to_bf16(v))
 
 enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
-       TOP_RED_COMB = 4, TOP_IOTA_DIM = 5 };
+       TOP_RED_COMB = 4, TOP_IOTA_DIM = 5, TOP_SCATTER = 6 };
 enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,
        SUB_ABS, SUB_FLOOR, SUB_CEIL, SUB_SIGN, SUB_FILL, SUB_IOTA_FLAT,
