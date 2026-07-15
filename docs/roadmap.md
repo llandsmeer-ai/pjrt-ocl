@@ -45,6 +45,15 @@ dispatches on a per-task dtype. Alignment is fine (arena buffers are 64B-aligned
 - **Tier 3 — no native OpenCL type, needs emulation**: `bf16` (store u16, up-convert to f32 for
   math), `complex64/128` (pairs of f32/f64 — every op splits into real/imag). Significant.
 
+### TODO — refresh README.md once coverage work settles (user, 2026-07-15)
+
+README currently says "dtypes in progress / f32 works today". After the dtype system landed
+(i32/u32/i64/bool/f64/f16/bf16 + convert/compare/select) and the in-flight op batch merges,
+update the README: the supported-ops table, the dtype line (now a full 1/2/4/8-byte matrix, f16/
+bf16 portable via f32-compute), and the limitations (drop f32-only framing; keep the PoCL-barrier
++ tensor-core-ceiling caveats). Do this after the op-coverage agents are merged and the corpus is
+re-measured — not before, so the numbers/tables are accurate.
+
 ### TODO — native f16 via cl_khr_fp16 on supported platforms (user, 2026-07-15)
 
 f16/bf16 currently do 2-byte storage + **f32 compute** (portable, no extension: vload_half/
