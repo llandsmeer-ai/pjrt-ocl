@@ -156,6 +156,18 @@ measured bubble % improves; (e) perf vs serial megakernel and streamed launches 
   double-buffering 0% (NVIDIA hides latency at 2 resident wg); interleaved µtile map REGRESSED.
   Need warm GPU clocks to measure (2.1 vs 4.3 cold/warm). Next for 30+: float4 register
   accumulators, subgroup broadcast, -cl-mad-enable. This is the MMA_TILE the VM adopts in Phase 3.
+  ✅ **ADOPTED into vm2.cl 2026-07-15**: chose the 64×64 / 4×4-µtile / BK16 variant (poc/06
+  step 2, ~17 TFLOPS pure-compute, 4× over the 16×16 naive) — NOT the 128×128/8×8 champion,
+  because it's a SHARED megakernel: the 8×8's 64 accumulators would spike register pressure for
+  every op. Measured tax even so: vm2 f32 vregs 377→545 (PTX virtual) — the ceiling-1 occupancy
+  cost is now paid by all ops. Real fix is typed lanes (put MMA in its own kernel). All 112
+  tests still pass (dot tile_sim tracks MMA_T=64 automatically).
+  ⚠️ **End-to-end finding**: a LONE large matmul through the VLIW engine is overhead/occupancy-
+  bound — 4096³ measures ~2 TFLOPS end-to-end (vs 17 pure-compute): H2D/D2H per execute (no
+  donation yet) + 376 persistent lanes with barrier overhead for a single task spread thin. The
+  VLIW engine's strength is HETEROGENEOUS co-scheduling, not one big op; single-big-op segments
+  want the streamed-launch second engine (decision #1 🅱️) at full occupancy. Motivates engine
+  routing per segment class. Buffer donation (M5) will also cut the transfer overhead.
 - Ceiling 3 (fundamental): matrix units unreachable from OpenCL on NVIDIA (tensor cores) and
   AMD (MFMA); Intel exposes cl_intel_subgroup_matrix_multiply_accumulate. SIMT fp32 rate is our
   matmul ceiling ⇒ ~4–8x behind tensor-core TF32/BF16 on matmul-heavy ML on NVIDIA. Per-vendor

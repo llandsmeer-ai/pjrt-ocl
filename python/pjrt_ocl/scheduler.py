@@ -34,7 +34,7 @@ from . import opsem
 # --- tile-op vocabulary + sentinels (docs/vmprogram.md v2.1 table) ----------
 
 TILE_SIZE = 16384          # EW tile size (TS)
-MMA_T = 16                 # MMA output tile edge
+MMA_T = 64                 # MMA output tile edge (vm2.cl MMA_TM/MMA_TN)
 
 TILE_EW = 0
 TILE_MMA = 1

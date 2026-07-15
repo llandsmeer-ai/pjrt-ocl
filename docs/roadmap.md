@@ -14,8 +14,13 @@ performance mode. Work autonomously. This file is the plan of record for continu
   112 pytest pass through BOTH validators; dot/reduce/iota/fused-relu(matmul) verified on
   NVIDIA + PoCL hardware. Scoreboard: tests/SCOREBOARD.md. Next ops: reshape/slice/concat
   (GATHER variants), partial-axis reduce, if/case, batched dot.
-- **Phase 3 (perf) pending**: adopt poc/06 fast MMA (26 TFLOPS) into vm2 MMA_TILE; calibration
-  slope-fit; slot-file fusion; typed lanes (poc/05).
+- **Phase 3 (perf) STARTED**: ✅ fast MMA adopted into vm2 (64×64/4×4/BK16, ~17 TFLOPS
+  pure-compute, 4× over naive; vregs 377→545 = accepted ceiling-1 tax). Findings recorded in
+  tile-isa.md: (a) shared-megakernel register bloat → typed lanes is the real fix; (b) a lone
+  big matmul is overhead/occupancy-bound end-to-end (~2 TFLOPS @4096) → wants the streamed-launch
+  engine + buffer donation. REMAINING: engine routing (VLIW for heterogeneous segments,
+  streamed-launch for single-big-op), buffer donation (cut H2D/D2H), calibration slope-fit,
+  slot-file fusion, typed lanes integration (poc/05), then 128×128 MMA behind typed lanes.
 - Merged PoCs this session: poc/04 (VLIW), poc/05 (typed-lanes viable), poc/06 (fast MMA).
 
 ## Phase 1 — VLIW engine in the real plugin (main session, critical path)
