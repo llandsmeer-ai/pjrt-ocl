@@ -7,3 +7,4 @@ editing the core files. Add a new family by creating pjrt_ocl/ops/<name>.py
 and importing it here.
 """
 from . import shape  # noqa: F401  (broadcast_in_dim, transpose, reshape)
+from . import dot  # noqa: F401  (dot_general — plain 2D matmul via TILE_MMA)
