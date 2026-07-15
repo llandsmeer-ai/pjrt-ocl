@@ -8,3 +8,4 @@ and importing it here.
 """
 from . import shape  # noqa: F401  (broadcast_in_dim, transpose, reshape)
 from . import elementwise  # noqa: F401  (div/max/min/pow, unary, compare, select)
+from . import dot  # noqa: F401  (dot_general — plain 2D matmul via TILE_MMA)

@@ -222,3 +222,55 @@ cost-table parsing, region-op rejection.
 - Once real int dtypes / non-EW tile ops land, revisit the cost table's role (it becomes load-
   bearing) and the aux-pool wiring (GATHER/REDUCE/DOT/IOTA_DIM populate it — n_aux > 0 path is
   written and reader-validated but currently unexercised).
+
+## ops/dot.py — dot_general (plain 2D matmul) — Phase 2 (2026-07-15)
+
+New op-family module `pjrt_ocl/ops/dot.py` (+ `tests/test_ops_dot.py`, `from . import dot` in
+`ops/__init__.py`). Targets the EXISTING `vm2.cl` `mma_tile` (plain row-major SGEMM), not the
+future fast MMA kernel.
+
+### Supported vs rejected (dot_dimension_numbers)
+
+Only the canonical plain 2D matmul `C[M,N] = A[M,K] @ B[K,N]`:
+- SUPPORTED: lhs rank 2, rhs rank 2, `lhs_contracting=[1]`, `rhs_contracting=[0]`,
+  `lhs_batching=[]`, `rhs_batching=[]`. `a @ b` on 2D jax arrays lowers to exactly these.
+- REJECTED with `LoweringError` (message names the numbers): any batching dims, non-canonical
+  contracting axes (e.g. `[0]x[1]`, which would need an operand transpose — a separate GATHER
+  family), or rank != 2. Verified: rank-3 `jnp.matmul` lowers to `batching_dims=[0]x[0],
+  contracting_dims=[2]x[1]` → rejected; a rank-3 `tensordot` also rejected.
+
+### M/N/K encoding decision (Instr fields)
+
+The device `mma_tile` reads dims as LITERALS from the scheduled task (`M=t.p0, N=t.p1, K=t.p2`),
+so `to_task(ins)` must yield literal M,N,K. But `to_task` gets only the `Instr` — no `rt`, so it
+CANNOT dereference the aux pool; and `vmreader.parse` bounds-checks `Instr.aux <= n_aux`, so a raw
+K cannot ride in `aux` either (would fail parse when n_aux < K). An `Instr` has just two free
+scalar fields once dst/a/b carry the buffers: `n` and `imm`. Three dims → two fields → pack:
+
+    Instr.n = M ;  Instr.imm = (N << 16) | K ;  Instr.aux = 0
+    decode:  M = ins.n ;  N = ins.imm >> 16 ;  K = ins.imm & 0xFFFF
+
+`N, K > 0xFFFF` raise LoweringError (never silently corrupt the packing); M is a full u32.
+This deviates from docs/vmprogram.md's DOT row (aux=[M,N,K], n=M*N) — that form is unusable here
+because to_task has no pool access, and the C++ engine never reads the DOT *tensor* Instr anyway
+(it consumes the scheduled Task p0/p1/p2). The Instr encoding therefore only has to satisfy our
+own numpy interp + scheduler, and it is the single source of truth for both. Chose NOT to touch
+vmreader/scheduler/docs (scope: one family module only).
+
+### Validators
+
+- interp (validator a): `C = (A.reshape(M,K) @ B.reshape(K,N)).ravel()`.
+- tile_sim (validator b, TILE_MMA): mirrors `mma_tile` tile indexing exactly —
+  `tiles_n = ceil(N/16)`, `tr = tile//tiles_n`, `tc = tile%tiles_n`, fills
+  `C[tr*16:.., tc*16:..]` (clipped to M,N) `= A_rows @ B_cols` for tiles in `[tile_lo, tile_hi)`.
+
+### Verified
+
+`.venv/bin/python -m pytest tests/test_ops_dot.py -q` → **17 passed**; full `tests/ -q` → **49
+passed, 2 skipped** (the 2 skips are the plugin-not-built e2e cases, pre-existing). Ran with the
+worktree's python/ on PYTHONPATH (main venv's jaxlib — the worktree's own `.venv` has a partial,
+broken jaxlib copy; `pjrt_ocl.__file__` confirmed resolving into the worktree). Non-16-multiple
+correctness explicitly covered: shapes (3,4,5),(17,17,17),(33,17,3),(17,33,64),(3,64,3), etc. —
+ragged M, N, and K edges all match the CPU backend through BOTH validators (integer-valued f32,
+K<=64, so products are exact). Also: matmul→add, matmul→scale (const pool), matmul-by-identity,
+chained `(a@b)@c` (two MMA tasks across a barrier level).
