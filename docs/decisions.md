@@ -89,8 +89,8 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
   each — it's a timeline, not a benchmark; (b) the GPU megakernel is NOT per-entry
   observable from the host (only the existing barrier arrival-rank stats), so traces
   always measure the host-dispatch engine. Findings from the `diamond` example
-  (matmul ∥ EW chain, then join): PoCL runs level 0 with lanes 5–7 (EW) 98–99% idle —
-  an MMA tile costs ~25× an EW tile there vs the unit-cost default (53% of lane-time
+  (matmul ∥ EW chain, then join): PoCL runs level 0 with lanes 5–7 (EW) 97–98% idle —
+  an MMA tile costs ~25× an EW tile there vs the unit-cost default (~50% of lane-time
   idle overall); NVIDIA's level 0 is nearly flat (ratio ≈ 1). Same schedule, opposite
   balance — reconfirms measure-don't-assume; the cost-table (`PJRT_OCL_COST_TABLE`)
   is the rebalancing lever. Verified: runtime_test PoCL+NVIDIA PASS, 197 pytest pass,
