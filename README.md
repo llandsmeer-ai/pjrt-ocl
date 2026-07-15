@@ -125,6 +125,36 @@ f16/bf16 use 2-byte storage with f32 compute (portable, no `cl_khr_fp16` require
 
 Anything unsupported raises a clear `LoweringError` naming the op.
 
+## Performance
+
+Correctness comes first; performance is early. Below is per-op wall-clock vs
+problem size N — **our OpenCL backend against JAX's native CUDA (XLA + cuBLAS)
+on the same GPU** (NVIDIA RTX PRO 6000 Blackwell), so it's an apples-to-apples
+GPU-vs-GPU comparison of the VM against a production compiler.
+
+![ours (OpenCL) vs JAX CUDA, per-op N-vs-time](docs/bench_plot.png)
+
+Takeaways (higher = slower; both axes log):
+
+- **Small sizes are dispatch-bound and competitive** — within ~1.3x of CUDA for
+  elementwise/gather, since both are dominated by launch/execute overhead.
+- **Large elementwise / gather** run ~4–8x slower: our megakernel is not yet
+  bandwidth-optimal (note the step near 512K elements — a lane/tile scaling
+  threshold worth tuning).
+- **`dot_general`** is ~7.5x off cuBLAS at 2048³ — expected for a naive
+  register-blocked tile kernel vs a tuned library; the kernel-table override
+  mechanism is the intended path to close this.
+- **`while` loops** are the biggest gap (~10–30x): every iteration pays a
+  cross-workgroup barrier + control round-trip. Loop-body fusion and cheaper
+  per-iteration sync are the obvious wins.
+
+Reproduce (writes `docs/bench_plot.png` + `.csv`; auto-uses native CUDA as the
+reference if a CUDA jaxlib is installed, else JAX CPU):
+
+```bash
+. ./env.sh && python tools/plot_bench.py --device NVIDIA
+```
+
 ## Development
 
 ```bash

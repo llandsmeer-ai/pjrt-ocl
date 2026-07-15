@@ -1,0 +1,69 @@
+op,N,ours_ms,ref_ms
+elementwise add (a+b),4096,0.048466,0.048862
+elementwise add (a+b),8192,0.051702,0.037996
+elementwise add (a+b),16384,0.058719,0.035725
+elementwise add (a+b),32768,0.091413,0.036423
+elementwise add (a+b),65536,0.059658,0.035113
+elementwise add (a+b),131072,0.059119,0.03708
+elementwise add (a+b),262144,0.059098,0.038612
+elementwise add (a+b),524288,0.199663,0.039161
+elementwise add (a+b),1048576,0.20421,0.035521
+elementwise add (a+b),2097152,0.208855,0.037687
+elementwise add (a+b),4194304,0.223535,0.035705
+elementwise add (a+b),8388608,0.30021,0.038711
+elementwise add (a+b),16777216,0.578259,0.135734
+elementwise mul (a*b),4096,0.046812,0.049588
+elementwise mul (a*b),8192,0.051678,0.048903
+elementwise mul (a*b),16384,0.059082,0.049557
+elementwise mul (a*b),32768,0.058935,0.069522
+elementwise mul (a*b),65536,0.059654,0.052616
+elementwise mul (a*b),131072,0.059324,0.052447
+elementwise mul (a*b),262144,0.059095,0.049874
+elementwise mul (a*b),524288,0.202458,0.052159
+elementwise mul (a*b),1048576,0.205674,0.038594
+elementwise mul (a*b),2097152,0.212979,0.039201
+elementwise mul (a*b),4194304,0.218109,0.041321
+elementwise mul (a*b),8388608,0.296592,0.03758
+elementwise mul (a*b),16777216,0.576829,0.137077
+matrix x vector (NxN . Nx1),128,0.060542,0.072052
+matrix x vector (NxN . Nx1),256,0.071142,0.08645
+matrix x vector (NxN . Nx1),384,0.085545,0.061923
+matrix x vector (NxN . Nx1),512,0.09486,0.064625
+matrix x vector (NxN . Nx1),768,0.121486,0.061462
+matrix x vector (NxN . Nx1),1024,0.147792,0.067066
+matrix x vector (NxN . Nx1),1536,0.193644,0.059348
+matrix x vector (NxN . Nx1),2048,0.242088,0.071033
+matrix x matrix (NxN . NxN),128,0.059256,0.06892
+matrix x matrix (NxN . NxN),256,0.072293,0.074952
+matrix x matrix (NxN . NxN),384,0.086392,0.070228
+matrix x matrix (NxN . NxN),512,0.135213,0.07116
+matrix x matrix (NxN . NxN),768,0.205191,0.05233
+matrix x matrix (NxN . NxN),1024,0.282646,0.094725
+matrix x matrix (NxN . NxN),1536,0.620057,0.110562
+matrix x matrix (NxN . NxN),2048,1.113287,0.148082
+gather (dynamic_slice),4096,0.052648,0.078328
+gather (dynamic_slice),8192,0.056717,0.059479
+gather (dynamic_slice),16384,0.061061,0.03718
+gather (dynamic_slice),32768,0.090441,0.062508
+gather (dynamic_slice),65536,0.07107,0.060986
+gather (dynamic_slice),131072,0.077588,0.061221
+gather (dynamic_slice),262144,0.073215,0.062956
+gather (dynamic_slice),524288,0.122851,0.061364
+gather (dynamic_slice),1048576,0.212735,0.052694
+gather (dynamic_slice),2097152,0.212563,0.050437
+gather (dynamic_slice),4194304,0.214437,0.038915
+gather (dynamic_slice),8388608,0.228426,0.039421
+gather (dynamic_slice),16777216,0.297949,0.038257
+while loop (32x a*1.5+1),4096,2.478991,0.349255
+while loop (32x a*1.5+1),8192,2.88004,0.228892
+while loop (32x a*1.5+1),16384,3.7034,0.237298
+while loop (32x a*1.5+1),32768,3.753874,0.235095
+while loop (32x a*1.5+1),65536,3.831446,0.310502
+while loop (32x a*1.5+1),131072,3.846291,0.236035
+while loop (32x a*1.5+1),262144,3.866059,0.236623
+while loop (32x a*1.5+1),524288,4.12695,0.235361
+while loop (32x a*1.5+1),1048576,4.167867,0.227001
+while loop (32x a*1.5+1),2097152,4.177649,0.234694
+while loop (32x a*1.5+1),4194304,4.825305,0.234741
+while loop (32x a*1.5+1),8388608,9.530517,0.372243
+while loop (32x a*1.5+1),16777216,22.634005,0.802666
