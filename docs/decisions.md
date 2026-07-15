@@ -46,7 +46,19 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
   runtime — this is why nobody ships CPU cross-workgroup sync as a spin. **The correct CPU barrier
   is the KERNEL BOUNDARY** (poc/07 test D: host relaunch per phase, 46 µs/phase on PoCL, immune
   because a finished workgroup EXITS and frees its thread). Decision: **host-dispatch engine for CPU
-  (non-GPU) devices; GPUs keep the device-scope megakernel.** Supersedes the vaguer fix-options in
+  (non-GPU) devices; GPUs keep the device-scope megakernel.**
+  - **Literature confirms (2026-07-15 web check).** Canonical portable inter-workgroup barrier
+    (Sorensen/Donaldson, OOPSLA 2016): "we must ensure that all workgroups are resident on the
+    device at the same time. We size our launches accordingly to guarantee full occupancy" — an
+    Occupancy-Bound Execution assumption non-preemptive CPU schedulers violate ("if a single
+    work-group is blocked by the OBE model, the barrier deadlocks due to starvation"). OpenCL model
+    itself: "OpenCL does not support synchronization across work-groups inside a kernel; instead
+    multiple kernels must be launched" — the kernel boundary IS the sanctioned cross-group barrier.
+    PoCL's own CPU pipeline uses Continuation-Based Synchronization, which "defines kernel entries
+    and exits as barriers" — literally the host-dispatch model. Only in-kernel escape is
+    *cooperative kernels* (need a bespoke scheduler that context-switches a waiting group; not
+    available to portable OpenCL C or PoCL). Not a PoCL bug, not out-engineerable in-kernel — it is
+    the established state of the art. Supersedes the vaguer fix-options in
   the node below.
 - ⚠️ **CONFIRMED #1 RISK 2026-07-15: cross-workgroup spin-barrier is UNRELIABLE on PoCL under
   iteration (LIVENESS axis — still open; poc/07 fixed only the visibility axis above).** The persistent-VLIW engine (vm2.cl) uses the poc/01 global barrier between schedule
