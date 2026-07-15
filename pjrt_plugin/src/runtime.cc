@@ -354,6 +354,9 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->vm_seg_kernel_ = clCreateKernel(rt->program_, "vm2_seg", &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateKernel vm2_seg: " + std::to_string(cerr));
+  rt->vm_one_kernel_ = clCreateKernel(rt->program_, "vm2_one", &cerr);
+  if (cerr != CL_SUCCESS)
+    return fail("clCreateKernel vm2_one: " + std::to_string(cerr));
 
   // Engine selection: the persistent in-kernel spin-barrier requires all lanes
   // to be co-resident and balanced, which non-GPU (CPU) OpenCL runtimes do NOT
@@ -378,6 +381,15 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
     // "auto" (or anything else) keeps the default.
   }
 
+  // Execution tracing (PJRT_OCL_VM_TRACE=<path>): per-entry event profiling
+  // only exists on the host-dispatch engine (the megakernel's entries are not
+  // individually observable from the host — only barrier arrival ranks are),
+  // so tracing forces host-dispatch, overriding PJRT_OCL_ENGINE=mega.
+  if (const char* t = std::getenv("PJRT_OCL_VM_TRACE"); t && t[0]) {
+    rt->trace_path_ = t;
+    rt->host_dispatch_ = true;
+  }
+
   // Lanes advertised to the python scheduler (PJRT_OCL_NLANES). Validated
   // co-residency regime: <= 3x CUs at 256 threads (poc/01, poc/04); GPUs get
   // 2 lanes/CU, CPUs 1/CU.
@@ -392,6 +404,7 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
 OclRuntime::~OclRuntime() {
   if (vm_kernel_) clReleaseKernel(vm_kernel_);
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
+  if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
   if (program_) clReleaseProgram(program_);
   if (queue_) clReleaseCommandQueue(queue_);
   if (ctx_) clReleaseContext(ctx_);
@@ -493,6 +506,23 @@ LoadedProgram::~LoadedProgram() {
   for (cl_mem m : {arena_, aux_buf_, tasks_buf_, entries_buf_, lane_tab_buf_,
                    bar_buf_, stats_buf_, seg_tab_buf_})
     if (m) clReleaseMemObject(m);
+  for (cl_command_queue q : trace_queues_)
+    if (q) clReleaseCommandQueue(q);
+}
+
+bool LoadedProgram::EnsureTraceQueues(std::string* err) {
+  if (!trace_queues_.empty()) return true;
+  trace_queues_.resize(prog_.n_lanes, nullptr);
+  for (auto& q : trace_queues_) {
+    cl_int cerr;
+    q = clCreateCommandQueue(rt_->ctx(), rt_->dev(),
+                             CL_QUEUE_PROFILING_ENABLE, &cerr);
+    if (cerr != CL_SUCCESS) {
+      *err = "trace: profiling queue create failed: " + std::to_string(cerr);
+      return false;
+    }
+  }
+  return true;
 }
 
 bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
@@ -585,6 +615,28 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
   constexpr uint32_t WIDX_ROOT = 0xFFFFFFFFu;
   constexpr int MAX_DEPTH = 8;
 
+  // Trace mode: each entry runs as its own single-workgroup vm2_one launch on
+  // its lane's profiling queue (lanes stay concurrent — verified: PoCL and
+  // NVIDIA overlap kernels across queues), and its event yields device-clock
+  // start/end. clFinish over the lane queues replaces the one-launch clFinish
+  // as the phase barrier. Records are appended to trace_path() as one JSON
+  // line per Execute when the walk completes.
+  const bool tracing = !rt_->trace_path().empty();
+  struct TraceEv { uint32_t phase, lane, entry; cl_event ev; };
+  std::vector<TraceEv> tevs;
+  uint32_t phase_i = 0;
+  if (tracing) {
+    if (!EnsureTraceQueues(err)) return false;
+    // Input writes were enqueued on the main queue; lane queues must see them.
+    if (clFinish(q) != CL_SUCCESS) {
+      *err = "trace: pre-phase clFinish failed";
+      return false;
+    }
+  }
+  auto release_tevs = [&tevs]() {
+    for (auto& t : tevs) clReleaseEvent(t.ev);
+  };
+
   if (!seg_tab_buf_) {
     cl_int cerr;
     seg_tab_buf_ = clCreateBuffer(rt_->ctx(), CL_MEM_READ_ONLY,
@@ -640,6 +692,33 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
   };
 
   auto launch_seg = [&]() -> bool {
+    if (tracing) {
+      cl_kernel k = rt_->vm_one_kernel();
+      clSetKernelArg(k, 0, sizeof(arena_), &arena_);
+      clSetKernelArg(k, 1, sizeof(aux_buf_), &aux_buf_);
+      clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
+      clSetKernelArg(k, 3, sizeof(entries_buf_), &entries_buf_);
+      size_t lsz = 256, gsz = lsz;  // one workgroup per entry, like vm2_seg
+      for (uint32_t L = 0; L < n; ++L) {
+        for (uint32_t e = seg[2 * L]; e < seg[2 * L] + seg[2 * L + 1]; ++e) {
+          if (p.entries[e].task == kEntNop) continue;
+          cl_event ev = nullptr;
+          clSetKernelArg(k, 4, sizeof(e), &e);
+          if (clEnqueueNDRangeKernel(trace_queues_[L], k, 1, nullptr, &gsz,
+                                     &lsz, 0, nullptr, &ev) != CL_SUCCESS) {
+            *err = "trace: entry launch failed";
+            return false;
+          }
+          tevs.push_back({phase_i, L, e, ev});
+        }
+      }
+      for (uint32_t L = 0; L < n; ++L)  // <-- this IS the phase barrier
+        if (clFinish(trace_queues_[L]) != CL_SUCCESS) {
+          *err = "trace: clFinish (phase barrier) failed";
+          return false;
+        }
+      return true;
+    }
     if (clEnqueueWriteBuffer(q, seg_tab_buf_, CL_TRUE, 0,
                              sizeof(cl_uint) * 2 * n, seg.data(), 0, nullptr,
                              nullptr) != CL_SUCCESS) {
@@ -668,6 +747,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
   for (long guard = 0;; ++guard) {
     if (guard > 100000000L) {
       *err = "host-dispatch: runaway control loop";
+      release_tevs();
       return false;
     }
     const Ev ev = advance(0);
@@ -675,11 +755,16 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     for (uint32_t L = 1; L < n; ++L) {
       if (advance(L) != ev) {
         *err = "host-dispatch: non-uniform control across lanes";
+        release_tevs();
         return false;
       }
       if (seg[2 * L + 1] > 0) any = true;
     }
-    if (any && !launch_seg()) return false;
+    if (any && !launch_seg()) {
+      release_tevs();
+      return false;
+    }
+    phase_i++;
 
     if (ev == EV_DONE) break;
     if (ev == EV_BARRIER) {
@@ -694,6 +779,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       if (clEnqueueReadBuffer(q, arena_, CL_TRUE, off, 4, &cbits, 0, nullptr,
                               nullptr) != CL_SUCCESS) {
         *err = "host-dispatch: cond read failed";
+        release_tevs();
         return false;
       }
       for (uint32_t L = 0; L < n; ++L) {
@@ -717,6 +803,40 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         f.phase = 0;
       }
     }
+  }
+
+  if (tracing) {
+    // One JSON line per Execute: task table + per-entry device timestamps.
+    // tasks carry ORIGINAL buffer ids (only the device copy was offset-
+    // patched), so tools can name blocks by op and destination buffer.
+    std::FILE* f = std::fopen(rt_->trace_path().c_str(), "a");
+    if (f) {
+      std::fprintf(f, "{\"device\":\"%s\",\"n_lanes\":%u,\"tasks\":[",
+                   rt_->info().device_name.c_str(), n);
+      for (size_t i = 0; i < p.tasks.size(); ++i)
+        std::fprintf(f, "%s[%u,%u,%u,%u]", i ? "," : "", p.tasks[i].tile_op,
+                     p.tasks[i].dst, p.tasks[i].p0, p.tasks[i].p1);
+      std::fprintf(f, "],\"events\":[");
+      bool first = true;
+      for (const auto& t : tevs) {
+        cl_ulong t0 = 0, t1 = 0;
+        if (clGetEventProfilingInfo(t.ev, CL_PROFILING_COMMAND_START,
+                                    sizeof(t0), &t0, nullptr) != CL_SUCCESS ||
+            clGetEventProfilingInfo(t.ev, CL_PROFILING_COMMAND_END, sizeof(t1),
+                                    &t1, nullptr) != CL_SUCCESS)
+          continue;  // profiling info unavailable on this device: skip entry
+        const VmEntry& en = p.entries[t.entry];
+        std::fprintf(f,
+                     "%s[%u,%u,%u,%u,%u,%u,%llu,%llu]", first ? "" : ",",
+                     t.phase, t.lane, t.entry, en.task, en.tile_lo, en.tile_hi,
+                     static_cast<unsigned long long>(t0),
+                     static_cast<unsigned long long>(t1));
+        first = false;
+      }
+      std::fprintf(f, "]}\n");
+      std::fclose(f);
+    }
+    release_tevs();
   }
   return true;
 }

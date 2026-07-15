@@ -111,9 +111,17 @@ class OclRuntime {
   const DeviceInfo& info() const { return info_; }
 
   cl_context ctx() const { return ctx_; }
+  cl_device_id dev() const { return dev_; }
   cl_command_queue queue() const { return queue_; }
   cl_kernel vm_kernel() const { return vm_kernel_; }
   cl_kernel vm_seg_kernel() const { return vm_seg_kernel_; }
+  cl_kernel vm_one_kernel() const { return vm_one_kernel_; }
+  // Execution trace (PJRT_OCL_VM_TRACE=<path>): host-dispatch is forced and
+  // every schedule entry runs as its own single-workgroup launch on a per-lane
+  // profiling queue; per-entry device timestamps are appended to <path> as one
+  // JSON line per Execute. For engineering timeline plots (tools/
+  // plot_schedule.py) — per-entry launches add overhead, don't benchmark it.
+  const std::string& trace_path() const { return trace_path_; }
   cl_uint ngroups() const { return ngroups_; }
   size_t local_size() const { return local_size_; }
   // Host-dispatch engine: the host drives control flow and enforces the
@@ -141,6 +149,8 @@ class OclRuntime {
   cl_program program_ = nullptr;
   cl_kernel vm_kernel_ = nullptr;
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
+  cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
+  std::string trace_path_;             // empty = tracing off
   cl_uint ngroups_ = 0;    // co-resident workgroups (poc/01 rule: <= CUs)
   size_t local_size_ = 64;
   bool host_dispatch_ = false;
@@ -180,6 +190,9 @@ class LoadedProgram {
   // them. Reads while-cond scalars from the arena between phases. Caller holds
   // the runtime mutex; blocks until the program completes.
   bool LaunchHostDispatch(cl_command_queue q, std::string* err);
+  // Trace mode: lazily creates the per-lane profiling queues (one per lane so
+  // lanes run concurrently, like workgroups of one launch do).
+  bool EnsureTraceQueues(std::string* err);
   OclRuntime* rt_ = nullptr;  // borrowed; client outlives executables
   VmProgram prog_;
   cl_mem arena_ = nullptr;
@@ -190,6 +203,7 @@ class LoadedProgram {
   cl_mem bar_buf_ = nullptr;
   cl_mem stats_buf_ = nullptr;
   cl_mem seg_tab_buf_ = nullptr;   // host-dispatch: per-lane {off,count} u2
+  std::vector<cl_command_queue> trace_queues_;  // trace mode, one per lane
 };
 
 // ---- Lowering subprocess ----------------------------------------------------

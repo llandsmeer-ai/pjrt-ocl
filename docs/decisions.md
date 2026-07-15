@@ -73,6 +73,28 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     still deadlocks (flag works). 197 pytest + 3 e2e pass. **PoCL is deadlock-free for the first time.**
   - Supersedes the vaguer fix-options in
   the node below.
+
+- ✅ **SHIPPED 2026-07-15: execution-trace instrumentation + timeline plots**
+  (`PJRT_OCL_VM_TRACE=<file>` + `tools/plot_schedule.py`) — delivers the spec-level
+  instrumentation item (bubble % now visible per lane, plotted planned-vs-measured).
+  Design: OpenCL gives per-COMMAND timestamps only (no portable in-kernel clock), so
+  per-entry timing requires one launch per entry → trace mode forces the host-dispatch
+  engine and runs every schedule entry as its own single-workgroup `vm2_one` launch on a
+  per-lane `CL_QUEUE_PROFILING_ENABLE` queue; `clFinish` over the lane queues is the
+  phase barrier; one JSON line (task table + per-entry device-clock start/end) appended
+  per Execute. **Pre-verified assumption: lanes stay concurrent across queues** — 8
+  spin kernels on 8 queues take 1.06× one kernel on PoCL (events on a common timebase),
+  and NVIDIA maps queues to streams; without that the traced timeline would be fiction.
+  Caveats (recorded in README + tool docstring): (a) per-entry launches add ~tens of µs
+  each — it's a timeline, not a benchmark; (b) the GPU megakernel is NOT per-entry
+  observable from the host (only the existing barrier arrival-rank stats), so traces
+  always measure the host-dispatch engine. Findings from the `diamond` example
+  (matmul ∥ EW chain, then join): PoCL runs level 0 with lanes 5–7 (EW) 98–99% idle —
+  an MMA tile costs ~25× an EW tile there vs the unit-cost default (53% of lane-time
+  idle overall); NVIDIA's level 0 is nearly flat (ratio ≈ 1). Same schedule, opposite
+  balance — reconfirms measure-don't-assume; the cost-table (`PJRT_OCL_COST_TABLE`)
+  is the rebalancing lever. Verified: runtime_test PoCL+NVIDIA PASS, 197 pytest pass,
+  traced diamond output matches numpy (max |err| 4.8e-7 — f32 matmul accumulation).
 - ⚠️ **CONFIRMED #1 RISK 2026-07-15: cross-workgroup spin-barrier is UNRELIABLE on PoCL under
   iteration (LIVENESS axis — still open; poc/07 fixed only the visibility axis above).** The persistent-VLIW engine (vm2.cl) uses the poc/01 global barrier between schedule
   phases. On NVIDIA it is rock-solid (500 two-level + 300 chained-matmul back-to-back runs, zero

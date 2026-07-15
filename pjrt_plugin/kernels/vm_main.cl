@@ -162,3 +162,21 @@ __kernel void vm2_seg(__global uchar *arena,
                            As, Bs);
     }
 }
+
+/* TRACE mode (PJRT_OCL_VM_TRACE): one entry per launch, so OpenCL event
+ * profiling yields a per-entry start/end timestamp. Launched with a single
+ * workgroup on the entry's lane queue — same one-workgroup-per-entry execution
+ * as vm2_seg, just one entry at a time. */
+__kernel void vm2_one(__global uchar *arena,
+                      __global const int *aux,
+                      __global const task_t *tasks,
+                      __global const entry_t *entries,
+                      const uint entry_idx)
+{
+    __local float As[MMA_ASZ];
+    __local float Bs[MMA_BSZ];
+    const entry_t en = entries[entry_idx];
+    if (en.task != ENT_NOP)
+        vmo_exec_tiles(arena, aux, tasks[en.task], en.tile_lo, en.tile_hi,
+                       As, Bs);
+}

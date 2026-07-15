@@ -155,6 +155,70 @@ reference if a CUDA jaxlib is installed, else JAX CPU):
 . ./env.sh && python tools/plot_bench.py --device NVIDIA
 ```
 
+## Inside the VM: scheduled vs. measured execution
+
+How does a `jax.jit` function actually run on the device? Take a program with both
+parallel and sequential structure — a heavy matmul next to a cheap elementwise chain,
+joined at the end:
+
+```python
+def f(a, b, c):          # all 256x256 f32
+    m = a @ b            # heavy matmul            \  independent -> same dataflow
+    s = c + c            # cheap elementwise        } level, scheduled onto
+    p = c * c            # cheap elementwise       /  different lanes in parallel
+    q = s * p            # needs s and p  -> next level (after a global barrier)
+    return q + m         # needs q and m  -> final level (the join)
+```
+
+The compile pipeline turns this into the per-lane schedule below. Lowering emits one
+**task** per op and splits each into **tiles** (16K elements for elementwise, 64×64
+output blocks for matmul). The scheduler then groups independent ops into **dataflow
+levels**, packs each level's tiles onto **lanes** (persistent workgroups) by cost
+(LPT), and separates levels with **global barriers** — that schedule *is* the bytecode
+the engines execute. `tools/plot_schedule.py` draws it (top), then runs the program
+through the plugin with per-entry instrumentation and draws what the device really did
+(bottom):
+
+![scheduled vs measured lane timeline](docs/schedule_diamond.png)
+
+Reading it, top panel (the scheduler's intent, on its cost model's clock):
+
+- **Level 0**: the matmul's 16 tiles get lanes 0–4 while `c+c` and `c*c` run
+  concurrently on lanes 5–7 — independent ops really do run side by side.
+- The dashed **barriers** separate levels: `s * p` and the final join each wait for
+  every lane, because their inputs were produced across lanes.
+- Levels 1–2 have only 4 tiles for 8 lanes: lanes 4–7 are scheduled idle —
+  a structural **bubble** visible at schedule time.
+
+Bottom panel (device timestamps from the same program, white gaps = bubbles):
+
+- On this CPU the default cost model is wrong: a matmul tile costs roughly 25× an
+  elementwise tile, so lanes 5–7 finish in under a millisecond and then stall at the
+  barrier while the matmul lanes grind on — most of the idle time in the run.
+  Supplying measured per-tile costs (`--cost-table`, `PJRT_OCL_COST_TABLE`) lets the
+  scheduler rebalance exactly this.
+- The same command with `--device NVIDIA` shows a much flatter level 0: on that GPU
+  a matmul tile and an elementwise tile cost about the same. The schedule is
+  device-neutral but the costs are not — which is why per-tile costs are measured
+  per device rather than assumed.
+
+Reproduce (any of `diamond`, `chain`, `wide`, or your own StableHLO):
+
+```bash
+. ./env.sh
+python tools/plot_schedule.py --example diamond --device Portable --out docs/schedule_diamond.png
+python tools/plot_schedule.py --stablehlo my_program.mlir      # planned timeline only
+```
+
+How the measurement works: `PJRT_OCL_VM_TRACE=<file>` switches execution to the
+host-dispatch engine and runs **every schedule entry as its own single-workgroup
+launch on a per-lane profiling queue** (lanes still run concurrently — verified on
+PoCL and NVIDIA), so each entry gets device-clock start/end timestamps via OpenCL
+event profiling, appended as JSON per execute. Two caveats: per-entry launches add
+overhead (~tens of µs each), so treat it as a timeline, not a benchmark — and the
+GPU megakernel path is not per-entry observable from the host (only barrier arrival
+ranks), so traces always reflect the host-dispatch engine.
+
 ## Development
 
 ```bash
