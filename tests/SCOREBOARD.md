@@ -9,16 +9,21 @@ Updated 2026-07-15 (Phase 2 fan-out landed).
 
 ## Dtypes (byte-addressed arena, per-task dtype dispatch)
 
+Byte-addressed arena, per-task dtype dispatch (result dtype tile_op bits 8-15,
+operand dtype bits 16-23). f16/bf16 = 2-byte storage + f32 compute (portable, no
+cl_khr_fp16). bool = 1-byte. Shape ops propagate input dtype (element copy width).
+
 | dtype | status |
 |---|---|
 | f32 | ✅ all ops |
-| i32 / u32 | ✅ elementwise (arith, compare, select); shape ops (gather copies any size) |
-| bool (i1) | ✅ 1-byte; compare→bool, select pred, bool I/O at jax boundary |
-| f64 | ✅ elementwise, **gated behind cl_khr_fp64** (clean error on unsupported devices) |
-| i64 | ✅ storage + gather; elementwise arith partial |
-| f16 / bf16 / i8 / i16 / complex | ❌ next (f16/bf16 = biggest remaining bucket) |
+| i32 / u32 | ✅ elementwise arith/compare/select/convert; shape ops |
+| bool (i1) | ✅ 1-byte; compare→bool, select pred, bool I/O; convert |
+| f64 | ✅ elementwise + convert, **gated behind cl_khr_fp64** |
+| i64 | ✅ storage + gather + convert; elementwise arith |
+| **f16 / bf16** | ✅ elementwise + compare/select/convert + broadcast/shape (2-byte, f32 compute) |
+| i8 / i16 / complex / f8 | ❌ next (i8/i16 byte-addressed; complex = real/imag pairs) |
 
-Not yet dtype-aware: reduce and iota tiles are f32-only (integer sum/max/min next).
+Still f32-only: reduce + iota tiles (integer reduce in progress).
 
 ## Supported ops
 
