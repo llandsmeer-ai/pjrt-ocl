@@ -8,6 +8,23 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
 
 ## 1. Execution model
 
+- ⚠️ **CONFIRMED #1 RISK 2026-07-15: cross-workgroup spin-barrier is UNRELIABLE on PoCL under
+  iteration.** The persistent-VLIW engine (vm2.cl) uses the poc/01 global barrier between schedule
+  phases. On NVIDIA it is rock-solid (500 two-level + 300 chained-matmul back-to-back runs, zero
+  hangs). On PoCL (CPU) it deadlocks NONDETERMINISTICALLY within ~30–50 iterations of ANY
+  multi-level program (even `(a+b)*a`), at every lane count tried (24 down to 4). Root cause:
+  PoCL maps workgroups onto a CPU thread pool and does not guarantee all N workgroups make
+  concurrent progress, so a spin-barrier where WG-i waits on not-yet-scheduled WG-j hangs.
+  AGGRAVATED tonight by the register-blocked MMA raising the shared megakernel's `__local` from
+  2 KB→8 KB (declared for ALL programs), cutting PoCL co-residency headroom — the ceiling-1
+  shared-resource tax, now a correctness problem on CPU. Single-shot executes still pass, so PoCL
+  remains valid for CORRECTNESS spot-checks; numpy validators (vmreader) don't touch the barrier
+  so pytest is unaffected. PERF/stress testing must use NVIDIA. **Fix options (next major item):**
+  (a) Plan B — host-side kernel-launch-per-phase loop (host enforces the barrier at launch
+  boundaries; the bytecode is engine-agnostic by design); (b) per-family / typed-lane kernel
+  split so non-MMA programs carry small local footprint and stay co-resident; (c) PoCL-specific
+  engine = host dispatch. NVIDIA/real-GPU path is unaffected and is the current perf target.
+
 - ✅ **PIVOT 2026-07-14 (user-driven, M3): host-dispatch is the primary engine.** Each data
   instruction = one `clEnqueueNDRangeKernel` of a dedicated per-op kernel at full problem size
   (one WI per element; per-op local sizes), in-order queue, NO global barrier on the hot path.
