@@ -65,22 +65,38 @@ signals; all lanes wait it).
 
 Lanes = persistent workgroups, 1–4 per CU, 256 threads, validated co-residency regime.
 
-## v1.1: explicit data movement + lane-local tile slots (user, 2026-07-15)
+## v1.1: LOCAL-memory tile slots for fusion (user, 2026-07-15; register premise CORRECTED)
 
-The ISA is load/store: arena = main memory; each lane owns a small **tile-slot file** in local
-memory (~5 slots of 64×64 f32 at 96 KB/lane) + named register tiles inside op cases (MMA
-accumulator). New/changed ops: `LOAD_TILE(slot, region)`, `STORE_TILE(slot, region)`; compute
-tile ops address slots (operands/dest = slot ids or arena, flagged per operand).
-- **Fusion by scheduling, not codegen**: consumer scheduled on the SAME lane right after its
-  producer reads the slot directly — elementwise chains do 1 load + 1 store instead of d each;
-  matmul epilogues fuse onto the resident accumulator. No-compile-at-dispatch preserved.
-- Scheduler additions: slot liveness = tile-level register allocation (linear scan, per lane);
-  **lane-affinity constraint** (slots are lane-private; cross-lane consumers round-trip via
-  arena). Stream-entry encoding reserves operand slot/arena flags from v0 to avoid format churn.
-- Register-file-in-actual-registers beyond named accumulators requires specialized cases
-  (tiered JIT: per-program FUSED kernels compiled async + hot-swapped) — 🧭 marked future.
-- Rollout: Phase 1 implements entries WITH slot fields but only arena-mode ops; slot mode +
-  affinity scheduling lands in Phase 3 (perf mode) behind the same encoding.
+Original framing was "explicit data moves keep working memory in registers." **That does not
+work and is dropped**: GPU registers are not addressable, so a slot file indexed by a runtime
+slot id spills to local/private memory regardless. LOAD/STORE never reaches registers.
+
+What survives — the FUSION benefit, restated on the correct (local-memory) premise: arena =
+global; each lane owns a **local-memory tile-slot file** (~5 slots × 64×64 f32). `LOAD_TILE`/
+`STORE_TILE` move arena↔slot; compute tile ops may address slots (operand/dest arena-or-slot
+flag, reserved in the v0 entry encoding).
+- **Fusion by scheduling**: a consumer scheduled on the SAME lane right after its producer reads
+  the slot from LOCAL memory instead of round-tripping through the arena — elementwise chains do
+  1 global load + 1 global store total; matmul epilogue (bias/act) fuses onto the accumulator
+  tile in local memory. No compile-at-dispatch.
+- Scheduler additions: slot liveness = per-lane linear-scan allocation over the local-mem slot
+  file; **lane-affinity constraint** (slots lane-private; cross-lane consumers go via arena).
+
+### Register pressure — MEASURED, not a slot-file problem (2026-07-15)
+
+Question raised: could a "global register file reused across opcodes by casting" cut the
+megakernel's register footprint? **No — the compiler already does it, measured on NVIDIA
+(PTX virtual-register counts, same compiler ⇒ comparable):**
+- EW-only kernel: 4 f32 vregs. MMA-only (8×8 reg block): 595. Switch over BOTH: 598 ≈ MMA, NOT
+  4+595. ⇒ the allocator reuses registers across mutually-exclusive cases automatically
+  (max-over-cases, not sum). A manual union/register-file adds nothing and risks forcing
+  spills (dynamically-indexed union arrays can't stay in registers).
+- BUT the combined kernel costs 598 regs on EVERY lane, incl. ones running a cheap add, because
+  occupancy = kernel PEAK pressure and MMA's 64 accumulators are all simultaneously live. No
+  reuse trick shrinks a peak that's live at once. ⇒ ceiling-1 is intrinsic; the ONLY escape is
+  the fat op in a separate kernel (typed lanes, poc/05-validated). Repo: probe in job tmp.
+- Rollout unchanged: Phase 1 = arena-mode ops only (slot fields reserved); slot-fusion + typed
+  lanes land in Phase 3.
 
 ## Cost model & calibration (hardware-dependent by design)
 
