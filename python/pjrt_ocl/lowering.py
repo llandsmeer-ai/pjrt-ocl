@@ -51,8 +51,29 @@ VERSION = 3         # v3 = v2 tensor sections + v2.1 schedule sections
 ARENA_ALIGN = 64    # buffer arena offsets
 SECTION_ALIGN = 8   # file sections / variable-length entries
 
+# Dtype enum (docs/vmprogram.md). Tier 1 = 4-byte types the VM handles by
+# bit-reinterpreting arena slots (as_int/as_float); the arena stays 4-byte
+# slotted. Tier 2/3 (8-byte i64/f64, 2-byte f16/bf16, complex) need the
+# byte-addressed arena and are added later.
 DT_F32 = 0
-DTYPE_NUMPY = {DT_F32: np.dtype("<f4")}
+DT_I32 = 1
+DT_U32 = 2
+DT_BOOL = 3          # stored as i32 0/1 in a 4-byte slot
+# reserved for later tiers:
+DT_I64 = 4
+DT_F64 = 5
+DT_F16 = 6
+DT_BF16 = 7
+DT_C64 = 8
+
+DTYPE_NUMPY = {
+    DT_F32: np.dtype("<f4"),
+    DT_I32: np.dtype("<i4"),
+    DT_U32: np.dtype("<u4"),
+    DT_BOOL: np.dtype("<i4"),   # our arena repr: i32 0/1
+}
+# Tier-1 dtypes are all 4-byte and share the slot-reinterpret VM path.
+TIER1_DTYPES = frozenset({DT_F32, DT_I32, DT_U32, DT_BOOL})
 
 OP_NOP = 0
 OP_ADD_F32 = 1
@@ -260,8 +281,29 @@ class _Ctx:
             raise LoweringError(f"no buffer for SSA value {value}") from None
 
 
+def _elem_dtype(element_type) -> int:
+    """MLIR element type -> our dtype enum (Tier 1). Raises for unsupported."""
+    from jaxlib.mlir import ir
+    if isinstance(element_type, ir.F32Type):
+        return DT_F32
+    if isinstance(element_type, ir.IntegerType):
+        w = element_type.width
+        if w == 1:
+            return DT_BOOL                 # i1 predicate/mask
+        if w == 32:
+            # stablehlo integers are signless; treat as i32 (jax uses i32 for
+            # indices/counters). unsigned is distinguished by the op, not type.
+            return DT_I32
+        raise LoweringError(
+            f"unsupported integer width i{w} (Tier 1 = i32/bool; i64 is Tier 2)")
+    raise LoweringError(
+        f"unsupported element type {element_type} "
+        f"(Tier 1 dtypes: f32, i32, bool; f64/f16/bf16/i64/complex are later)")
+
+
 def _tensor_info(mlir_type) -> tuple[tuple[int, ...], int, int]:
-    """-> (shape, n_elems, dtype enum). Static rank-N f32 tensors only."""
+    """-> (shape, n_elems, dtype enum). Static-shape ranked tensors, Tier-1
+    dtypes (f32/i32/bool)."""
     from jaxlib.mlir import ir
     # jaxlib 0.10.2 bindings auto-downcast types and lack Type.isinstance();
     # plain python isinstance() is the supported check (poc/03 NOTES #4).
@@ -270,11 +312,17 @@ def _tensor_info(mlir_type) -> tuple[tuple[int, ...], int, int]:
     t = mlir_type
     if any(t.is_dynamic_dim(i) for i in range(t.rank)):
         raise LoweringError(f"dynamic shapes unsupported: {mlir_type}")
-    if not isinstance(t.element_type, ir.F32Type):
+    dtype = _elem_dtype(t.element_type)
+    # Recognition is dtype-aware (groundwork), but the VM/scheduler/vmreader
+    # only execute f32 today. Gate here so non-f32 raises a clean "not yet"
+    # instead of silently mis-executing as f32. Lifting this gate per dtype is
+    # the Tier-1 (i32/bool) vertical-slice work (docs/roadmap.md, dtype tiers).
+    if dtype != DT_F32:
         raise LoweringError(
-            f"unsupported element type {t.element_type} (v1 is f32-only)")
+            f"dtype {DTYPE_NUMPY.get(dtype, dtype)} recognized but not yet "
+            f"executable (VM is f32-only pending the dtype workstream)")
     shape = tuple(t.shape)
-    return shape, math.prod(shape) if t.rank else 1, DT_F32
+    return shape, math.prod(shape) if t.rank else 1, dtype
 
 
 # per-op handlers: stablehlo op name -> handler(ctx, op). Add entries to grow
