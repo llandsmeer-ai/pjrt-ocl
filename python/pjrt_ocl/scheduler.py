@@ -43,6 +43,9 @@ TILE_REDUCE_PART = 3
 TILE_REDUCE_COMB = 4
 TILE_IOTA_DIM = 5
 TILE_SCATTER = 6      # strided scatter: dst[out_off + affine(i)] = a[i]
+TILE_DYN_GATHER = 7   # dynamic_slice: gather with a runtime base offset
+TILE_DYN_SCATTER = 8  # dynamic_update_slice: scatter with a runtime base offset
+TILE_RED_WINDOW = 9   # windowed reduction (pooling)
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -141,7 +144,8 @@ class Task:
     adtype: int = 0       # DT_* operand dtype (compare/convert differ from dtype)
 
     def n_tiles(self) -> int:
-        if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM, TILE_SCATTER):
+        if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM, TILE_SCATTER,
+                             TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW):
             return max(1, math.ceil(self.p1 / TILE_SIZE))
         if self.tile_op == TILE_MMA:
             return math.ceil(self.p0 / MMA_T) * math.ceil(self.p1 / MMA_T)
