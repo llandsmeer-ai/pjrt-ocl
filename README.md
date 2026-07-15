@@ -5,9 +5,10 @@ plugin that lets `jax.jit` execute on OpenCL-capable hardware — Intel, AMD, NV
 or a CPU via [PoCL](https://portablecl.org/) — with no vendor SDK (no CUDA, no ROCm)
 on the execution path.
 
-> ⚠️ **Experimental / work in progress.** f32 only, a growing subset of StableHLO ops,
-> not yet on PyPI. Validated end-to-end on an NVIDIA RTX PRO 6000 (via NVIDIA's OpenCL)
-> and on PoCL (CPU). Not affiliated with Google, OpenXLA, or the JAX project.
+> ⚠️ **Experimental / work in progress.** A growing subset of StableHLO ops across the
+> full JAX dtype matrix (f32/f64/i32/u32/i64/bool/f16/bf16), not yet on PyPI. Validated
+> end-to-end on an NVIDIA RTX PRO 6000 (via NVIDIA's OpenCL) and on PoCL (CPU). Not
+> affiliated with Google, OpenXLA, or the JAX project.
 
 ## How it works
 
@@ -102,16 +103,25 @@ PJRT_OCL_DEVICE="Intel:1"       python your_script.py   # 2nd Intel device
 
 ## Supported ops
 
-f32 only (JAX defaults to f32; x64 disabled). Growing test-driven; see
-[`tests/SCOREBOARD.md`](tests/SCOREBOARD.md).
+52 StableHLO ops, grown test-first — each verified against JAX's CPU backend. Full
+scoreboard: [`tests/SCOREBOARD.md`](tests/SCOREBOARD.md).
 
-- **Elementwise** — add, subtract, multiply, divide, max, min, pow; negate, exp, log,
-  sqrt, rsqrt, tanh, abs, floor, ceil, sign; compare (all directions), select.
-- **Shape** — `broadcast_in_dim`, `transpose` (as strided gathers).
-- **Reductions** — full sum / max / min / prod (over all axes).
+- **Elementwise** — add, subtract, multiply, divide, remainder, pow, max, min, atan2;
+  negate, abs, sign, exp, expm1, log, log1p, sqrt, rsqrt, cbrt, sin, cos, tan, tanh,
+  floor, ceil, round (even & away-from-zero), is_finite; clamp; and/or/xor/not;
+  compare (all directions), select.
+- **Type** — `convert` (any dtype ↔ any dtype), `bitcast_convert`.
+- **Shape** — `broadcast_in_dim`, `transpose`, `reshape`, `slice` (strided), `reverse`,
+  `concatenate`, `pad` (as strided gathers/scatters).
+- **Dynamic indexing** — `dynamic_slice`, `dynamic_update_slice`.
+- **Reductions** — `reduce` (full sum / max / min / prod, f32 & i32), `reduce_window`
+  (pooling, with strides & padding).
 - **Linear algebra** — `dot_general` (plain 2D matmul, register-blocked tile kernel).
-- **Making** — `iota`, `convert` (f32).
-- **Control flow** — `while` (interpreted on device).
+- **Making** — `iota`, `constant`.
+- **Control flow** — `while` (interpreted on device by a frame-stack VM).
+
+**Dtypes** — f32, f64 (where `cl_khr_fp64` is present), i32, u32, i64, bool, f16, bf16.
+f16/bf16 use 2-byte storage with f32 compute (portable, no `cl_khr_fp16` required).
 
 Anything unsupported raises a clear `LoweringError` naming the op.
 
@@ -136,15 +146,20 @@ core path, and it never assumes fp64. Design decisions and their rationale live 
 
 ## Limitations & roadmap
 
-- **Dtypes in progress**: f32 works today; full dtype coverage (i32/bool first, then
-  i64/f64/f16, then bf16/complex) is the active workstream — the VM is being made
-  byte-addressed and dtype-dispatched. f64/f16 will be device-conditional (OpenCL extensions).
-- **Op coverage is partial** and grows test-first — reshape, slice, concatenate,
-  partial-axis reductions, batched matmul, and `if`/`case` are next.
+- **Op coverage is partial** and grows test-first. Not yet supported: partial-axis
+  reductions, batched / non-canonical `dot_general`, `if`/`case` control flow, general
+  (data-dependent) gather/scatter, sort. These raise a clear `LoweringError` today.
+- **Dtypes**: the full JAX matrix (f32/f64/i32/u32/i64/bool/f16/bf16) is in; f64 is gated
+  on `cl_khr_fp64`. Still to come: i8/i16 and complex.
 - **PoCL (CPU) is reliable for correctness spot-checks but not heavy iteration**: the
   device-side cross-workgroup barrier can deadlock under repeated dispatch on PoCL's CPU
   thread pool. Real GPUs (co-resident workgroups) are unaffected. A host-dispatch fallback
   engine is planned (see `docs/decisions.md`).
+- **Multi-lane data sharing under iteration**: the cross-workgroup barrier reliably
+  publishes the atomic loop-condition flag, but regular cross-lane data loads can race
+  under iteration on the current kernel. Until the barrier's memory model is hardened,
+  `while`-containing programs run on a single lane (correct, but loop bodies don't yet
+  parallelize across lanes).
 - Performance is improving but not yet tuned: matmul runs a register-blocked tile kernel;
   memory-bound ops are currently limited by arena-copy traffic (see
   [`docs/perf-findings.md`](docs/perf-findings.md)).

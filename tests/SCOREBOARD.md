@@ -5,7 +5,8 @@ Each op is verified by `tests/test_ops_*.py` through BOTH validators (tensor
 numpy interpreter + schedule simulator) against the JAX CPU backend, and the
 core families are spot-checked on real NVIDIA + PoCL hardware via the plugin.
 
-Updated 2026-07-15 (Phase 2 fan-out landed).
+Updated 2026-07-15 (Phase 2 fan-out + control flow landed: full dtype matrix,
+elementwise math/logical, shape/dynamic-index ops, reduce_window, stablehlo.while).
 
 ## Dtypes (byte-addressed arena, per-task dtype dispatch)
 
@@ -23,36 +24,46 @@ cl_khr_fp16). bool = 1-byte. Shape ops propagate input dtype (element copy width
 | **f16 / bf16** | ✅ elementwise + compare/select/convert + broadcast/shape (2-byte, f32 compute) |
 | i8 / i16 / complex / f8 | ❌ next (i8/i16 byte-addressed; complex = real/imag pairs) |
 
-Still f32-only: reduce + iota tiles (integer reduce in progress).
+Reduce covers f32 and i32; shape/dynamic-index ops are dtype-agnostic (copy by
+element width). iota emits f32/i32.
 
 ## Supported ops
 
+52 stablehlo ops. Each row is verified by `tests/test_ops_*.py` through both
+reference validators against the JAX CPU backend.
+
 | stablehlo op | tile op | family module | notes |
 |---|---|---|---|
-| add, multiply, subtract | EW | (core) | M2 baseline |
-| constant | — | (core) | const pool |
-| divide, maximum, minimum, power | EW | elementwise | |
-| negate, exponential, log, sqrt, rsqrt, tanh, abs, floor, ceil, sign | EW | elementwise | unary |
-| compare (EQ/NE/LT/LE/GT/GE) | EW(cmp) | elementwise | i1→f32 1.0/0.0 |
-| select | EW(select) | elementwise | pred nonzero = true |
+| add, subtract, multiply, divide, remainder, power, maximum, minimum, atan2 | EW | elementwise | binary arith |
+| negate, abs, sign, exponential, exponential_minus_one, log, log_plus_one, sqrt, rsqrt, cbrt, sine, cosine, tan, tanh, floor, ceil, round_nearest_even, round_nearest_afz, is_finite | EW | elementwise | unary |
+| clamp | EW | elementwise | ternary min/max |
+| and, or, xor, not | EW | elementwise | logical / bitwise |
+| compare (EQ/NE/LT/LE/GT/GE) | EW(cmp) | elementwise | mixed operand dtype → bool |
+| select | EW(select) | elementwise | 1-byte pred |
+| convert | EW(convert) | elementwise | any dtype ↔ any dtype |
+| bitcast_convert | EW(bitcast) | bitcast | same-width bit reinterpret (union recast) |
+| constant | — | (core) | const pool (int/f16/bf16 via splat/iter) |
 | broadcast_in_dim | GATHER | shape | stride-0 stretch |
 | transpose | GATHER | shape | permuted strides |
+| reshape | GATHER | shape | strided view where possible |
+| slice | GATHER | shape | strided (start/limit/stride) |
+| reverse | GATHER | shape | negative-stride gather |
+| concatenate, pad | SCATTER | concat | strided-scatter into dst |
+| dynamic_slice, dynamic_update_slice | DYN_GATHER / DYN_SCATTER | dynslice | runtime base offset |
 | iota | IOTA_DIM | making | any rank/axis |
-| convert | EW(copy) | making | f32→f32 only (jax elides same-dtype; int/bool rejected) |
-| reduce (sum/max/min/prod) | REDUCE_PART+COMB | reduce | FULL reductions only (all axes → scalar) |
+| reduce (sum/max/min/prod) | REDUCE_PART+COMB | reduce | FULL reductions (all axes → scalar), f32 + i32 |
+| reduce_window (max/sum) | RED_WINDOW | reduce_window | pooling; strides/padding |
 | dot_general | MMA | dot | plain 2D C=A@B (canonical [1]×[0], no batch) |
-| while | (control) | (core) | on-device, runtime_test |
+| while | (control) | (core) | on-device frame-stack VM; runtime_test B |
 
 ## Not yet supported (next, roughly in demand order)
 
-- reshape, slice, concatenate, reverse, pad (reshape/slice/reverse are GATHER
-  variants — extend ops/shape.py)
 - partial-axis reduce (needs a permuting gather before REDUCE, or strided
-  REDUCE tile op)
-- batched / non-canonical dot_general
-- sine, cosine, and other transcendentals without a vm2 subop
+  REDUCE tile op) — currently rejected at lowering
+- batched / non-canonical dot_general — currently rejected at lowering
 - if/case control flow (IF entry exists in vm2; needs lowering + scheduler seam)
-- integer dtypes (int32/int64) — currently all-f32 policy
+- general gather/scatter (data-dependent indices), sort, top-k
+- i8 / i16 / complex / f8 dtypes
 
 ## How to add an op family
 
