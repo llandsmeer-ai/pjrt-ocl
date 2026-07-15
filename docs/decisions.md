@@ -99,6 +99,32 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
       - ⚠️ **Lesson**: the cond scalar MUST be read with `atomic_add(p,0)` — a plain load hit
         stale per-SM cache on NVIDIA, diverged the workgroups' loop decision, and deadlocked the
         barrier (PoCL was fine). Rule: uniform-control-flow values are always read atomically.
+    - ✅ **stablehlo.while END-TO-END through the real plugin — 2026-07-15 (M4).** Lowering
+      (`lowering._lower_while`) + scheduler (`scheduler._Scheduler` per-lane WHILE control entries
+      with cond/body sub-streams placed after `root_len`) + a WHILE-aware python lane simulator
+      (`vmreader._run_control`, mirrors vm2.cl's frame stack). Loop-carry model: N mutable carry
+      buffers, init-copied from the operands; body computes fresh values then snapshot→commit
+      copies them back (two levels with a barrier between ⇒ carry writes strictly after all body
+      reads, so swap/passthrough bodies are safe despite carries not being SSA). Verified on
+      NVIDIA: scalar mixed i32/f32 carry, fori_loop, multi-tile vector carry, multi-level body,
+      zero-iteration, nested while, while-then-op — all bit-exact vs jax CPU, 40/40 deterministic.
+      - ⚠️ **CROSS-LANE DATA RACE under iteration (extends the 1.2-atomics gap, lines below).**
+        The barrier reliably publishes the *atomic* cond-flag read across workgroups, but a
+        loop-carried DATA buffer written by lane A and read by lane B in a later phase races
+        UNDER ITERATION on NVIDIA (regular global loads hit stale L1; the barrier's global-mem
+        fence is workgroup-scoped). Measured: a fori whose scheduler split a scalar carry's
+        copy-chain across 2 lanes gave 17/20/23/29 nondeterministically at ≥2 lanes, but 30/30
+        correct at 1 lane; a same-lane-only while (manual op order) and a single-shot reduce
+        (cross-lane but not iterated) are both 100%. Root cause is the kernel barrier's memory
+        model, NOT the lowering/scheduler (both python validators, 1-lane device, and same-lane
+        multi-lane device all pass). **Mitigation (M4, correctness-first):**
+        `schedule_program` forces **n_lanes = 1** for any while-containing program, so every
+        carry's producer/consumer share a lane (no cross-lane data movement). The multi-lane
+        WHILE scheduler path stays exercised by the python simulator
+        (`allow_multilane_while=True`), where cross-lane is exact. **Follow-up (M5):** harden the
+        barrier (OpenCL 2.0 device-scope acquire/release, or an L1-bypassing cross-lane load) then
+        re-enable multi-lane loop bodies — until then a loop with a heavy body is single-workgroup
+        and slow (correct). Same root cause as the feature-detect item two bullets down.
   - ✅ **Cross-workgroup barrier — VALIDATED 2026-07-14** (`poc/01-device-vm`): Xiao&Feng-style
     arrival counter + phase flag with OpenCL **1.2** atomics passes correctness + 2000-instr
     dependency stress on both PoCL (24 grp) and NVIDIA (188 grp, ~1.1 µs/barrier). Megakernel vs

@@ -15,15 +15,27 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = REPO / "pjrt_plugin" / "build" / "libpjrt_ocl.so"
 BODY = pathlib.Path(__file__).parent / "_e2e_body.py"
+WHILE_BODY = pathlib.Path(__file__).parent / "_while_e2e_body.py"
 
 
-@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
-def test_e2e_subprocess():
+def _run_body(body: pathlib.Path, marker: str) -> None:
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "opencl"
     # Keep OpenCL compiler caches off the (full) root overlay on the dev box.
     env.setdefault("POCL_CACHE_DIR", str(REPO / "third_party" / "pocl-cache"))
-    proc = subprocess.run([sys.executable, str(BODY)], capture_output=True,
+    proc = subprocess.run([sys.executable, str(body)], capture_output=True,
                           text=True, env=env, timeout=120)
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-    assert "E2E PASS" in proc.stdout
+    assert marker in proc.stdout
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_subprocess():
+    _run_body(BODY, "E2E PASS")
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_while_subprocess():
+    """stablehlo.while end-to-end through the real plugin (single-lane loop
+    scheduling; see scheduler.schedule_program M4 caveat)."""
+    _run_body(WHILE_BODY, "WHILE E2E PASS")
