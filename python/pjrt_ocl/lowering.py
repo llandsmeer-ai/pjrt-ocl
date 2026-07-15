@@ -288,6 +288,10 @@ class _Ctx:
         self.output_shapes: list[tuple[int, ...]] = []
         self.aux: list[int] = []           # aux pool (u32 words)
         self.funcs: dict = {}              # sym_name -> func.func (call inlining)
+        # deferred region lowering: stablehlo.while emits its cond/body sub-lists
+        # AFTER the root list so all region instrs live at indices >= main_len
+        # (docs/vmprogram.md root_len rule). Each item is a _WhileJob.
+        self.region_queue: list = []
         self._arena = 0
 
     def emit(self, instr: Instr) -> None:
@@ -480,6 +484,108 @@ def _inline_call(ctx: _Ctx, o) -> None:
         _lower_op(ctx, io)
 
 
+@dataclasses.dataclass
+class _WhileJob:
+    """A deferred stablehlo.while region-lowering job. `while_idx` is the index
+    of the WHILE placeholder Instr in ctx.instrs; carry is the list of
+    (buf_id, n_elems, dtype) loop-carried buffers."""
+    while_idx: int
+    cond_block: object
+    body_block: object
+    carry: list
+
+
+@_handles("stablehlo.while")
+def _lower_while(ctx: _Ctx, op):
+    """Lower stablehlo.while to an OP_WHILE instruction over cond/body sub-lists.
+
+    Model (docs/vmprogram.md WHILE + task prompt): N operands are the initial
+    carried values. We allocate N *mutable* carry buffers, init-copy the
+    operands into them (SSA-per-buffer is broken deliberately: the carries are
+    updated in place across iterations). The cond region reads the carries and
+    produces the loop scalar; the body reads the carries, computes fresh values,
+    and copies them back into the carries so the next iteration sees the update.
+    The N while results alias the carry buffers.
+
+    The cond/body regions are lowered LATER (region_queue, drained after the
+    root list) so their instrs land at indices >= main_len — the root walk only
+    covers [0, main_len) and must never step into a sub-list (root_len rule)."""
+    n = len(op.operands)
+    carry: list = []
+    for k in range(n):
+        _, n_elems, dtype = _tensor_info(op.operands[k].type)
+        cbuf = ctx.new_buffer(n_elems, dtype)
+        carry.append((cbuf, n_elems, dtype))
+        # init: operand -> carry (root list; runs once before the loop)
+        ctx.emit(Instr(OP_COPY_F32, dst=cbuf, a=ctx.buf_for(op.operands[k]),
+                       n=n_elems))
+    while_idx = len(ctx.instrs)
+    ctx.emit(Instr(OP_WHILE))          # placeholder; patched once regions lower
+    ctx.region_queue.append(_WhileJob(
+        while_idx, op.regions[0].blocks[0], op.regions[1].blocks[0], carry))
+    for k in range(n):                 # results alias the carry buffers
+        ctx.value_to_buf[op.results[k]] = carry[k][0]
+
+
+def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
+    """Lower a queued while's cond + body regions into ctx.instrs (appended
+    after the root list) and patch the WHILE placeholder with the resulting
+    sub-list ranges. Nested whiles enqueue further jobs (drained in turn)."""
+    carry = job.carry
+    n = len(carry)
+
+    # --- cond sub-list: bind block args to carries, lower, read the scalar ----
+    cond_start = len(ctx.instrs)
+    for k in range(n):
+        ctx.value_to_buf[job.cond_block.arguments[k]] = carry[k][0]
+    cond_scalar = None
+    for inner in job.cond_block.operations:
+        io = inner.operation
+        if io.name == "stablehlo.return":
+            cond_scalar = ctx.buf_for(io.operands[0])
+        else:
+            _lower_op(ctx, io)
+    if cond_scalar is None:
+        raise LoweringError("stablehlo.while cond region has no return")
+    # The device reads the loop scalar with a 4-byte atomic; the compare result
+    # is a 1-byte i1. Convert it to an f32 0.0/1.0 flag so all 4 bytes are
+    # defined (a bare bool slot would leave 3 padding bytes in the atomic read).
+    cond_flag = ctx.new_buffer(1, DT_F32)
+    ctx.emit(Instr(OP_CONVERT, dst=cond_flag, a=cond_scalar, n=1))
+    cond_len = len(ctx.instrs) - cond_start
+
+    # --- body sub-list: lower, then copy new values back into the carries -----
+    body_start = len(ctx.instrs)
+    for k in range(n):
+        ctx.value_to_buf[job.body_block.arguments[k]] = carry[k][0]
+    ret_bufs = None
+    for inner in job.body_block.operations:
+        io = inner.operation
+        if io.name == "stablehlo.return":
+            ret_bufs = [ctx.buf_for(v) for v in io.operands]
+        else:
+            _lower_op(ctx, io)
+    if ret_bufs is None or len(ret_bufs) != n:
+        raise LoweringError("stablehlo.while body region return arity mismatch")
+    # Snapshot returns into temps, then commit temps into carries. The two
+    # phases (with a scheduler barrier between) make the carry writes strictly
+    # later than every body read of a carry, so no WAR/aliasing hazard survives
+    # even for swap/passthrough bodies (the carries are not SSA).
+    temps = []
+    for k in range(n):
+        _, n_elems, dtype = carry[k]
+        t = ctx.new_buffer(n_elems, dtype)
+        ctx.emit(Instr(OP_COPY_F32, dst=t, a=ret_bufs[k], n=n_elems))
+        temps.append(t)
+    for k in range(n):
+        cbuf, n_elems, _ = carry[k]
+        ctx.emit(Instr(OP_COPY_F32, dst=cbuf, a=temps[k], n=n_elems))
+    body_len = len(ctx.instrs) - body_start
+
+    ctx.instrs[job.while_idx] = Instr(OP_WHILE, dst=cond_flag, a=cond_start,
+                                      b=cond_len, n=body_start, imm=body_len)
+
+
 def _lower_op(ctx: _Ctx, o) -> None:
     if o.name == "func.call":
         _inline_call(ctx, o)
@@ -520,6 +626,13 @@ def lower_module(module) -> VMProgram:
     for op in entry_block.operations:
         _lower_op(ctx, op.operation)
 
+    # The root list is exactly the entry-block lowering; region sub-lists
+    # (cond/body of every while, nested included) are appended after it so the
+    # root walk [0, main_len) never enters a sub-range (docs/vmprogram.md).
+    main_len = len(ctx.instrs)
+    while ctx.region_queue:
+        _lower_while_regions(ctx, ctx.region_queue.pop(0))
+
     return VMProgram(
         arena_bytes=ctx._arena,
         buffers=ctx.buffers,
@@ -530,7 +643,7 @@ def lower_module(module) -> VMProgram:
         consts=ctx.consts,
         instrs=ctx.instrs,
         aux=ctx.aux,
-        main_len=len(ctx.instrs),
+        main_len=main_len,
     )
 
 
