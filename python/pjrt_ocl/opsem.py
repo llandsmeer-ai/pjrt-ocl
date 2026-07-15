@@ -48,6 +48,19 @@ def register_tile_sim(tile_op: int, sim: Callable) -> None:
     TILE_SIM[tile_op] = sim
 
 
+# EW subop -> callable(a, b, task, rt, lo, hi) -> ndarray for output[lo:hi].
+# a/b are the operand f32 views already sliced to [lo, hi) (b is None for unary
+# subops); task carries p2/p3; rt is the _SchedRT facade and lo/hi the global
+# element range (select reads rt.view(task.p3)[lo:hi]). Lets the elementwise
+# family add subops without editing the core EW simulator; ADD/MUL/SUB/FILL keep
+# builtin fast paths.
+EW_SIM: dict[int, Callable] = {}
+
+
+def register_ew_sim(subop: int, sim: Callable) -> None:
+    EW_SIM[subop] = sim
+
+
 def reads_of(ins) -> set[int]:
     fn = READS.get(ins.op)
     if fn is not None:

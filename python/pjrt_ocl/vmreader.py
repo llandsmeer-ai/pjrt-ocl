@@ -510,6 +510,11 @@ def execute_schedule(prog: Program, args: list[np.ndarray],
                               a * b if subop == S.EW_MUL else a - b)
             elif subop == S.EW_FILL:
                 dst[lo:hi] = _f32_from_bits(task.p2)
+            elif subop in opsem.EW_SIM:
+                a = view(task.a)[lo:hi]
+                # binary subops read b; unary/select handlers ignore extras.
+                b = view(task.b)[lo:hi] if task.b < len(prog.buffers) else None
+                dst[lo:hi] = opsem.EW_SIM[subop](a, b, task, sim_rt, lo, hi)
             else:
                 raise NotImplementedError(
                     f"schedule simulator: EW subop {subop} not supported")
