@@ -11,3 +11,4 @@ from . import elementwise  # noqa: F401  (div/max/min/pow, unary, compare, selec
 from . import dot  # noqa: F401  (dot_general — plain 2D matmul via TILE_MMA)
 from . import reduce  # noqa: F401  (reduce: full sum/max/min/prod)
 from . import making  # noqa: F401  (iota, convert)
+from . import bitcast  # noqa: F401  (bitcast_convert — bit reinterpret)

@@ -253,12 +253,37 @@ static void convert_tile(__global uchar *arena, const task_t t, uint tile,
     }
 }
 
+/* bitcast_convert: reinterpret the BITS of each element as the result dtype
+ * (same element size). A typed memcpy of the 2/4/8-byte word — NOT a numeric
+ * conversion (f32<->i32<->u32; f64<->i64). Width comes from the result dtype;
+ * source and dest share the byte width by construction (checked in lowering). */
+static void bitcast_tile(__global uchar *arena, const task_t t, uint tile,
+                         uint dt, uint lid, uint lsz)
+{
+    const uint n = t.p1;
+    const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
+    if (dt == DT_I64 || dt == DT_F64) {
+        __global long *d = AP(long, t.dst);
+        __global const long *a = AP(const long, t.a);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = a[i];
+    } else if (dt == DT_F16 || dt == DT_BF16) {
+        __global ushort *d = AP(ushort, t.dst);
+        __global const ushort *a = AP(const ushort, t.a);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = a[i];
+    } else {   /* 4-byte: f32/i32/u32 */
+        __global int *d = AP(int, t.dst);
+        __global const int *a = AP(const int, t.a);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = a[i];
+    }
+}
+
 static void ew_tile(__global uchar *arena, const task_t t, uint tile,
                     uint dt, uint adt, uint lid, uint lsz)
 {
     if (t.p0 == SUB_CMP) { cmp_tile(arena, t, tile, adt, lid, lsz); return; }
     if (t.p0 == SUB_SELECT) { select_tile(arena, t, tile, dt, lid, lsz); return; }
     if (t.p0 == SUB_CONVERT) { convert_tile(arena, t, tile, dt, adt, lid, lsz); return; }
+    if (t.p0 == SUB_BITCAST) { bitcast_tile(arena, t, tile, dt, lid, lsz); return; }
     switch (dt) {
     case DT_I32: case DT_U32: ew_tile_i32(arena, t, tile, lid, lsz); break;
     case DT_BOOL:             ew_tile_bool(arena, t, tile, lid, lsz); break;
