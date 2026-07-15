@@ -45,6 +45,22 @@ dispatches on a per-task dtype. Alignment is fine (arena buffers are 64B-aligned
 - **Tier 3 — no native OpenCL type, needs emulation**: `bf16` (store u16, up-convert to f32 for
   math), `complex64/128` (pairs of f32/f64 — every op splits into real/imag). Significant.
 
+### TODO — `pip install` should build + bundle the .so (packaging)
+
+A user hit `Backend 'opencl' is not in the list of known backends` after
+`pip install git+…` — because pip installs only the Python package, never the C++
+`.so`, so `initialize()` can't find the plugin and skips registration. IMMEDIATE fixes
+landed: the loader now searches PJRT_OCL_PLUGIN_PATH → bundled-in-package → dev build
+tree, raises a clear actionable error (not silent), and shouts to stderr when
+JAX_PLATFORMS names opencl; README now says plainly that a bare pip-from-git does NOT
+work and gives the clone+build+`pip install -e python/` path (verified working).
+PROPER fix (needs a clean-env pip flow to test — do NOT ship untested): a
+scikit-build-core (or setuptools+cmake) build backend at the repo root that runs cmake,
+builds libpjrt_ocl.so, and installs it into the wheel at `pjrt_ocl/libpjrt_ocl.so`
+(the loader already checks that bundled location). Requires cmake + OpenCL dev headers
+at install time (document as prerequisites). Then `pip install git+https://…` works
+end-to-end.
+
 ### TODO — refresh README.md once coverage work settles (user, 2026-07-15)
 
 README currently says "dtypes in progress / f32 works today". After the dtype system landed

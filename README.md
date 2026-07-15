@@ -38,10 +38,12 @@ jax.jit(f)  ──►  StableHLO  ──►  lowering (Python)  ──►  VMPro
 
 ## Installation
 
-The plugin has two parts: a Python package (lowering + JAX registration) and a small
-C++ shared library (the OpenCL runtime + VM). Both must be present.
+The plugin has two parts: a Python package (lowering + JAX registration) and a
+compiled C++ shared library (the OpenCL runtime + VM). **A plain `pip install` does
+not build the `.so`** — you must build it and install from the clone. (Automatic
+`pip install`-builds-the-`.so` packaging is planned; see the roadmap.)
 
-### 1. Build the C++ plugin
+### 1. Clone and build the C++ plugin
 
 ```bash
 git clone https://github.com/llandsmeer-ai/pjrt-ocl.git
@@ -50,26 +52,25 @@ cmake -S pjrt_plugin -B pjrt_plugin/build -G Ninja
 cmake --build pjrt_plugin/build          # -> pjrt_plugin/build/libpjrt_ocl.so
 ```
 
-### 2. Install the Python package
-
-Editable install from the clone (recommended — the package then finds the `.so` next
-to it automatically):
+### 2. Install the Python package (editable, from the clone)
 
 ```bash
 pip install -e python/
 ```
 
-Or install the Python package straight from GitHub:
+Installed editable from the clone, the package finds the `.so` you just built
+automatically (via its build-tree location). That's the whole install — the
+`JAX_PLATFORMS=opencl` example below now works.
 
-```bash
-pip install "git+https://github.com/llandsmeer-ai/pjrt-ocl.git#subdirectory=python"
-```
-
-> When installed this way the package lives in `site-packages`, so it can't guess where
-> your built `.so` is — point it at the library you built in step 1:
+> **Do not** `pip install git+https://…` on its own: that installs only the Python
+> package into `site-packages` with no `.so`, and JAX will report
+> `Backend 'opencl' is not in the list of known backends`. If you must install that
+> way, build the `.so` (step 1) and point the package at it:
 > ```bash
 > export PJRT_OCL_PLUGIN_PATH=/path/to/pjrt-ocl/pjrt_plugin/build/libpjrt_ocl.so
 > ```
+> (The package also loads a `libpjrt_ocl.so` bundled next to itself, if a future
+> packaged build puts one there.)
 
 ### 3. Check JAX sees the device
 

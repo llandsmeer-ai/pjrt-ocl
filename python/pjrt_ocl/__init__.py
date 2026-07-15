@@ -34,6 +34,12 @@ logger = logging.getLogger(__name__)
 PLUGIN_PATH_ENV = "PJRT_OCL_PLUGIN_PATH"
 
 
+def _bundled_plugin_path() -> str:
+    # A packaged build places the .so next to this file (pjrt_ocl/libpjrt_ocl.so).
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "libpjrt_ocl.so")
+
+
 def _default_plugin_path() -> str:
     # This file lives at <repo>/python/pjrt_ocl/__init__.py when installed
     # editable; the plugin builds to <repo>/pjrt_plugin/build/libpjrt_ocl.so.
@@ -42,22 +48,32 @@ def _default_plugin_path() -> str:
 
 
 def find_plugin_library() -> str:
-    """Absolute path of the built plugin .so, or raise FileNotFoundError."""
+    """Absolute path of the built plugin .so, or raise FileNotFoundError.
+    Search order: PJRT_OCL_PLUGIN_PATH, bundled-in-package, dev build tree."""
     env = os.environ.get(PLUGIN_PATH_ENV)
     if env:
         if not os.path.isfile(env):
             raise FileNotFoundError(
                 f"{PLUGIN_PATH_ENV}={env!r} is set but that file does not exist")
         return os.path.abspath(env)
+    bundled = _bundled_plugin_path()
+    if os.path.isfile(bundled):
+        return bundled
     default = _default_plugin_path()
     if os.path.isfile(default):
         return default
     raise FileNotFoundError(
-        f"pjrt-ocl plugin library not found: {PLUGIN_PATH_ENV} is unset and the "
-        f"default build location {default} does not exist. Build the plugin "
-        f"(cmake -S pjrt_plugin -B pjrt_plugin/build -G Ninja && "
-        f"cmake --build pjrt_plugin/build) or set {PLUGIN_PATH_ENV} to a built "
-        f"libpjrt_ocl.so.")
+        "pjrt-ocl native plugin (libpjrt_ocl.so) not found. A plain "
+        "`pip install` does NOT build it. Either:\n"
+        "  1. clone the repo and build it:\n"
+        "     cmake -S pjrt_plugin -B pjrt_plugin/build -G Ninja && "
+        "cmake --build pjrt_plugin/build\n"
+        f"  2. then either run from the clone, or set {PLUGIN_PATH_ENV} to the "
+        "built .so:\n"
+        f"     export {PLUGIN_PATH_ENV}=/path/to/pjrt-ocl/pjrt_plugin/build/"
+        "libpjrt_ocl.so\n"
+        f"(searched: {PLUGIN_PATH_ENV} [unset], bundled {bundled}, dev "
+        f"{default})")
 
 
 def lower_service_path() -> str:
@@ -71,9 +87,14 @@ def initialize() -> None:
     try:
         library_path = find_plugin_library()
     except FileNotFoundError as e:
-        logger.warning(
-            "pjrt-ocl: skipping registration of the 'opencl' PJRT platform "
-            "(plugin not built?): %s", e)
+        # Visible (not just logging): otherwise the user only sees jax's opaque
+        # "Backend 'opencl' is not in the list of known backends" downstream.
+        # Only shout when the user actually asked for opencl.
+        if "opencl" in os.environ.get("JAX_PLATFORMS", ""):
+            sys.stderr.write("\npjrt-ocl: cannot register the 'opencl' "
+                             "backend:\n" + str(e) + "\n\n")
+        else:
+            logger.warning("pjrt-ocl: 'opencl' backend not registered: %s", e)
         return
 
     # Import lazily: lower_service.py imports this package too and must stay
