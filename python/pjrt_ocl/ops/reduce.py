@@ -61,6 +61,10 @@ _KIND_BY_REGION_OP = {
     "stablehlo.multiply": PROD,
 }
 
+# integer dtypes whose reduce uses integer accumulation + iinfo identities
+# (matches reduce.cl's i32/u32 path). bool/f-types use the float path.
+_INT_DTYPES = frozenset({L.DT_I32, L.DT_U32, L.DT_I64})
+
 
 def _chunk_for(n: int) -> int:
     """Deterministic chunk size for a flat n-element reduction. Recomputed
@@ -85,8 +89,9 @@ def _decode_imm(imm: int) -> tuple[int, int]:
 
 # --- stablehlo handler ------------------------------------------------------
 
-def _read_scalar_const(value) -> float:
-    """Read a scalar f32 stablehlo.constant that defines `value`."""
+def _read_scalar_const(value, dt: int):
+    """Read a scalar stablehlo.constant that defines `value` (int or float,
+    per the reduction's dtype). Returns a python int/float."""
     import numpy as np
     from jaxlib.mlir import ir
     owner = value.owner
@@ -95,17 +100,29 @@ def _read_scalar_const(value) -> float:
         raise L.LoweringError(
             "reduce: init value is not a compile-time constant "
             "(cannot verify it is the reduction identity)")
-    vals = np.asarray(ir.DenseFPElementsAttr(op.attributes["value"])).reshape(-1)
+    attr = op.attributes["value"]
+    if dt in _INT_DTYPES:
+        vals = np.asarray(ir.DenseIntElementsAttr(attr)).reshape(-1)
+    else:
+        vals = np.asarray(ir.DenseFPElementsAttr(attr)).reshape(-1)
     if vals.size != 1:
         raise L.LoweringError("reduce: init value is not a scalar")
-    return float(vals[0])
+    return vals[0].item()
 
 
-def _assert_identity(kind: int, init: float) -> None:
-    ok = ((kind == SUM and init == 0.0) or
-          (kind == PROD and init == 1.0) or
-          (kind == MAX and math.isinf(init) and init < 0) or
-          (kind == MIN and math.isinf(init) and init > 0))
+def _assert_identity(kind: int, init, dt: int) -> None:
+    if dt in _INT_DTYPES:
+        import numpy as np
+        info = np.iinfo(L.DTYPE_NUMPY[dt])
+        ok = ((kind == SUM and init == 0) or
+              (kind == PROD and init == 1) or
+              (kind == MAX and init == info.min) or
+              (kind == MIN and init == info.max))
+    else:
+        ok = ((kind == SUM and init == 0.0) or
+              (kind == PROD and init == 1.0) or
+              (kind == MAX and math.isinf(init) and init < 0) or
+              (kind == MIN and math.isinf(init) and init > 0))
     if not ok:
         raise L.LoweringError(
             f"reduce: init value {init} is not the identity for kind {kind} "
@@ -120,7 +137,7 @@ def _reduce(ctx, op):
             "reduce: only single-input, single-output reductions are supported "
             f"(got {len(op.operands)} operands, {len(op.results)} results)")
 
-    in_shape, n_in, _ = L.tensor_info(op.operands[0].type)
+    in_shape, n_in, in_dt = L.tensor_info(op.operands[0].type)
     in_rank = len(in_shape)
     dims = sorted(int(x) for x in ir.DenseI64ArrayAttr(op.attributes["dimensions"]))
 
@@ -143,17 +160,18 @@ def _reduce(ctx, op):
             f"{sorted(_KIND_BY_REGION_OP)})")
     kind = _KIND_BY_REGION_OP[compute[0].name]
 
-    _assert_identity(kind, _read_scalar_const(op.operands[1]))
+    _assert_identity(kind, _read_scalar_const(op.operands[1], in_dt), in_dt)
 
     in_buf = ctx.buf_for(op.operands[0])
     n_parts = _n_parts(n_in)
 
-    # PART: input -> n_parts partials (one per chunk)
-    partials = ctx.new_buffer(n_parts)
+    # PART: input -> n_parts partials (one per chunk). Partials + output carry
+    # the INPUT dtype so the VM reduces/accumulates in that dtype.
+    partials = ctx.new_buffer(n_parts, in_dt)
     ctx.emit(L.Instr(L.OP_REDUCE, dst=partials, a=in_buf, b=in_buf,
                      n=n_in, imm=_encode_imm(PHASE_PART, kind)))
     # COMB: partials -> scalar output
-    out = ctx.new_buffer(1)
+    out = ctx.new_buffer(1, in_dt)
     ctx.emit(L.Instr(L.OP_REDUCE, dst=out, a=partials, b=partials,
                      n=n_parts, imm=_encode_imm(PHASE_COMB, kind)))
     ctx.value_to_buf[op.results[0]] = out

@@ -20,8 +20,8 @@ static void exec_tiles(__global uchar *arena, __global const int *aux,
         case TOP_EW:       ew_tile(arena, t, tile, dt, adt, lid, lsz); break;
         case TOP_MMA:      mma_tile(arena, t, tile, As, Bs); break;
         case TOP_GATHER:   gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
-        case TOP_RED_PART: reduce_part_tile(arena, t, tile, As, lid, lsz); break;
-        case TOP_RED_COMB: reduce_comb_tile(arena, t, lid); break;
+        case TOP_RED_PART: reduce_part_tile(arena, t, tile, As, dt, lid, lsz); break;
+        case TOP_RED_COMB: reduce_comb_tile(arena, t, dt, lid); break;
         case TOP_IOTA_DIM: iota_tile(arena, aux, t, tile, lid, lsz); break;
         default: break;
         }
