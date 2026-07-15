@@ -137,6 +137,7 @@ class ParsedSchedule:
     n_lanes: int
     tasks: list[ParsedTask]
     lane_streams: list[list[ParsedEntry]]
+    root_lens: list[int] = dataclasses.field(default_factory=list)
 
 
 class FormatError(ValueError):
@@ -299,6 +300,7 @@ def _parse_schedule(data: bytes, pos: int, n_buffers: int) -> ParsedSchedule:
                                 dtype=dtype, adtype=adtype))
 
     lane_tab: list[tuple[int, int]] = []
+    root_lens: list[int] = []
     for i in range(n_lanes):
         off, count, root_len, _pad = S.LANETAB_STRUCT.unpack_from(data, pos)
         pos += S.LANETAB_STRUCT.size
@@ -309,6 +311,7 @@ def _parse_schedule(data: bytes, pos: int, n_buffers: int) -> ParsedSchedule:
         if root_len > count:
             raise FormatError(f"lane[{i}] root_len {root_len} > count {count}")
         lane_tab.append((off, count))
+        root_lens.append(root_len)
 
     entries: list[ParsedEntry] = []
     for i in range(n_entries):
@@ -328,7 +331,7 @@ def _parse_schedule(data: bytes, pos: int, n_buffers: int) -> ParsedSchedule:
 
     lane_streams = [[entries[off + k] for k in range(count)]
                     for off, count in lane_tab]
-    return ParsedSchedule(n_flags, n_lanes, tasks, lane_streams)
+    return ParsedSchedule(n_flags, n_lanes, tasks, lane_streams, root_lens)
 
 
 # --- numpy reference interpreter --------------------------------------------
@@ -409,11 +412,10 @@ def execute(prog: Program, args: list[np.ndarray]) -> list[np.ndarray]:
 # --- schedule lane simulator (validator b) ----------------------------------
 
 def _split_phases(sched: ParsedSchedule) -> list[list[tuple[int, ParsedEntry]]]:
-    """Split each lane's stream by BARRIER into phases. Asserts every lane has
-    the same barrier count and returns a list of phases; phase p holds
-    [(lane, entry)] for the entries between barrier p-1 and barrier p. Control
-    entries (WHILE/IF) are not produced by the current scheduler and are
-    rejected here (seam)."""
+    """Split each lane's ROOT walk by BARRIER into phases. Asserts every lane
+    has the same barrier count and returns a list of phases; phase p holds
+    [(lane, entry)] for the entries between barrier p-1 and barrier p. Only
+    valid for control-flow-free schedules (WHILE/IF drive `_run_control`)."""
     counts = [sum(1 for e in s if e.task == S.TASK_BARRIER)
               for s in sched.lane_streams]
     if len(set(counts)) > 1:
@@ -428,8 +430,7 @@ def _split_phases(sched: ParsedSchedule) -> list[list[tuple[int, ParsedEntry]]]:
                 p += 1
             elif e.task in (S.TASK_WHILE, S.TASK_IF):
                 raise NotImplementedError(
-                    "schedule simulator: WHILE/IF entries not supported yet "
-                    "(structured seam — see python/NOTES.md)")
+                    "_split_phases: control entries present (use _run_control)")
             elif e.task == S.TASK_NOP:
                 pass
             else:
@@ -479,7 +480,8 @@ def execute_schedule(prog: Program, args: list[np.ndarray],
         raise ValueError(f"expected {len(prog.inputs)} args, got {len(args)}")
     sched = prog.schedule
     _check_coverage(sched)
-    phases = _split_phases(sched)
+    has_control = any(e.task in (S.TASK_WHILE, S.TASK_IF)
+                      for s in sched.lane_streams for e in s)
 
     arena = np.zeros(prog.arena_bytes, dtype=np.uint8)
 
@@ -541,15 +543,108 @@ def execute_schedule(prog: Program, args: list[np.ndarray],
             run_entry(e)
         return arena.copy()
 
-    for phase in phases:
+    def run_batch(batch: list[tuple[int, ParsedEntry]]) -> None:
+        """Execute a barrier phase's entries; assert order-independence
+        (forward vs reverse must agree) and adopt the result."""
+        if not batch:
+            return
         base = arena.copy()
-        forward = run_order(phase, base)
-        reverse = run_order(list(reversed(phase)), base)
+        forward = run_order(batch, base)
+        reverse = run_order(list(reversed(batch)), base)
         if not np.array_equal(forward, reverse):
             raise AssertionError(
                 "schedule phase is order-dependent: lanes conflict within a "
                 "barrier phase")
         arena[:] = forward   # both orders agree; adopt the result
 
+    if has_control:
+        _run_control(sched, arena, view, run_batch)
+    else:
+        for phase in _split_phases(sched):
+            run_batch(phase)
+
     return [view(buf_id).copy().reshape(shape)
             for buf_id, shape in zip(prog.outputs, prog.output_shapes)]
+
+
+def _run_control(sched: ParsedSchedule, arena: np.ndarray, view,
+                 run_batch) -> None:
+    """Lane simulator with a frame stack, mirroring vm2.cl's vm2 interpreter,
+    for schedules that contain WHILE control entries. All lanes step in lockstep
+    between global barriers: each driver iteration walks every lane forward to
+    its next global barrier, collecting the compute entries into one batch;
+    `run_batch` runs it order-independently; then the (uniform) barrier is
+    resolved — an explicit BARRIER just advances, a WHILE cond/body boundary
+    reads the shared loop scalar and transitions every lane's frame identically.
+    Control is uniform across lanes (same structure, same cond) so every lane
+    yields the same barrier token each iteration; a mismatch is a scheduler bug."""
+    n = sched.n_lanes
+    streams = sched.lane_streams
+    ROOT = -1
+    # per-lane frame stack: each frame is [pc, end, widx, phase]
+    stacks = [[[0, sched.root_lens[lane], ROOT, 0]] for lane in range(n)]
+
+    def advance(lane: int, batch: list) -> str:
+        stream = streams[lane]
+        while True:
+            f = stacks[lane][-1]
+            if f[0] >= f[1]:                        # frame range exhausted
+                if f[2] == ROOT:
+                    return "DONE"
+                w = stream[f[2]]
+                if w.task == S.TASK_IF:             # branch done: pop, advance
+                    stacks[lane].pop()
+                    stacks[lane][-1][0] += 1
+                    continue
+                return "WHILE_COND" if f[3] == 0 else "WHILE_BODY"
+            e = stream[f[0]]
+            if e.task == S.TASK_BARRIER:
+                return "BAR"
+            if e.task == S.TASK_WHILE:
+                if len(stacks[lane]) > MAX_WHILE_DEPTH:
+                    raise FormatError(f"WHILE nesting exceeds {MAX_WHILE_DEPTH}")
+                stacks[lane].append([e.tile_lo, e.tile_lo + e.tile_hi, f[0], 0])
+                continue
+            if e.task == S.TASK_IF:
+                raise NotImplementedError("schedule simulator: IF entries")
+            if e.task != S.TASK_NOP:
+                batch.append((lane, e))
+            f[0] += 1
+
+    while True:
+        batch: list = []
+        tokens = [advance(lane, batch) for lane in range(n)]
+        if all(t == "DONE" for t in tokens):
+            # a lane's final compute level (no trailing root barrier) is
+            # collected into `batch` by the same advance() that reaches the
+            # frame end and returns DONE — run it before terminating, else the
+            # last level is dropped.
+            if batch:
+                run_batch(batch)
+            break
+        if len(set(tokens)) != 1:
+            raise AssertionError(
+                f"non-uniform control across lanes: {sorted(set(tokens))}")
+        run_batch(batch)
+        kind = tokens[0]
+        if kind == "BAR":
+            for lane in range(n):
+                stacks[lane][-1][0] += 1            # step past the barrier
+        elif kind == "WHILE_COND":
+            for lane in range(n):
+                f = stacks[lane][-1]
+                w = streams[lane][f[2]]
+                if view(w.signal_flag)[0] != 0:     # loop continues -> body
+                    f[0] = w.wait_flag
+                    f[1] = w.wait_flag + w.wait_count
+                    f[3] = 1
+                else:                               # loop exits -> pop
+                    stacks[lane].pop()
+                    stacks[lane][-1][0] += 1
+        else:                                       # WHILE_BODY -> recheck cond
+            for lane in range(n):
+                f = stacks[lane][-1]
+                w = streams[lane][f[2]]
+                f[0] = w.tile_lo
+                f[1] = w.tile_lo + w.tile_hi
+                f[3] = 0

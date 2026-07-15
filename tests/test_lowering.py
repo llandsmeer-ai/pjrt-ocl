@@ -615,10 +615,16 @@ def test_scheduler_while_loop():
     raise NotImplementedError
 
 
-def test_scheduler_rejects_region_op_for_now():
-    """Until the seam is filled, a WHILE instruction is rejected cleanly."""
+def test_scheduler_emits_while_control_entry():
+    """A WHILE instruction now schedules to a uniform control entry per lane,
+    with cond/body sub-ranges living beyond each lane's root_len (root_len rule,
+    docs/vmprogram.md). Empty cond/body ranges are the degenerate but valid
+    shape used here (a real while carries cond/body compute)."""
+    # root: [WHILE] only (cond/body empty). cond buffer = buf 1 (const 0 -> exit
+    # immediately). This exercises the scheduler's control-entry emission and
+    # the root_len bookkeeping without needing a full jax program.
     prog = L.VMProgram(
-        arena_bytes=64 * 4,
+        arena_bytes=64 * 2,
         buffers=[L.Buffer(0, 4), L.Buffer(64, 4)],
         inputs=[], outputs=[0],
         input_shapes=[], output_shapes=[()],
@@ -626,5 +632,16 @@ def test_scheduler_rejects_region_op_for_now():
         instrs=[L.Instr(L.OP_WHILE, dst=1, a=1, b=0, n=1, imm=0)],
         main_len=1,
     )
-    with pytest.raises(S.ScheduleError):
-        S.schedule_program(prog, GOLDEN_CFG)
+    sched = S.schedule_program(prog, GOLDEN_CFG, allow_multilane_while=True)
+    assert sched.root_lens is not None
+    for lane, stream in enumerate(sched.lane_streams):
+        root_len = sched.root_lens[lane]
+        # every lane's root walk contains exactly one WHILE control entry
+        root = stream[:root_len]
+        whiles = [e for e in root if e.task == S.TASK_WHILE]
+        assert len(whiles) == 1
+        w = whiles[0]
+        # cond/body sub-ranges (empty here) start at/after root_len
+        assert w.tile_lo >= root_len
+        assert w.wait_flag >= root_len
+        assert w.signal_flag == 1              # cond buffer id (pre-patch)

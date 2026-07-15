@@ -69,7 +69,7 @@ _TENSOR_TO_EW = {
     L.OP_FILL_F32: EW_FILL,
 }
 
-# region ops (need recursion; current lowering never emits them)
+# region ops: scheduled recursively into per-lane control entries + sub-streams
 _REGION_OPS = {L.OP_WHILE}
 
 SCHED_HDR_STRUCT = struct.Struct("<IIII")      # n_tasks,n_entries,n_flags,n_lanes
@@ -178,15 +178,18 @@ class Schedule:
     n_lanes: int
     tasks: list[Task]
     lane_streams: list[list[Entry]]         # len == n_lanes
+    # per-lane root_len (top-level walk length). None => whole stream is root
+    # (no control flow). WHILE sub-ranges live at [root_len, len(stream)).
+    root_lens: list[int] | None = None
 
     def serialize_sections(self) -> bytes:
         assert len(self.lane_streams) == self.n_lanes
         flat: list[Entry] = []
         lane_tab: list[tuple[int, int, int]] = []
-        for stream in self.lane_streams:
-            # root_len == len(stream): no control flow yet (region ops raise
-            # ScheduleError). WHILE/IF sub-ranges will live at [root_len:count).
-            lane_tab.append((len(flat), len(stream), len(stream)))
+        for lane, stream in enumerate(self.lane_streams):
+            root_len = (len(stream) if self.root_lens is None
+                        else self.root_lens[lane])
+            lane_tab.append((len(flat), len(stream), root_len))
             flat.extend(stream)
         out = bytearray()
         out += SCHED_HDR_STRUCT.pack(len(self.tasks), len(flat),
@@ -352,48 +355,173 @@ def _pack_level(level_tasks: list[tuple[int, Task]], n_lanes: int,
 
 # --- top-level scheduling ---------------------------------------------------
 
+@dataclasses.dataclass
+class _WhileJob:
+    """A deferred region-scheduling job for one WHILE instruction: the per-lane
+    WHILE Entry objects to patch, plus the cond/body instruction index lists."""
+    while_entries: list          # one Entry per lane (patched after scheduling)
+    cond_indices: list
+    body_indices: list
+
+
+class _Scheduler:
+    """Recursive per-lane stream builder. The root list schedules into each
+    lane's stream; every WHILE emits a uniform control Entry into all lanes and
+    queues its cond/body sub-lists, which are appended AFTER the root (and after
+    any enclosing region) so they live at stream indices >= root_len — the
+    device frame-walk never steps into a sub-range it did not push (root_len
+    rule, docs/vmprogram.md, validated by runtime_test B)."""
+
+    def __init__(self, prog: L.VMProgram, config: DeviceConfig, n_lanes: int):
+        self.prog = prog
+        self.config = config
+        self.n_lanes = n_lanes
+        self.lanes: list[list[Entry]] = [[] for _ in range(n_lanes)]
+        self.tasks: list[Task] = []
+        self.instr_task: dict[int, int] = {}
+        self.region_queue: list[_WhileJob] = []
+
+    def _task_for(self, idx: int) -> int:
+        tid = self.instr_task.get(idx)
+        if tid is None:
+            tid = len(self.tasks)
+            self.instr_task[idx] = tid
+            self.tasks.append(_instr_to_task(self.prog.instrs[idx],
+                                             self.prog.buffers))
+        return tid
+
+    def _add_barrier(self) -> None:
+        for lane in range(self.n_lanes):
+            self.lanes[lane].append(_barrier_entry())
+
+    def _build_levels(self, indices: list[int]):
+        """Ordered levels over `indices` (SSA order). Compute runs are split
+        into maximal dataflow levels; each WHILE is its own singleton level (a
+        natural all-lanes sync point). Yields ("compute", [idx...]) or
+        ("while", idx). NOPs are dropped (no task/entry)."""
+        levels: list = []
+        seg: list[int] = []
+
+        def flush():
+            if seg:
+                for lvl in _levels(self.prog.instrs, seg):
+                    levels.append(("compute", lvl))
+                seg.clear()
+
+        for i in indices:
+            op = self.prog.instrs[i].op
+            if op in _REGION_OPS:
+                flush()
+                levels.append(("while", i))
+            elif op == L.OP_NOP:
+                continue
+            else:
+                seg.append(i)
+        flush()
+        return levels
+
+    def schedule_range(self, indices: list[int], trailing_barrier: bool) -> None:
+        """Append entries for a linear instruction sub-list to every lane, with
+        a global BARRIER after each level. `trailing_barrier` controls the last
+        level's barrier: True for the root (barrier after every level); False
+        for cond/body sub-lists, whose closing barrier the WHILE machinery in
+        the kernel supplies (after the cond scalar read / after the body)."""
+        levels = self._build_levels(indices)
+        for li, (kind, payload) in enumerate(levels):
+            if kind == "compute":
+                level_tasks = [(self._task_for(i), self.tasks[self._task_for(i)])
+                               for i in payload]
+                for lane, entry in _pack_level(level_tasks, self.n_lanes,
+                                               self.config):
+                    self.lanes[lane].append(entry)
+            else:
+                self._emit_while(payload)
+            if trailing_barrier or li != len(levels) - 1:
+                self._add_barrier()
+
+    def _emit_while(self, idx: int) -> None:
+        ins = self.prog.instrs[idx]
+        while_entries = []
+        for lane in range(self.n_lanes):
+            # tile_lo/tile_hi (cond range) + wait_flag/wait_count (body range)
+            # are patched once the sub-lists are scheduled; signal_flag carries
+            # the cond BUFFER id (executor patches to a byte offset at load).
+            e = Entry(TASK_WHILE, tile_lo=0, tile_hi=0, wait_flag=0,
+                      wait_count=0, signal_flag=ins.dst)
+            self.lanes[lane].append(e)
+            while_entries.append(e)
+        self.region_queue.append(_WhileJob(
+            while_entries,
+            list(range(ins.a, ins.a + ins.b)),        # cond instr range
+            list(range(ins.n, ins.n + ins.imm))))     # body instr range
+
+    def schedule_region(self, job: _WhileJob) -> None:
+        """Schedule one while's cond then body sub-lists contiguously into every
+        lane, then patch each lane's WHILE entry with its own (per-lane) cond/
+        body entry ranges. Nested whiles enqueue further jobs (drained later, so
+        their sub-ranges land beyond this body)."""
+        cond_start = [len(l) for l in self.lanes]
+        self.schedule_range(job.cond_indices, trailing_barrier=False)
+        body_start = [len(l) for l in self.lanes]
+        self.schedule_range(job.body_indices, trailing_barrier=False)
+        body_end = [len(l) for l in self.lanes]
+        for lane in range(self.n_lanes):
+            e = job.while_entries[lane]
+            e.tile_lo = cond_start[lane]
+            e.tile_hi = body_start[lane] - cond_start[lane]      # cond_len
+            e.wait_flag = body_start[lane]
+            e.wait_count = body_end[lane] - body_start[lane]     # body_len
+
+
 def schedule_program(prog: L.VMProgram,
-                     config: DeviceConfig | None = None) -> Schedule:
-    """Schedule the tensor VMProgram's root instruction list into per-lane
-    streams. Returns a Schedule (v0 contract: BARRIER between levels; WAIT/
-    SIGNAL unused; n_flags = 0)."""
+                     config: DeviceConfig | None = None,
+                     allow_multilane_while: bool = False) -> Schedule:
+    """Schedule the tensor VMProgram into per-lane streams. Root instrs schedule
+    with a global BARRIER between levels; each WHILE becomes a uniform control
+    entry whose cond/body sub-lists are appended after the root (root_len rule).
+    v0 contract: WAIT/SIGNAL unused; n_flags = 0.
+
+    WHILE + cross-lane data (M4 caveat): the global barrier reliably publishes
+    the *atomic* cond-flag read across workgroups, but regular cross-lane data
+    loads race UNDER ITERATION on the current kernel (measured on NVIDIA — a
+    loop-carried value read by a different lane than wrote it gives a
+    nondeterministic result; docs/decisions.md, project risk #1). Until the
+    barrier is hardened (M5), while-containing programs schedule on a SINGLE
+    lane so every loop-carried buffer's producer/consumer share a lane (no
+    cross-lane data movement). Correctness-first; loop-body parallelism is a
+    later perf item. `allow_multilane_while=True` keeps the multi-lane path (for
+    the python simulator, where cross-lane is exact) — do NOT use it for device
+    schedules."""
     config = config or DeviceConfig.from_env()
     n_lanes = config.nlanes
-    tasks: list[Task] = []
-    lane_streams: list[list[Entry]] = [[] for _ in range(n_lanes)]
+    if (n_lanes > 1 and not allow_multilane_while
+            and any(ins.op == L.OP_WHILE for ins in prog.instrs)):
+        n_lanes = 1
+    sc = _Scheduler(prog, config, n_lanes)
 
-    main = prog.instrs[:prog.main_len]
-    for ins in main:
-        if ins.op in _REGION_OPS:
-            raise ScheduleError(
-                "scheduler: region ops (while/if) not yet scheduled "
-                "(structured seam — see python/NOTES.md)")
+    # Root schedules with a global BARRIER only BETWEEN levels (trailing_barrier
+    # =False): the barrier after the last root level synchronizes nothing
+    # (nothing reads it before the kernel ends + clFinish), so omit it. A
+    # single-level program then needs NO cross-workgroup barrier at all —
+    # important on devices where the persistent-thread barrier doesn't co-reside
+    # (docs/decisions.md #1). WHILE cond/body sub-lists still get their internal
+    # barriers (the while machinery supplies them); they live at indices
+    # >= root_len and are entered mid-root via a frame push, so the smaller
+    # root_len is irrelevant to them.
+    sc.schedule_range(list(range(prog.main_len)), trailing_barrier=False)
+    # a program with no root entries still gets one barrier phase so lane
+    # streams are uniform (and the executor has a defined shape)
+    if not any(sc.lanes):
+        sc._add_barrier()
+    root_lens = [len(l) for l in sc.lanes]
 
-    # compute instrs get a task; NOP (and future no-task ops) do not.
-    instr_task: dict[int, int] = {}
-    for idx, ins in enumerate(main):
-        if ins.op == L.OP_NOP:
-            continue
-        instr_task[idx] = len(tasks)
-        tasks.append(_instr_to_task(ins, prog.buffers))
+    # drain region jobs (BFS): cond/body — and any nested whiles they contain —
+    # append after the root, all at indices >= root_len.
+    while sc.region_queue:
+        sc.schedule_region(sc.region_queue.pop(0))
 
-    sched_indices = [i for i in range(len(main)) if i in instr_task]
-    levels = _levels(main, sched_indices)
-    for li, level in enumerate(levels):
-        level_tasks = [(instr_task[i], tasks[instr_task[i]]) for i in level]
-        for lane, entry in _pack_level(level_tasks, n_lanes, config):
-            lane_streams[lane].append(entry)
-        # global BARRIER only BETWEEN levels — the trailing one after the last
-        # level synchronizes nothing (nothing reads it before the kernel ends +
-        # clFinish), so omit it. A single-level program then needs no
-        # cross-workgroup barrier at all — important on devices where the
-        # persistent-thread barrier doesn't co-reside (docs/decisions.md #1).
-        if li < len(levels) - 1:
-            for lane in range(n_lanes):
-                lane_streams[lane].append(_barrier_entry())
-
-    return Schedule(n_flags=0, n_lanes=n_lanes, tasks=tasks,
-                    lane_streams=lane_streams)
+    return Schedule(n_flags=0, n_lanes=n_lanes, tasks=sc.tasks,
+                    lane_streams=sc.lanes, root_lens=root_lens)
 
 
 def lower_and_schedule(artifact: bytes,
