@@ -378,15 +378,67 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
     // "auto" (or anything else) keeps the default.
   }
 
-  // Lanes advertised to the python scheduler (PJRT_OCL_NLANES). Validated
-  // co-residency regime: <= 3x CUs at 256 threads (poc/01, poc/04); GPUs get
-  // 2 lanes/CU, CPUs 1/CU.
+  // Lanes advertised to the python scheduler (PJRT_OCL_NLANES).
+  // CL_DEVICE_MAX_COMPUTE_UNITS is NOT a portable residency unit: NVIDIA
+  // reports SMs (2 lanes/CU validated at 256 threads, poc/01/04) but Intel
+  // reports vector engines — on Arc 140V (64 XVEs) 2xCU = 128 lanes is 4x the
+  // true capacity of 32 and starves the spin-barrier (decisions.md #9). GPUs
+  // therefore MEASURE co-residency of the real vm2 kernel at init (poc/08
+  // discovery, ~20 ms) and take min(measured, 2xCU) — the cap keeps NVIDIA at
+  // its already-validated sizing until discovery is re-validated there. CPUs
+  // stay 1/CU (host-dispatch; no spin-barrier, so no residency constraint).
   cl_uint cu = rt->info_.compute_units ? rt->info_.compute_units : 1;
+  rt->local_size_ = 256;
   rt->ngroups_ = rt->info_.is_gpu ? 2 * cu : cu;
+  if (rt->info_.is_gpu)
+    if (cl_uint measured = rt->ProbeResidency())
+      rt->ngroups_ = std::min(rt->ngroups_, measured);
   if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
-  rt->local_size_ = 256;
   return rt;
+}
+
+cl_uint OclRuntime::ProbeResidency() {
+  cl_int cerr;
+  cl_uint init[3] = {0u, 1u, 0u};  // lock=0, gate=open, count=0
+  cl_mem d = clCreateBuffer(ctx_, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                            sizeof(init), init, &cerr);
+  if (cerr != CL_SUCCESS) return 0;
+  cl_mem dummy = clCreateBuffer(ctx_, CL_MEM_READ_WRITE, 4096, nullptr, &cerr);
+  if (cerr != CL_SUCCESS) {
+    clReleaseMemObject(d);
+    return 0;
+  }
+  // vm2 checks nlanes==0 before touching any other argument, so every buffer
+  // arg except bar can be the same small dummy.
+  const cl_uint nlanes = 0;  // probe-mode sentinel
+  bool ok = clSetKernelArg(vm_kernel_, 0, sizeof(dummy), &dummy) == CL_SUCCESS &&
+            clSetKernelArg(vm_kernel_, 1, sizeof(dummy), &dummy) == CL_SUCCESS &&
+            clSetKernelArg(vm_kernel_, 2, sizeof(dummy), &dummy) == CL_SUCCESS &&
+            clSetKernelArg(vm_kernel_, 3, sizeof(dummy), &dummy) == CL_SUCCESS &&
+            clSetKernelArg(vm_kernel_, 4, sizeof(dummy), &dummy) == CL_SUCCESS &&
+            clSetKernelArg(vm_kernel_, 5, sizeof(d), &d) == CL_SUCCESS &&
+            clSetKernelArg(vm_kernel_, 6, sizeof(nlanes), &nlanes) == CL_SUCCESS &&
+            clSetKernelArg(vm_kernel_, 7, sizeof(dummy), &dummy) == CL_SUCCESS;
+  cl_uint count = 0;
+  if (ok) {
+    // Oversized on purpose: ticketless groups exit immediately, so this
+    // terminates for any launch size.
+    const size_t launch_groups =
+        std::min<size_t>(4096, std::max<size_t>(64, 4 * info_.compute_units));
+    size_t g = launch_groups * local_size_, l = local_size_;
+    if (clEnqueueNDRangeKernel(queue_, vm_kernel_, 1, nullptr, &g, &l, 0,
+                               nullptr, nullptr) == CL_SUCCESS &&
+        clFinish(queue_) == CL_SUCCESS) {
+      cl_uint out[3] = {0, 0, 0};
+      if (clEnqueueReadBuffer(queue_, d, CL_TRUE, 0, sizeof(out), out, 0,
+                              nullptr, nullptr) == CL_SUCCESS)
+        count = out[2];
+    }
+  }
+  clReleaseMemObject(dummy);
+  clReleaseMemObject(d);
+  return count;
 }
 
 OclRuntime::~OclRuntime() {

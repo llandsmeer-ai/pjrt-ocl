@@ -3,7 +3,8 @@
 Monotone-growing record of StableHLO ops our lowering + VLIW engine handle.
 Each op is verified by `tests/test_ops_*.py` through BOTH validators (tensor
 numpy interpreter + schedule simulator) against the JAX CPU backend, and the
-core families are spot-checked on real NVIDIA + PoCL hardware via the plugin.
+core families are spot-checked on real NVIDIA, Intel Xe2 (Arc 140V) + PoCL
+hardware via the plugin (full suite green on Xe2 and PoCL 2026-07-15).
 
 Updated 2026-07-15 (Phase 2 fan-out + control flow landed: full dtype matrix,
 elementwise math/logical, shape/dynamic-index ops, reduce_window, stablehlo.while).

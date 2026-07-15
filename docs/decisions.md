@@ -383,9 +383,19 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
   NVIDIA reports SMs (2×CU validated, poc/01/04), Intel reports **vector engines (XVEs)**, so
   2×CU oversubscribes 4× and the spin-barrier starves (§1's predicted "occupancy oracle"
   fragility, now measured on a second vendor).
-- 🧭 Fix direction (not yet implemented): vendor-aware lane sizing — Intel GPUs ⇒
-  `CU × (SIMD width / local_size)`-style formula (CU/2 at 256/SIMD16), or better a one-shot
-  init-time co-residency probe (launch N groups, barrier ping with device-side timeout, shrink
-  until it completes) cached with the program binaries. Until then Xe2 works via
-  `PJRT_OCL_VM_LANES=32` or the host-dispatch engine (which needed no tuning at all —
-  plan-B value confirmed).
+- ✅ **FIX (2026-07-15): measured occupancy discovery, `poc/08-occupancy-discovery` → integrated.**
+  Sorensen-Donaldson discovery protocol (gate/ticket/lock, 1.2 atomics on one buffer — safe on
+  the strict-1.2 `VMO_NO_DEVICE_FENCE` build too): ticket holders spin until the gate closes
+  (holds their residency slot), ticketless groups exit immediately ⇒ deadlock-free for ANY
+  launch size. Runs at init as a probe mode INSIDE vm2 (`nlanes==0` sentinel, ~20 ms), because
+  the answer is per-compiled-kernel: a lookalike probe kernel (8 KB SLM + reg pressure but
+  SIMD32) discovered 64 on Xe2 while the real vm2 (SIMD16) discovers exactly **32** — the
+  measured JAX boundary. `ngroups = min(discovered, 2×CU)`; the cap keeps NVIDIA at its
+  validated sizing until discovery is re-validated there. `PJRT_OCL_VM_LANES` still overrides.
+  Full suite green on Xe2 with no overrides after the fix.
+  - 🔬 poc/08 side-finding: SLIM kernels over-discover (256 = whole launch) — Xe2 mid-thread
+    preemption time-slices kernels that don't use barriers/SLM, so they don't need co-residency
+    at all; barrier+SLM kernels (vm2) are non-preemptible and discovery = true residency. If a
+    future kernel is preemptible, over-discovery is harmless (preemption keeps the spin-barrier
+    live). Liveness at discovered count: PASS (1.9 µs/barrier on Xe2, 225 µs on PoCL);
+    discovered+1 on Xe2: spins >60 s, host-killed — discovery is TIGHT.

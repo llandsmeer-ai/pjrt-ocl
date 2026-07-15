@@ -136,3 +136,37 @@ static void vmo_barrier(volatile __global uint *bar, const uint ngroups)
     }
     barrier(CLK_GLOBAL_MEM_FENCE);
 }
+
+/* Occupancy DISCOVERY (poc/08; Sorensen & Donaldson, OOPSLA 2016): count the
+ * workgroups that are SIMULTANEOUSLY resident, deadlock-free no matter how
+ * oversized the launch. d[0]=lock, d[1]=gate (init 1=open), d[2]=count.
+ * A leader takes a ticket while the gate is open; ticket holders spin until
+ * the gate closes (holding their residency slot — without this the scheduler
+ * backfills exited groups and the count inflates); ticketless groups exit
+ * immediately and never wait on anyone. Ticket 0 closes the gate once the
+ * count has been stable for a window. Uses only OpenCL 1.2 atomics on a
+ * single buffer — safe even on the strict-1.2 VMO_NO_DEVICE_FENCE build. */
+static uint vmo_discover(volatile __global uint *d)
+{
+    uint t = 0xFFFFFFFFu;
+    while (atomic_cmpxchg(&d[0], 0u, 1u) != 0u)
+        ;
+    if (atomic_add(&d[1], 0u) == 1u)
+        t = atomic_inc(&d[2]);
+    atomic_xchg(&d[0], 0u);
+    if (t == 0u) {
+        uint last = 1u, stable = 0u;
+        for (uint i = 0u; i < 50000000u && stable < 100000u; ++i) {
+            const uint c = atomic_add(&d[2], 0u);
+            if (c == last) stable++; else { stable = 0u; last = c; }
+        }
+        while (atomic_cmpxchg(&d[0], 0u, 1u) != 0u)
+            ;
+        atomic_xchg(&d[1], 0u);
+        atomic_xchg(&d[0], 0u);
+    } else if (t != 0xFFFFFFFFu) {
+        while (atomic_add(&d[1], 0u) == 1u)
+            ;
+    }
+    return t;
+}

@@ -47,6 +47,18 @@ __kernel void vm2(__global uchar *arena,
                   __global uint *stats)              /* arrival rank per
                                                         [barrier_i*nlanes+lane] */
 {
+    /* nlanes == 0: occupancy-probe mode (runtime.cc ProbeResidency; poc/08).
+     * Must run before any other argument is touched — probe launches pass a
+     * dummy buffer for everything except bar. The probe lives INSIDE vm2 so
+     * it inherits vm2's exact compiled footprint (SIMD width, GRF mode, SLM),
+     * which is what determines co-residency: on Xe2 a lookalike probe kernel
+     * over-reported 64 where the real vm2's limit is 32 (poc/08). */
+    if (nlanes == 0u) {
+        if (get_local_id(0) == 0u)
+            vmo_discover(bar);
+        return;
+    }
+
     const uint lane = get_group_id(0);
     const uint lid = get_local_id(0);
     /* Shared local scratch: MMA staging (As/Bs panels) and REDUCE_PART tree

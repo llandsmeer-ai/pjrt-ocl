@@ -134,6 +134,11 @@ class OclRuntime {
 
  private:
   OclRuntime() = default;
+  // Launches vm2 in probe mode (nlanes=0 sentinel) with an oversized grid and
+  // returns the measured co-resident workgroup count for the REAL vm2 kernel
+  // (poc/08 discovery protocol — deadlock-free for any launch size). 0 on any
+  // CL error (caller falls back to the heuristic).
+  cl_uint ProbeResidency();
   DeviceInfo info_;
   cl_device_id dev_ = nullptr;
   cl_context ctx_ = nullptr;
@@ -141,7 +146,7 @@ class OclRuntime {
   cl_program program_ = nullptr;
   cl_kernel vm_kernel_ = nullptr;
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
-  cl_uint ngroups_ = 0;    // co-resident workgroups (poc/01 rule: <= CUs)
+  cl_uint ngroups_ = 0;    // co-resident workgroups (GPUs: measured, poc/08)
   size_t local_size_ = 64;
   bool host_dispatch_ = false;
   std::mutex mu_;  // serializes execute (single in-order queue)
