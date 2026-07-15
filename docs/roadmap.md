@@ -25,12 +25,20 @@ performance mode. Work autonomously. This file is the plan of record for continu
 
 ## Phase 3 perf directives (user, 2026-07-15)
 
-1. **Fix transfers — keep data ON DEVICE.** Investigate H2D/D2H per execute; PJRT input buffers
-   should be device-resident cl_mem and stay on device across executes (device→device or direct
-   VM read, not host round-trips). Buffer donation. This is the #1 next item.
-2. **Per-op perf characterization** (every op): (a) does it actually parallelize? — measure
-   scaling as lanes/execution-units increase; (b) compare to JAX's own CPU + GPU backends
-   (python-level benchmark). Fix any perf bug found.
+1. ✅ **Transfers fixed — data stays ON DEVICE.** PJRT_Buffer holds a device cl_mem;
+   BufferFromHostBuffer uploads once, Execute copies inputs device→device into the arena and
+   leaves outputs on device, ToHostBuffer is the only (lazy) D2H. Sequential/chained jit calls
+   no longer round-trip host. (ef11206)
+2. ✅ **Per-op perf characterized** (docs/perf-findings.md, tools/bench_ops.*): all ops
+   parallelize with lanes (monotone speedup to saturation); beat JAX CPU 1.75×–19×; 43µs
+   per-execute floor. Bug found: memory-bound ops at 13–26% HBM peak due to arena copies.
+3. **NEXT perf item — zero-copy buffer binding**: pass input/output cl_mems as VM kernel args;
+   loader marks buffer ids as input-slot/output-slot/arena so the VM reads inputs & writes
+   outputs directly (no arena device→device copy). ~2× on memory-bound ops. Architectural
+   (vm2 ABI + loader); deferred to avoid destabilizing the verified engine.
+4. **NEXT reliability item — PoCL barrier (decisions #1)**: Plan-B host-dispatch or typed-lane
+   kernel split so PoCL (and the shared-megakernel local-mem tax) stops deadlocking under
+   iteration. NVIDIA unaffected.
 
 ## Phase 1 — VLIW engine in the real plugin (main session, critical path)
 
