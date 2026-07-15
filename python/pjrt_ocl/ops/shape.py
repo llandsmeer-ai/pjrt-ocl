@@ -69,6 +69,54 @@ def _broadcast_in_dim(ctx, op):
     ctx.value_to_buf[op.results[0]] = dst
 
 
+@L.handles("stablehlo.reshape")
+def _reshape(ctx, op):
+    # Row-major flat storage makes reshape a pure relabel: the element order is
+    # bit-identical, so alias the input's buffer under the new shape (no
+    # instruction, like func.return / constants). stablehlo.reshape carries no
+    # dimension-reorder attribute (that would be a transpose).
+    in_n = L.tensor_info(op.operands[0].type)[1]
+    out_n = L.tensor_info(op.results[0].type)[1]
+    if in_n != out_n:
+        raise L.LoweringError(
+            f"reshape: element count {in_n} != {out_n} (bitcast/resize?)")
+    ctx.value_to_buf[op.results[0]] = ctx.buf_for(op.operands[0])
+
+
+@L.handles("stablehlo.slice")
+def _slice(ctx, op):
+    # dst[i] = a[ start + i*slice_stride ] per axis -> a strided gather.
+    from jaxlib.mlir import ir
+    in_shape, _, _ = L.tensor_info(op.operands[0].type)
+    out_shape, _, _ = L.tensor_info(op.results[0].type)
+    starts = [int(x) for x in
+              ir.DenseI64ArrayAttr(op.attributes["start_indices"])]
+    sstrides = [int(x) for x in ir.DenseI64ArrayAttr(op.attributes["strides"])]
+    in_strides = _row_major_strides(in_shape)
+    out_strides = [in_strides[d] * sstrides[d] for d in range(len(out_shape))]
+    src_off = sum(starts[d] * in_strides[d] for d in range(len(in_shape)))
+    dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]),
+                       out_strides, src_off)
+    ctx.value_to_buf[op.results[0]] = dst
+
+
+@L.handles("stablehlo.reverse")
+def _reverse(ctx, op):
+    # reversed axes walk with a negative stride, starting at the last element.
+    from jaxlib.mlir import ir
+    in_shape, _, _ = L.tensor_info(op.operands[0].type)
+    dims = {int(x) for x in ir.DenseI64ArrayAttr(op.attributes["dimensions"])}
+    in_strides = _row_major_strides(in_shape)
+    out_strides = list(in_strides)
+    src_off = 0
+    for d in dims:
+        out_strides[d] = -in_strides[d]
+        src_off += (in_shape[d] - 1) * in_strides[d]
+    dst = _emit_gather(ctx, in_shape, ctx.buf_for(op.operands[0]),
+                       out_strides, src_off)
+    ctx.value_to_buf[op.results[0]] = dst
+
+
 @L.handles("stablehlo.transpose")
 def _transpose(ctx, op):
     from jaxlib.mlir import ir
