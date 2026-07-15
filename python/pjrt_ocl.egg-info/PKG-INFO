@@ -1,0 +1,117 @@
+Metadata-Version: 2.4
+Name: pjrt-ocl
+Version: 0.1.0
+Summary: JAX PJRT plugin executing StableHLO on OpenCL devices via a device-side bytecode VM
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: jax
+Requires-Dist: numpy
+
+# python/ NOTES — productionizing poc/03 into pjrt_ocl (2026-07-14)
+
+For merge into `docs/decisions.md`. Everything observed on jax/jaxlib 0.10.2, python 3.12.
+
+## What the C++ side must know (the contract)
+
+- `initialize()` registers platform **'opencl'**, priority 500, and passes
+  `register_plugin(..., options={'python_exe': sys.executable,
+  'lower_service': <abs path to python/pjrt_ocl/lower_service.py>})`. These arrive as
+  `PJRT_Client_Create` create_options (both plain strings).
+- Lowering invocation: `<python_exe> <lower_service>` with the VHLO portable artifact on
+  **stdin**, VMProgram v1 on **stdout**. Exit codes: 0 ok; **2 unsupported program** (valid
+  input, beyond op coverage → surface a clean PJRT error, UNIMPLEMENTED-ish); **3 internal
+  error**. On failure stdout is empty and stderr carries one JSON object
+  `{"error": <exception class>, "message": <str>}`. (poc/03 used exit 1 for internal errors;
+  the packaged service uses 3 per the M1 task spec — update any C++ code written against 1.)
+- Plugin .so discovery (python side): env `PJRT_OCL_PLUGIN_PATH`, else
+  `<repo>/pjrt_plugin/build/libpjrt_ocl.so` (repo root = two dirs above the editable-installed
+  package). Missing .so → `initialize()` logs a warning and **skips registration** (verified:
+  `import jax; jax.devices()` stays healthy, cpu backend selected).
+
+## VMProgram v1 — spec readings recorded (docs/vmprogram.md)
+
+Implemented byte-exactly as specified plus the coordinator's IO-shapes amendment. Points where
+the spec text left room, and the reading implemented (golden test `test_golden_layout_exact_bytes`
+pins all of these):
+
+1. **Section order** = the order the spec lists them: header, buffer table, IO maps,
+   **IO shapes** (spec update 2026-07-14: `{rank u32, pad u32, dims u64[rank]}` per IO buffer,
+   inputs in argument order then outputs), const pool, instructions. Every section start is
+   8B-aligned by construction (all entries are 8B multiples after the mandated padding), so no
+   inter-section padding is ever emitted; the reader still asserts alignment defensively.
+2. **IO-shapes count is implicit** (`n_inputs + n_outputs`) — the header has no field for it.
+   The amendment didn't add one; readers must derive it.
+3. **"padded to 8B after each array"** (IO maps) read as: pad after the inputs array AND after
+   the outputs array, separately. Rank-0 IO shapes are a bare `{rank=0, pad}` 8-byte entry.
+4. **No COPY opcode in v1** (poc/03's strawman had one). Returning an argument/constant
+   unchanged, or the same value twice, is lowered by **aliasing**: the outputs map simply
+   references the producing buffer id. Executor consequence: an output region may coincide with
+   an input/const region; reading outputs after the run is always correct since v1 is
+   synchronous. If the C++ side ever wants distinct result allocations it must copy on D2H.
+5. **arena_bytes includes the 64B tail padding** of the last buffer (allocation advances in
+   64B units), so the arena size is always a multiple of 64. Harmless either way; recorded so
+   the golden numbers make sense (3×f32[8] → arena 192, not 160).
+6. **Splat constants are expanded** into the const pool (N copies) rather than lowered to
+   `FILL_F32`. Chosen for executor simplicity (one const-upload path); FILL emission is a
+   cheap follow-up if const-pool bloat ever matters. FILL/IOTA/LTS/WHILE are still fully
+   supported by vmreader's parser+interpreter (hand-built-program test) so the C++ executor
+   has a reference for all 8 opcodes.
+7. **WHILE evaluation order**: cond list runs first, then `dst[0]` is tested; body runs only
+   while it is nonzero (i.e. `while cond() { body(); }`, cond re-evaluated after each body).
+   Matches poc/01 test4. The numpy interpreter uses plain recursion with the spec's depth
+   cap (8) enforced.
+8. Reader strictness (`vmreader.parse`): rejects bad magic/version, non-8B-aligned sections,
+   non-64B-aligned buffer offsets, buffers outside the arena, unknown dtype/opcode, nonzero pad
+   fields, out-of-range buffer indices / WHILE sub-list ranges, const byte_len > buffer size,
+   and trailing bytes. Mirror this in the C++ loader (spec says reject loudly).
+
+## Tried / failed / measured
+
+- **XLA CPU contracts `a*b - c` into an FMA under `jax.jit`** — bit-exact comparison against
+  jax.jit is NOT achievable for general data with mul-feeding-add/sub patterns. Measured
+  4.66e-9 (1 ULP) divergence on f32 standard-normal data; jit result equals the
+  f64-compute-then-round value, i.e. a hardware FMA. Tried and failed to disable it:
+  `--xla_allow_excess_precision=false`, `--xla_cpu_enable_fast_math=false`,
+  `--xla_cpu_use_fusion_emitters=false` (no effect),
+  `--xla_cpu_disable_new_fusion_emitters=true`, `--xla_cpu_disable_tiled_emitter=true`
+  (flags don't exist → crash). **Eager (non-jit) jax executes one XLA op at a time and matches
+  our per-op VM exactly** (diff 0.0 on the same data). Test strategy adopted: e2e cases use
+  integer-valued f32 inputs (all intermediates exactly representable ⇒ contraction cannot
+  change results ⇒ bit-exact vs jax.jit), plus one real-valued case compared bit-exactly
+  against eager jax. poc/03's atol=0 pass on `(a + b*c) - K` was seed luck.
+  **M2/M3 consequence**: e2e GPU tests comparing against jax.jit CPU need the same policy
+  (integer-valued data, or a 1-ULP tolerance on fusable patterns).
+- **Entry-point discovery works as documented**: with `pjrt-ocl` pip-installed (editable),
+  plain `import jax` already imports `pjrt_ocl` and calls `initialize()` (visible via the
+  skip-registration warning). No `jax_plugins/` namespace dir needed — poc/02's dir approach
+  is superseded; `initialize()` still guards `"opencl" in xb._backend_factories` in case both
+  are ever present.
+- jax's `discover_pjrt_plugins()` wraps `initialize()` in a bare `except:` with
+  `logger.exception`, so raising on a missing .so wouldn't crash jax either — but it would
+  print a full traceback on every import in a source checkout. Log-and-skip chosen instead;
+  `find_plugin_library()` raises the clear FileNotFoundError for anyone calling it directly.
+- `register_plugin` contract re-read from jax 0.10.2 source (`jax/_src/xla_bridge.py:596`):
+  `options` may be a dict or a zero-arg callable returning one; values go through
+  `xla_client._NameValueMapping` (str/int/float/bool/lists). We pass a plain dict of two strs.
+  Also confirmed: passing both `library_path` and `c_api` is an error; we pass only
+  `library_path`.
+- **pyproject dependencies**: declared `jax` + `numpy` unpinned (jaxlib comes with jax).
+  Deliberately no version pins — a plugin must not fight the host env's jax pin; we develop
+  against 0.10.2 (docs/decisions.md #4b). No other deps.
+- `pip install -e python/` with `--cache-dir third_party/pip-cache` works; `pytest` was not in
+  the venv and was installed the same way (pytest 9.1.1).
+- `lower_service.py` runs both as `python -m pjrt_ocl.lower_service` and as a direct script
+  path (what the C++ plugin does). Direct-script mode falls back to inserting `python/` on
+  sys.path if the package isn't installed, so a bare source checkout works too. Both modes
+  produce byte-identical VMProgram output (asserted during bring-up).
+- Artifact-byte instability across call sites (poc/03 NOTES #3) reconfirmed implicitly: tests
+  never compare artifact bytes, only lowered results.
+
+## Open questions / follow-ups
+
+- `python_exe`/`lower_service` option **key names** are now load-bearing for the C++ side —
+  if M2 renames them, update `pjrt_ocl/__init__.py` and this note together.
+- Buffer plan is still naive one-buffer-per-SSA-value (no liveness reuse) — M1 leftover,
+  fine for current program sizes.
+- Should the service cap artifact size / add a timeout guard? Currently reads stdin to EOF
+  unbounded; the C++ side should enforce a subprocess timeout.

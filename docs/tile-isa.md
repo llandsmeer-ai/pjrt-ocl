@@ -133,6 +133,13 @@ measured bubble % improves; (e) perf vs serial megakernel and streamed launches 
   status stays CL_SUBMITTED during deadlock (not a liveness signal) — use a host watchdog.
 - Ceiling 2 (accept): no SASS/PTX access from OpenCL on NVIDIA ⇒ CLBlast-class 40–70% of SIMT
   peak is the realistic target (cuBLAS ~85–90%).
+  📈 **poc/06 progress 2026-07-15**: naive 16×16 (4.3 TFLOPS) → register-blocked 128×128 BK16
+  = **26.2 TFLOPS / 24.7% peak, portable** (6.1×). Biggest lever: 8×8 register µtiles +
+  non-transposed A staging. 16 KB local, ~80 reg/thread (occupancy limiter, 2 wg/SM optimal).
+  Negatives: float4 staging net-neutral & crashes PoCL compiler (→ vendor override only);
+  double-buffering 0% (NVIDIA hides latency at 2 resident wg); interleaved µtile map REGRESSED.
+  Need warm GPU clocks to measure (2.1 vs 4.3 cold/warm). Next for 30+: float4 register
+  accumulators, subgroup broadcast, -cl-mad-enable. This is the MMA_TILE the VM adopts in Phase 3.
 - Ceiling 3 (fundamental): matrix units unreachable from OpenCL on NVIDIA (tensor cores) and
   AMD (MFMA); Intel exposes cl_intel_subgroup_matrix_multiply_accumulate. SIMT fp32 rate is our
   matmul ceiling ⇒ ~4–8x behind tensor-core TF32/BF16 on matmul-heavy ML on NVIDIA. Per-vendor
