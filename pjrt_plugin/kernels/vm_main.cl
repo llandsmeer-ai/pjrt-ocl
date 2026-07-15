@@ -24,6 +24,9 @@ static void exec_tiles(__global uchar *arena, __global const int *aux,
         case TOP_RED_COMB: reduce_comb_tile(arena, t, dt, lid); break;
         case TOP_IOTA_DIM: iota_tile(arena, aux, t, tile, lid, lsz); break;
         case TOP_SCATTER:  scatter_tile(arena, aux, t, tile, esz, lid, lsz); break;
+        case TOP_DYN_GATHER:  dyn_gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
+        case TOP_DYN_SCATTER: dyn_scatter_tile(arena, aux, t, tile, esz, lid, lsz); break;
+        case TOP_RED_WINDOW:  redwin_tile(arena, aux, t, tile, dt, lid, lsz); break;
         default: break;
         }
     }

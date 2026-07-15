@@ -133,6 +133,9 @@ OP_XOR = 44              # stablehlo.xor
 OP_NOT = 45              # stablehlo.not
 OP_IS_FINITE = 46        # stablehlo.is_finite (float -> bool)
 OP_SCATTER = 47          # strided scatter (concatenate/pad); aux = rank,in_dims,out_strides,out_off
+OP_DYNAMIC_SLICE = 48    # gather with a runtime base offset (aux carries start-scalar byte offsets)
+OP_DYNAMIC_UPDATE_SLICE = 49  # scatter with a runtime base offset
+OP_REDUCE_WINDOW = 50    # windowed reduction (pooling); aux = kind,rank,out/win/stride/pad/in dims+strides
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -152,7 +155,10 @@ OP_NAMES = {
     OP_ROUND_NEAREST_AFZ_F32: "round_nearest_afz_f32",
     OP_ATAN2_F32: "atan2_f32", OP_REMAINDER_F32: "remainder_f32",
     OP_AND: "and", OP_OR: "or", OP_XOR: "xor", OP_NOT: "not",
-    OP_IS_FINITE: "is_finite",
+    OP_IS_FINITE: "is_finite", OP_SCATTER: "scatter",
+    OP_DYNAMIC_SLICE: "dynamic_slice",
+    OP_DYNAMIC_UPDATE_SLICE: "dynamic_update_slice",
+    OP_REDUCE_WINDOW: "reduce_window",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
@@ -189,6 +195,10 @@ class Instr:
     n: int = 0
     imm: int = 0
     aux: int = 0        # v2: aux-pool word offset (pad0 renamed); 0 for EW ops
+    # Extra buffer ids read besides a/b (e.g. dynamic_slice start-index scalars,
+    # whose ids ride in the aux pool the scheduler can't inspect). Consumed by
+    # the scheduler's dependency analysis only — NOT serialized.
+    reads_hint: tuple = ()
 
 
 def _pad8(out: bytearray) -> None:

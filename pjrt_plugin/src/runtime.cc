@@ -168,7 +168,9 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
       if (id >= n_buffers) return fail("task buffer id out of range");
     if (base_op == kTopEw && t.p0 == kEwSubSelect && t.p3 >= n_buffers)
       return fail("select pred id out of range");
-    if ((base_op == kTopGather || base_op == kTopIotaDim) && t.p0 >= n_aux)
+    if ((base_op == kTopGather || base_op == kTopIotaDim ||
+         base_op == kTopDynGather || base_op == kTopDynScatter ||
+         base_op == kTopRedWindow) && t.p0 >= n_aux)
       return fail("task aux offset out of range");
   }
   uint32_t barrier_count_ref = 0;
