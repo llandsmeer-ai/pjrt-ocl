@@ -50,7 +50,21 @@ enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
 enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,
        SUB_ABS, SUB_FLOOR, SUB_CEIL, SUB_SIGN, SUB_FILL, SUB_IOTA_FLAT,
-       SUB_CMP, SUB_SELECT, SUB_LTS, SUB_CONVERT };
+       SUB_CMP, SUB_SELECT, SUB_LTS, SUB_CONVERT,
+       /* new float binary (routed through ew_bin; kept contiguous with
+        * SUB_ADD..SUB_POW so ew_is_bin() in ops/ew.cl is a simple range
+        * check) */
+       SUB_ATAN2, SUB_REMAINDER,
+       /* new float unary (routed through ew_un; contiguous so ew_is_un() in
+        * ops/ew.cl is a range check, same trick as SUB_COPY..SUB_SIGN) */
+       SUB_LOG1P, SUB_EXPM1, SUB_CBRT, SUB_SIN, SUB_COS, SUB_TAN,
+       SUB_RINT /* round_nearest_even */, SUB_ROUND /* round_nearest_afz */,
+       /* bitwise int32/bool — dedicated dispatch in ew_tile_i32/ew_tile_bool
+        * (NOT ew_bin/ew_un, which are float-only helpers) */
+       SUB_AND, SUB_OR, SUB_XOR, SUB_NOT,
+       /* mixed-dtype: float operand -> bool result (own dispatch in ew_tile,
+        * like SUB_CMP/SUB_SELECT/SUB_CONVERT) */
+       SUB_ISFINITE };
 
 #define ENT_NOP     0xFFFFFFFFu
 #define ENT_BARRIER 0xFFFFFFFEu

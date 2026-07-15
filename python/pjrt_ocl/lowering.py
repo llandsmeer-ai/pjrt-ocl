@@ -115,6 +115,26 @@ OP_DOT = 27              # aux: M, N, K
 OP_IOTA_DIM = 28         # aux: rank, out_dims[], dim
 OP_IF = 29
 OP_CONVERT = 30          # dtype cast: read a as operand dtype, write dst dtype
+# batch: elementwise coverage growth (docs/coverage-baseline.md "easy EW ops").
+# Float unary transcendentals/rounding:
+OP_LOG1P_F32 = 31        # stablehlo.log_plus_one
+OP_EXPM1_F32 = 32        # stablehlo.exponential_minus_one
+OP_CBRT_F32 = 33         # stablehlo.cbrt
+OP_SIN_F32 = 34          # stablehlo.sine
+OP_COS_F32 = 35          # stablehlo.cosine
+OP_TAN_F32 = 36          # stablehlo.tan
+OP_ROUND_NEAREST_EVEN_F32 = 37   # stablehlo.round_nearest_even
+OP_ROUND_NEAREST_AFZ_F32 = 38    # stablehlo.round_nearest_afz
+# Float binary:
+OP_ATAN2_F32 = 39        # stablehlo.atan2
+OP_REMAINDER_F32 = 40    # stablehlo.remainder (C fmod semantics)
+# Bitwise int32/bool (same opcode reused for both dtypes, like compare/select):
+OP_AND = 41              # stablehlo.and
+OP_OR = 42               # stablehlo.or
+OP_XOR = 43              # stablehlo.xor
+OP_NOT = 44              # stablehlo.not
+# Mixed dtype: float operand -> bool result.
+OP_IS_FINITE = 45        # stablehlo.is_finite
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -127,6 +147,13 @@ OP_NAMES = {
     OP_CMP_F32: "cmp_f32", OP_SELECT_F32: "select_f32",
     OP_GATHER_STRIDED: "gather_strided", OP_REDUCE: "reduce", OP_DOT: "dot",
     OP_IOTA_DIM: "iota_dim", OP_IF: "if", OP_CONVERT: "convert",
+    OP_LOG1P_F32: "log1p_f32", OP_EXPM1_F32: "expm1_f32", OP_CBRT_F32: "cbrt_f32",
+    OP_SIN_F32: "sin_f32", OP_COS_F32: "cos_f32", OP_TAN_F32: "tan_f32",
+    OP_ROUND_NEAREST_EVEN_F32: "round_nearest_even_f32",
+    OP_ROUND_NEAREST_AFZ_F32: "round_nearest_afz_f32",
+    OP_ATAN2_F32: "atan2_f32", OP_REMAINDER_F32: "remainder_f32",
+    OP_AND: "and", OP_OR: "or", OP_XOR: "xor", OP_NOT: "not",
+    OP_IS_FINITE: "is_finite",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
