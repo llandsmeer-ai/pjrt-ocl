@@ -399,6 +399,8 @@ OclRuntime::~OclRuntime() {
   if (vm_kernel_) clReleaseKernel(vm_kernel_);
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
   if (dummy_buf_) clReleaseMemObject(dummy_buf_);
+  for (auto& [sz, v] : buf_pool_)
+    for (cl_mem m : v) clReleaseMemObject(m);
   if (program_) clReleaseProgram(program_);
   if (queue_) clReleaseCommandQueue(queue_);
   if (ctx_) clReleaseContext(ctx_);
@@ -816,7 +818,6 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
     return std::chrono::duration<double, std::milli>(b - a).count();
   };
   auto t0 = clk();
-  cl_int cerr;
 
   // Bind I/O ports (zero-copy) and copy only the non-ported buffers through the
   // arena. Inputs: ported -> the kernel reads the input cl_mem directly; else
@@ -839,10 +840,8 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
   outputs->assign(p.outputs.size(), nullptr);
   for (size_t o = 0; o < p.outputs.size(); ++o) {
     const auto& b = p.buffers[p.outputs[o]];
-    cl_mem out = clCreateBuffer(rt_->ctx(), CL_MEM_READ_WRITE,
-                                std::max<size_t>(b.size_bytes, 4), nullptr,
-                                &cerr);
-    if (cerr != CL_SUCCESS) {
+    cl_mem out = rt_->PoolAlloc(std::max<size_t>(b.size_bytes, 4), err);
+    if (!out) {
       *err = "ExecuteDevice: output alloc failed";
       for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
       outputs->clear();
@@ -889,15 +888,39 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
   return true;
 }
 
-cl_mem OclRuntime::AllocDevice(size_t bytes, std::string* err) {
+cl_mem OclRuntime::PoolAlloc(size_t bytes, std::string* err) {
+  const size_t sz = std::max<size_t>(bytes, 4);
+  {
+    std::lock_guard<std::mutex> lk(pool_mu_);
+    auto it = buf_pool_.find(sz);
+    if (it != buf_pool_.end() && !it->second.empty()) {
+      cl_mem m = it->second.back();
+      it->second.pop_back();
+      return m;  // reuse a recently-freed same-size buffer (no lazy re-alloc)
+    }
+  }
   cl_int cerr;
-  cl_mem m = clCreateBuffer(ctx_, CL_MEM_READ_WRITE, std::max<size_t>(bytes, 4),
-                            nullptr, &cerr);
+  cl_mem m = clCreateBuffer(ctx_, CL_MEM_READ_WRITE, sz, nullptr, &cerr);
   if (cerr != CL_SUCCESS) {
-    *err = "AllocDevice failed: " + std::to_string(cerr);
+    *err = "PoolAlloc failed: " + std::to_string(cerr);
     return nullptr;
   }
   return m;
+}
+
+void OclRuntime::PoolFree(cl_mem m, size_t bytes) {
+  if (!m) return;
+  const size_t sz = std::max<size_t>(bytes, 4);
+  std::lock_guard<std::mutex> lk(pool_mu_);
+  auto& v = buf_pool_[sz];
+  if (v.size() < kPoolPerSize)
+    v.push_back(m);
+  else
+    clReleaseMemObject(m);
+}
+
+cl_mem OclRuntime::AllocDevice(size_t bytes, std::string* err) {
+  return PoolAlloc(bytes, err);
 }
 
 bool OclRuntime::WriteToDevice(cl_mem dst, const void* host, size_t bytes,

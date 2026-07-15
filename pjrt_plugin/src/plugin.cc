@@ -643,7 +643,8 @@ static PJRT_Error* Impl_PJRT_Client_BufferFromHostBuffer(
 
 static PJRT_Error* Impl_PJRT_Buffer_Destroy(PJRT_Buffer_Destroy_Args* args) {
   if (args->buffer && args->buffer->mem)
-    clReleaseMemObject(args->buffer->mem);
+    args->buffer->client->runtime->PoolFree(args->buffer->mem,
+                                            args->buffer->size_bytes);
   delete args->buffer;
   return nullptr;
 }
@@ -694,7 +695,8 @@ static PJRT_Error* Impl_PJRT_Buffer_Memory(PJRT_Buffer_Memory_Args* args) {
 static PJRT_Error* Impl_PJRT_Buffer_Delete(PJRT_Buffer_Delete_Args* args) {
   args->buffer->deleted = true;
   if (args->buffer->mem) {
-    clReleaseMemObject(args->buffer->mem);
+    args->buffer->client->runtime->PoolFree(args->buffer->mem,
+                                            args->buffer->size_bytes);
     args->buffer->mem = nullptr;
   }
   return nullptr;

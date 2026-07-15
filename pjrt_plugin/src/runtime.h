@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #define CL_TARGET_OPENCL_VERSION 300
@@ -132,6 +133,14 @@ class OclRuntime {
                      std::string* err);
   bool ReadFromDevice(cl_mem src, void* host, size_t bytes, std::string* err);
 
+  // Size-keyed cl_mem pool. Fresh device allocations of >=2 MB hit a slow
+  // driver path (measured: ~0.1 ms on NVIDIA, done lazily on first kernel
+  // write) — costly when a fresh output buffer is allocated every execute.
+  // PoolAlloc reuses a same-size buffer if one was recently freed (PoolFree),
+  // else allocates. Thread-safe (own mutex, independent of the execute mutex).
+  cl_mem PoolAlloc(size_t bytes, std::string* err);
+  void PoolFree(cl_mem m, size_t bytes);
+
   // 1-byte placeholder bound to unused kernel I/O ports (never dereferenced).
   cl_mem dummy_buf() const { return dummy_buf_; }
 
@@ -149,6 +158,9 @@ class OclRuntime {
   size_t local_size_ = 64;
   bool host_dispatch_ = false;
   std::mutex mu_;  // serializes execute (single in-order queue)
+  std::mutex pool_mu_;
+  std::unordered_map<size_t, std::vector<cl_mem>> buf_pool_;
+  static constexpr size_t kPoolPerSize = 4;  // cap per size (bounds memory)
 };
 
 // ---- Loaded program (one per PJRT executable) ------------------------------
