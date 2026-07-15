@@ -7,7 +7,20 @@ core families are spot-checked on real NVIDIA + PoCL hardware via the plugin.
 
 Updated 2026-07-15 (Phase 2 fan-out landed).
 
-## Supported
+## Dtypes (byte-addressed arena, per-task dtype dispatch)
+
+| dtype | status |
+|---|---|
+| f32 | ✅ all ops |
+| i32 / u32 | ✅ elementwise (arith, compare, select); shape ops (gather copies any size) |
+| bool (i1) | ✅ 1-byte; compare→bool, select pred, bool I/O at jax boundary |
+| f64 | ✅ elementwise, **gated behind cl_khr_fp64** (clean error on unsupported devices) |
+| i64 | ✅ storage + gather; elementwise arith partial |
+| f16 / bf16 / i8 / i16 / complex | ❌ next (f16/bf16 = biggest remaining bucket) |
+
+Not yet dtype-aware: reduce and iota tiles are f32-only (integer sum/max/min next).
+
+## Supported ops
 
 | stablehlo op | tile op | family module | notes |
 |---|---|---|---|
