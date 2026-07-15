@@ -50,6 +50,35 @@ def _concatenate(ctx, op):
     ctx.value_to_buf[op.results[0]] = out_buf
 
 
+@L.handles("stablehlo.pad")
+def _pad(ctx, op):
+    from jaxlib.mlir import ir
+    in_shape, in_n, dtype = L.tensor_info(op.operands[0].type)
+    out_shape, out_n, _ = L.tensor_info(op.results[0].type)
+    low = [int(x) for x in ir.DenseI64ArrayAttr(op.attributes["edge_padding_low"])]
+    high = [int(x) for x in ir.DenseI64ArrayAttr(op.attributes["edge_padding_high"])]
+    interior = [int(x) for x in
+                ir.DenseI64ArrayAttr(op.attributes["interior_padding"])]
+    if any(v < 0 for v in low + high):
+        raise L.LoweringError("pad: negative edge padding (cropping) unsupported")
+    out_strides = _row_major_strides(out_shape)
+    out_buf = ctx.new_buffer(out_n, dtype)
+    # 1) fill the whole output with the (scalar) pad value via a stride-0 gather
+    #    (reads operand[1], the scalar pad value, into every output element).
+    fill_aux = ctx.add_aux([len(out_shape)] + list(out_shape) +
+                           [0] * len(out_shape) + [0])
+    ctx.emit(L.Instr(L.OP_GATHER_STRIDED, dst=out_buf,
+                     a=ctx.buf_for(op.operands[1]), n=out_n, aux=fill_aux))
+    # 2) scatter the operand into the interior: output coord for input coord c is
+    #    low[d] + c*(interior[d]+1)  ->  out_stride[d]*(interior[d]+1), off=sum low.
+    scat_strides = [out_strides[d] * (interior[d] + 1)
+                    for d in range(len(in_shape))]
+    out_off = sum(low[d] * out_strides[d] for d in range(len(in_shape)))
+    _emit_scatter(ctx, out_buf, ctx.buf_for(op.operands[0]), in_shape,
+                  scat_strides, out_off)
+    ctx.value_to_buf[op.results[0]] = out_buf
+
+
 # --- OP_SCATTER tensor-opcode semantics -------------------------------------
 
 def _scatter_to_task(ins) -> Task:
