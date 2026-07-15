@@ -1,4 +1,10 @@
-"""StableHLO -> VMProgram v1 lowering. Producer half of docs/vmprogram.md.
+"""StableHLO -> VMProgram v3 TENSOR sections. Producer half of docs/vmprogram.md.
+
+This module emits the tensor sections (the ISA of record). The v2.1 SCHEDULE
+sections are produced by pjrt_ocl.scheduler from the VMProgram this returns;
+`VMProgram.serialize(schedule)` appends them. A real v3 file always carries a
+schedule (lower_service runs the scheduler); serialize(schedule=None) writes
+tensor-only bytes for inspection / the reference-interpreter path.
 
 Runs inside the compile-time subprocess (lower_service.py) spawned by the C++
 plugin; also importable directly for tests/tooling. Uses jaxlib's bundled
@@ -41,7 +47,7 @@ import numpy as np
 # --- format constants (docs/vmprogram.md) ----------------------------------
 
 MAGIC = 0x314D5056  # b"VPM1" read little-endian
-VERSION = 1
+VERSION = 3         # v3 = v2 tensor sections + v2.1 schedule sections
 ARENA_ALIGN = 64    # buffer arena offsets
 SECTION_ALIGN = 8   # file sections / variable-length entries
 
@@ -62,11 +68,14 @@ OP_NAMES = {
     OP_LTS_F32: "lts_f32", OP_WHILE: "while",
 }
 
-HEADER_STRUCT = struct.Struct("<IIIIIIIIQ")  # 40 bytes
-BUFENT_STRUCT = struct.Struct("<QQII")       # 24 bytes
-CONSTHDR_STRUCT = struct.Struct("<II")       # 8 bytes, then data
-INSTR_STRUCT = struct.Struct("<IIIIIIII")    # 32 bytes
-assert HEADER_STRUCT.size == 40
+# v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
+# arena_bytes u64 as before (docs/vmprogram.md "v2 deltas").
+HEADER_STRUCT = struct.Struct("<IIIIIIIIIIQ")  # 48 bytes
+BUFENT_STRUCT = struct.Struct("<QQII")         # 24 bytes
+CONSTHDR_STRUCT = struct.Struct("<II")         # 8 bytes, then data
+# instruction: { op, dst, a, b, n, imm, aux, pad1 } — pad0 renamed aux (v2).
+INSTR_STRUCT = struct.Struct("<IIIIIIII")      # 32 bytes
+assert HEADER_STRUCT.size == 48
 assert BUFENT_STRUCT.size == 24
 assert INSTR_STRUCT.size == 32
 
@@ -92,6 +101,7 @@ class Instr:
     b: int = 0
     n: int = 0
     imm: int = 0
+    aux: int = 0        # v2: aux-pool word offset (pad0 renamed); 0 for EW ops
 
 
 def _pad8(out: bytearray) -> None:
@@ -109,8 +119,14 @@ class VMProgram:
     consts: list[tuple[int, bytes]]         # (buffer id, raw element bytes)
     instrs: list[Instr]                     # flat; root list = [0, main_len)
     main_len: int
+    aux: list[int] = dataclasses.field(default_factory=list)  # aux pool, u32 words
 
-    def serialize(self) -> bytes:
+    def serialize(self, schedule=None) -> bytes:
+        """Serialize a v3 VMProgram: tensor sections, then (if given) the v2.1
+        schedule sections. `schedule` is any object exposing
+        `serialize_sections() -> bytes` (pjrt_ocl.scheduler.Schedule). A real
+        v3 file always carries a schedule; None is allowed only for
+        tensor-only inspection / the reference-interpreter path."""
         assert len(self.inputs) == len(self.input_shapes)
         assert len(self.outputs) == len(self.output_shapes)
         assert self.main_len <= len(self.instrs)
@@ -118,7 +134,7 @@ class VMProgram:
         out += HEADER_STRUCT.pack(
             MAGIC, VERSION, len(self.buffers), len(self.instrs),
             len(self.consts), self.main_len, len(self.inputs),
-            len(self.outputs), self.arena_bytes)
+            len(self.outputs), len(self.aux), 0, self.arena_bytes)
         # buffer table
         for b in self.buffers:
             assert b.arena_byte_offset % ARENA_ALIGN == 0, b
@@ -134,6 +150,10 @@ class VMProgram:
             out += struct.pack("<II", len(shape), 0)
             for dim in shape:
                 out += struct.pack("<Q", dim)
+        # aux pool: n_aux x u32, padded to 8B (between IO shapes and const pool)
+        for word in self.aux:
+            out += struct.pack("<I", word & 0xFFFFFFFF)
+        _pad8(out)
         # const pool
         for buf_id, data in self.consts:
             out += CONSTHDR_STRUCT.pack(buf_id, len(data))
@@ -142,7 +162,10 @@ class VMProgram:
         # instructions
         for ins in self.instrs:
             out += INSTR_STRUCT.pack(ins.op, ins.dst, ins.a, ins.b, ins.n,
-                                     ins.imm, 0, 0)
+                                     ins.imm, ins.aux, 0)
+        # schedule sections (8B-aligned; instructions are 32B each => aligned)
+        if schedule is not None:
+            out += schedule.serialize_sections()
         return bytes(out)
 
     def dump(self) -> str:
