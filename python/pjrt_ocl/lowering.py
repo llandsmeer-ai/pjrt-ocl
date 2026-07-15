@@ -286,6 +286,7 @@ class _Ctx:
         self.input_shapes: list[tuple[int, ...]] = []
         self.output_shapes: list[tuple[int, ...]] = []
         self.aux: list[int] = []           # aux pool (u32 words)
+        self.funcs: dict = {}              # sym_name -> func.func (call inlining)
         self._arena = 0
 
     def emit(self, instr: Instr) -> None:
@@ -456,21 +457,57 @@ def _ensure_ops_registered() -> None:
         from . import ops  # noqa: F401
 
 
+def _inline_call(ctx: _Ctx, o) -> None:
+    """Inline a func.call to a private function: bind the callee's block args to
+    the call's operand buffers, lower the callee body, and alias the callee's
+    return values to the call's results. jax emits these for jnp.where / clip /
+    some transcendentals."""
+    from jaxlib.mlir import ir
+    callee_name = ir.FlatSymbolRefAttr(o.attributes["callee"]).value
+    callee = ctx.funcs.get(callee_name)
+    if callee is None:
+        raise LoweringError(f"func.call to unknown function @{callee_name}")
+    block = callee.regions[0].blocks[0]
+    for arg, operand in zip(block.arguments, o.operands):
+        ctx.value_to_buf[arg] = ctx.buf_for(operand)
+    for inner in block.operations:
+        io = inner.operation
+        if io.name == "func.return":
+            for ret_val, call_res in zip(io.operands, o.results):
+                ctx.value_to_buf[call_res] = ctx.buf_for(ret_val)
+            return
+        _lower_op(ctx, io)
+
+
+def _lower_op(ctx: _Ctx, o) -> None:
+    if o.name == "func.call":
+        _inline_call(ctx, o)
+        return
+    handler = OP_HANDLERS.get(o.name)
+    if handler is None:
+        raise LoweringError(f"unsupported op: {o.name} "
+                            f"(known: {sorted(OP_HANDLERS)})")
+    handler(ctx, o)
+
+
 def lower_module(module) -> VMProgram:
     """Lower a deserialized stablehlo module's public @main to a VMProgram."""
     from jaxlib.mlir import ir
     _ensure_ops_registered()
+    funcs = {}          # sym_name -> func.func operation (for call inlining)
     main = None
     for op in module.body.operations:
         o = op.operation
-        if (o.name == "func.func"
-                and ir.StringAttr(o.attributes["sym_name"]).value == "main"):
-            main = o
-            break
+        if o.name == "func.func":
+            name = ir.StringAttr(o.attributes["sym_name"]).value
+            funcs[name] = o
+            if name == "main":
+                main = o
     if main is None:
         raise LoweringError("no func.func @main in module")
 
     ctx = _Ctx()
+    ctx.funcs = funcs
     entry_block = main.regions[0].blocks[0]
     for arg in entry_block.arguments:
         shape, n_elems, dtype = _tensor_info(arg.type)
@@ -480,12 +517,7 @@ def lower_module(module) -> VMProgram:
         ctx.input_shapes.append(shape)
 
     for op in entry_block.operations:
-        o = op.operation
-        handler = OP_HANDLERS.get(o.name)
-        if handler is None:
-            raise LoweringError(f"unsupported op: {o.name} "
-                                f"(known: {sorted(OP_HANDLERS)})")
-        handler(ctx, o)
+        _lower_op(ctx, op.operation)
 
     return VMProgram(
         arena_bytes=ctx._arena,
