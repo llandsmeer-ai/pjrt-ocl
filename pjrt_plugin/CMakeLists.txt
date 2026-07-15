@@ -7,15 +7,27 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(OpenCL REQUIRED)
 
-# Embed kernels/vm.cl as a C string (recompiled when the .cl changes).
-set(VM_CL_IN ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vm2.cl)
+# Embed the modular OpenCL kernel (per-op-family files, concatenated in order)
+# as a C string. Add a new op family by dropping kernels/ops/<name>.cl and
+# listing it here (before vm_main.cl).
+set(VM_CL_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vm_common.cl
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/ew.cl
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/gather.cl
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/reduce.cl
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/mma.cl
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/iota.cl
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vm_main.cl)
 set(VM_CL_OUT ${CMAKE_CURRENT_BINARY_DIR}/vm_cl_source.h)
+# Join with | so the list survives as ONE argument to the -P script (a bare
+# ;-list would expand into separate cmake args).
+string(REPLACE ";" "," VM_CL_SOURCES_STR "${VM_CL_SOURCES}")
 add_custom_command(
   OUTPUT ${VM_CL_OUT}
-  COMMAND ${CMAKE_COMMAND} -DIN=${VM_CL_IN} -DOUT=${VM_CL_OUT}
+  COMMAND ${CMAKE_COMMAND} -DSRCS=${VM_CL_SOURCES_STR} -DOUT=${VM_CL_OUT}
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cl.cmake
-  DEPENDS ${VM_CL_IN} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cl.cmake
-  COMMENT "Embedding vm.cl")
+  DEPENDS ${VM_CL_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cl.cmake
+  COMMENT "Embedding modular VM kernel")
 
 add_library(pjrt_ocl SHARED src/plugin.cc src/runtime.cc ${VM_CL_OUT})
 target_include_directories(pjrt_ocl PRIVATE
