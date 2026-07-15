@@ -1,3 +1,55 @@
+# VMProgram v2.1 — schedule sections (the VLIW engine's input)
+
+v2.1 appends SCHEDULE sections after the v2 tensor sections. Producer: python
+(`pjrt_ocl.scheduler`, runs inside lower_service after lowering, using device config from env
+`PJRT_OCL_NLANES` + `PJRT_OCL_COST_TABLE`). Consumer: C++ VLIW engine (`kernels/vm2.cl`).
+Header `version` becomes **3** (tensor-only v2 files are not emitted; one repo, no compat).
+Header gains nothing; schedule sections follow the instruction array, 8B-aligned:
+
+```
+sched header (16B): { n_tasks u32, n_entries u32, n_flags u32, n_lanes u32 }
+tasks:   n_tasks   × 32B { tile_op u32, dst u32, a u32, b u32, p0 u32, p1 u32, p2 u32, p3 u32 }
+lane tab: n_lanes  ×  8B { entry_off u32, entry_count u32 }   (offsets into entries[])
+entries: n_entries × 32B { task u32, tile_lo u32, tile_hi u32,
+                           wait_flag u32, wait_count u32, signal_flag u32,
+                           slots u32 (reserved, 0 in v0 — 4×8b tile-slot refs, tile-isa v1.1),
+                           pad u32 }
+```
+
+- `task` sentinels: `0xFFFFFFFF` NOP, `0xFFFFFFFE` BARRIER (global; every lane must contain the
+  same barrier sequence), `0xFFFFFFFD` WHILE, `0xFFFFFFFC` IF.
+- dst/a/b in tasks are BUFFER IDS (executor patches to element offsets at load, as v1).
+- tile_op vocabulary + params (element counts, not bytes):
+
+| tile_op | p0 | p1 | p2 | p3 | tiles |
+|---|---|---|---|---|---|
+| 0 EW | subop (see below) | n_elems | imm (f32 bits for FILL splat / cmp pred) | 0 | ceil(n/TS), TS=16384 |
+| 1 MMA | M | N | K | 0 | ceil(M/16)*ceil(N/16) |
+| 2 GATHER | aux word offset | n_elems | 0 | 0 | ceil(n/TS) |
+| 3 REDUCE_PART | n_elems | chunk_elems | kind (0 sum,1 max,2 min,3 prod) | 0 | ceil(n/chunk) |
+| 4 REDUCE_COMB | n_parts | kind | 0 | 0 | 1 |
+| 5 IOTA_DIM | aux word offset | n_elems | 0 | 0 | ceil(n/TS) |
+
+- EW subops: 0 add, 1 mul, 2 sub, 3 div, 4 max, 5 min, 6 pow, 7 copy, 8 neg, 9 exp, 10 log,
+  11 sqrt, 12 rsqrt, 13 tanh, 14 abs, 15 floor, 16 ceil, 17 sign, 18 fill, 19 iota_flat,
+  20 cmp (pred in p2), 21 select (pred buffer id in task.p3... no: select uses b=pred; a and
+  dst carry the branches — see note), 22 lts_scalar.
+  NOTE select: task.dst = out, task.a = on_true, task.b = on_false, task.p3 = pred buffer id.
+- WHILE entry (uniform in every lane's stream): tile_lo = cond_start, tile_hi = cond_len,
+  wait_flag = body_start, wait_count = body_len (ranges within THIS lane's own stream),
+  signal_flag = cond scalar ELEMENT offset in arena (pre-patched by producer=python? no —
+  python writes the cond BUFFER ID here; executor patches it at load like task dst/a/b).
+  Kernel semantics: loop { run cond range; BARRIER; read cond atomically; if 0 break;
+  run body range; BARRIER }.
+- IF entry: tile_lo = then_start, tile_hi = then_len, wait_flag = else_start,
+  wait_count = else_len, signal_flag = cond buffer id (patched). Semantics: BARRIER implicit
+  before cond read is NOT added — scheduler must place a BARRIER entry before the IF/WHILE if
+  the cond producer ran in the same phase.
+- v0 scheduling contract: BARRIER between dataflow levels; WAIT/SIGNAL flags unused (all
+  0xFFFFFFFF = FLAG_NONE) — reserved for per-op counters later. n_flags may be 0.
+- Executor: launches ONE kernel (n_lanes workgroups × 256); uploads tasks (patched), lane tab,
+  entries at load time; flags+bar zeroed per execute.
+
 # VMProgram v2 — binary format spec
 
 v2 (2026-07-14, M3): adds the **aux pool** (per-instruction shape/stride metadata), shaped
