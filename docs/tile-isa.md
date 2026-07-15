@@ -65,6 +65,23 @@ signals; all lanes wait it).
 
 Lanes = persistent workgroups, 1–4 per CU, 256 threads, validated co-residency regime.
 
+## v1.1: explicit data movement + lane-local tile slots (user, 2026-07-15)
+
+The ISA is load/store: arena = main memory; each lane owns a small **tile-slot file** in local
+memory (~5 slots of 64×64 f32 at 96 KB/lane) + named register tiles inside op cases (MMA
+accumulator). New/changed ops: `LOAD_TILE(slot, region)`, `STORE_TILE(slot, region)`; compute
+tile ops address slots (operands/dest = slot ids or arena, flagged per operand).
+- **Fusion by scheduling, not codegen**: consumer scheduled on the SAME lane right after its
+  producer reads the slot directly — elementwise chains do 1 load + 1 store instead of d each;
+  matmul epilogues fuse onto the resident accumulator. No-compile-at-dispatch preserved.
+- Scheduler additions: slot liveness = tile-level register allocation (linear scan, per lane);
+  **lane-affinity constraint** (slots are lane-private; cross-lane consumers round-trip via
+  arena). Stream-entry encoding reserves operand slot/arena flags from v0 to avoid format churn.
+- Register-file-in-actual-registers beyond named accumulators requires specialized cases
+  (tiered JIT: per-program FUSED kernels compiled async + hot-swapped) — 🧭 marked future.
+- Rollout: Phase 1 implements entries WITH slot fields but only arena-mode ops; slot mode +
+  affinity scheduling lands in Phase 3 (perf mode) behind the same encoding.
+
 ## Cost model & calibration (hardware-dependent by design)
 
 Per-tile-op costs vary per device ⇒ **measured, not assumed**:
