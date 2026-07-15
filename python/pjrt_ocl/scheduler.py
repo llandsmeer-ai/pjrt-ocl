@@ -29,6 +29,7 @@ import os
 import struct
 
 from . import lowering as L
+from . import opsem
 
 # --- tile-op vocabulary + sentinels (docs/vmprogram.md v2.1 table) ----------
 
@@ -198,7 +199,8 @@ class Schedule:
 # --- dependency analysis + levels -------------------------------------------
 
 def _reads(ins: L.Instr) -> set[int]:
-    """Buffer ids read by an instruction (a/b; +p3 for select once it exists)."""
+    """Buffer ids read by an instruction. Built-in fast paths; other ops
+    declare their read set in opsem.READS."""
     op = ins.op
     if op in (L.OP_ADD_F32, L.OP_MUL_F32, L.OP_SUB_F32):
         return {ins.a, ins.b}
@@ -206,7 +208,8 @@ def _reads(ins: L.Instr) -> set[int]:
         return set()
     if op == L.OP_NOP:
         return set()
-    # unknown / region ops handled by the caller
+    if op in opsem.READS:
+        return opsem.reads_of(ins)
     return {ins.a, ins.b}
 
 
@@ -248,12 +251,16 @@ def _levels(instrs, indices: list[int]) -> list[list[int]]:
 # --- instruction -> task mapping --------------------------------------------
 
 def _instr_to_task(ins: L.Instr) -> Task:
-    """Map a compute tensor instruction to its tile task (EW today)."""
+    """Map a compute tensor instruction to its tile task. Built-in EW fast
+    path; other ops register a mapper in opsem.TO_TASK."""
     if ins.op in _TENSOR_TO_EW:
         subop = _TENSOR_TO_EW[ins.op]
         p2 = ins.imm if ins.op == L.OP_FILL_F32 else 0
         return Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.b,
                     p0=subop, p1=ins.n, p2=p2, p3=0)
+    mapper = opsem.TO_TASK.get(ins.op)
+    if mapper is not None:
+        return mapper(ins)
     raise ScheduleError(
         f"scheduler: no task mapping for opcode {ins.op} "
         f"({L.OP_NAMES.get(ins.op, hex(ins.op))})")

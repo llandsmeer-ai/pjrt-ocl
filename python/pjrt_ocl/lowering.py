@@ -62,10 +62,43 @@ OP_FILL_F32 = 4
 OP_IOTA_F32 = 5
 OP_LTS_F32 = 6
 OP_WHILE = 7
+# v2 tensor opcodes (docs/vmprogram.md "v2 deltas"). Binary/unary elementwise
+# share the EW tile-op (subop chosen in the scheduler); the shaped ops carry
+# metadata in the aux pool (Instr.aux = word offset).
+OP_DIV_F32 = 8
+OP_MAX_F32 = 9
+OP_MIN_F32 = 10
+OP_POW_F32 = 11
+OP_COPY_F32 = 12
+OP_NEG_F32 = 13
+OP_EXP_F32 = 14
+OP_LOG_F32 = 15
+OP_SQRT_F32 = 16
+OP_RSQRT_F32 = 17
+OP_TANH_F32 = 18
+OP_ABS_F32 = 19
+OP_FLOOR_F32 = 20
+OP_CEIL_F32 = 21
+OP_SIGN_F32 = 22
+OP_CMP_F32 = 23          # imm = predicate (0 EQ,1 NE,2 LT,3 LE,4 GT,5 GE)
+OP_SELECT_F32 = 24       # imm = pred buffer id
+OP_GATHER_STRIDED = 25   # aux: rank, out_dims[], in_strides[], src_off
+OP_REDUCE = 26           # aux: kind,out_rank,out_dims[],kept_strides[],red_rank,red_dims[],red_strides[],src_off
+OP_DOT = 27              # aux: M, N, K
+OP_IOTA_DIM = 28         # aux: rank, out_dims[], dim
+OP_IF = 29
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
     OP_LTS_F32: "lts_f32", OP_WHILE: "while",
+    OP_DIV_F32: "div_f32", OP_MAX_F32: "max_f32", OP_MIN_F32: "min_f32",
+    OP_POW_F32: "pow_f32", OP_COPY_F32: "copy_f32", OP_NEG_F32: "neg_f32",
+    OP_EXP_F32: "exp_f32", OP_LOG_F32: "log_f32", OP_SQRT_F32: "sqrt_f32",
+    OP_RSQRT_F32: "rsqrt_f32", OP_TANH_F32: "tanh_f32", OP_ABS_F32: "abs_f32",
+    OP_FLOOR_F32: "floor_f32", OP_CEIL_F32: "ceil_f32", OP_SIGN_F32: "sign_f32",
+    OP_CMP_F32: "cmp_f32", OP_SELECT_F32: "select_f32",
+    OP_GATHER_STRIDED: "gather_strided", OP_REDUCE: "reduce", OP_DOT: "dot",
+    OP_IOTA_DIM: "iota_dim", OP_IF: "if",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
@@ -199,10 +232,18 @@ class _Ctx:
         self.outputs: list[int] = []
         self.input_shapes: list[tuple[int, ...]] = []
         self.output_shapes: list[tuple[int, ...]] = []
+        self.aux: list[int] = []           # aux pool (u32 words)
         self._arena = 0
 
     def emit(self, instr: Instr) -> None:
         self.instrs.append(instr)
+
+    def add_aux(self, words) -> int:
+        """Append u32 words to the aux pool; return their starting word offset.
+        Signed ints (strides, src_off) are stored two's-complement."""
+        off = len(self.aux)
+        self.aux.extend(w & 0xFFFFFFFF for w in words)
+        return off
 
     def new_buffer(self, n_elems: int, dtype: int = DT_F32) -> int:
         size = n_elems * DTYPE_NUMPY[dtype].itemsize
@@ -247,6 +288,13 @@ def _handles(name):
         OP_HANDLERS[name] = fn
         return fn
     return deco
+
+
+# Public API for per-family op modules in pjrt_ocl.ops.* — register a
+# stablehlo handler `fn(ctx, op)`. `ctx` exposes emit/new_buffer/buf_for/
+# add_aux/value_to_buf; use tensor_info(type) for (shape, n_elems, dtype).
+handles = _handles
+tensor_info = _tensor_info
 
 
 def _elementwise_binop(opcode):
@@ -296,9 +344,23 @@ def _lower_return(ctx: _Ctx, op):
         ctx.output_shapes.append(shape)
 
 
+_ops_registered = False
+
+
+def _ensure_ops_registered() -> None:
+    """Import pjrt_ocl.ops on first lowering (registers family handlers +
+    opcode semantics). Deferred to call time so import-time cycles
+    (lowering -> ops -> scheduler -> lowering) never form."""
+    global _ops_registered
+    if not _ops_registered:
+        _ops_registered = True
+        from . import ops  # noqa: F401
+
+
 def lower_module(module) -> VMProgram:
     """Lower a deserialized stablehlo module's public @main to a VMProgram."""
     from jaxlib.mlir import ir
+    _ensure_ops_registered()
     main = None
     for op in module.body.operations:
         o = op.operation
@@ -335,6 +397,7 @@ def lower_module(module) -> VMProgram:
         output_shapes=ctx.output_shapes,
         consts=ctx.consts,
         instrs=ctx.instrs,
+        aux=ctx.aux,
         main_len=len(ctx.instrs),
     )
 

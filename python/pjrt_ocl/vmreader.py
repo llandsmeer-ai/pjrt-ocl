@@ -34,8 +34,38 @@ from .lowering import (
     SECTION_ALIGN, VERSION,
 )
 from . import scheduler as S
+from . import opsem
 
 MAX_WHILE_DEPTH = 8
+
+
+class _InterpRT:
+    """Facade passed to opsem.INTERP handlers (numpy reference semantics)."""
+
+    def __init__(self, prog, view):
+        self._prog = prog
+        self.view = view          # view(buf_id, n=None) -> f32 ndarray
+        self.aux = prog.aux       # list[int] (u32 words)
+
+    def aux_i32(self, off: int) -> int:
+        """Read aux word `off` as a signed int32 (strides/offsets)."""
+        v = self.aux[off]
+        return v - 0x100000000 if v >= 0x80000000 else v
+
+    @staticmethod
+    def f32_from_bits(imm: int) -> np.float32:
+        return _f32_from_bits(imm)
+
+
+class _SchedRT(_InterpRT):
+    """Facade for schedule-simulator (validator b) tile ops. Adds tile_size;
+    view() takes no element count (full-buffer view)."""
+
+    def __init__(self, prog, view, tile_size):
+        self.view = view
+        self.aux = prog.aux
+        self._prog = prog
+        self.tile_size = tile_size
 
 
 @dataclasses.dataclass
@@ -357,6 +387,8 @@ def execute(prog: Program, args: list[np.ndarray]) -> list[np.ndarray]:
                     if view(ins.dst, 1)[0] == np.float32(0.0):
                         break
                     run_range(ins.n, ins.imm, depth + 1)
+            elif op in opsem.INTERP:
+                opsem.INTERP[op](ins, _InterpRT(prog, view))
             else:  # unreachable: parse() rejects unknown opcodes
                 raise FormatError(f"unknown opcode {op}")
 
@@ -459,28 +491,34 @@ def execute_schedule(prog: Program, args: list[np.ndarray],
                              f"buffer is {prog.buffers[buf_id].size_bytes}")
         view(buf_id)[:] = flat
 
+    sim_rt = _SchedRT(prog, view, tile_size)
+
     def run_entry(e: ParsedEntry) -> None:
         task = sched.tasks[e.task]
-        if task.tile_op != S.TILE_EW:
+        if task.tile_op == S.TILE_EW:
+            n = task.p1
+            lo = e.tile_lo * tile_size
+            hi = min(e.tile_hi * tile_size, n)
+            if lo >= hi:
+                return
+            dst = view(task.dst)
+            subop = task.p0
+            if subop in (S.EW_ADD, S.EW_MUL, S.EW_SUB):
+                a = view(task.a)[lo:hi]
+                b = view(task.b)[lo:hi]
+                dst[lo:hi] = (a + b if subop == S.EW_ADD else
+                              a * b if subop == S.EW_MUL else a - b)
+            elif subop == S.EW_FILL:
+                dst[lo:hi] = _f32_from_bits(task.p2)
+            else:
+                raise NotImplementedError(
+                    f"schedule simulator: EW subop {subop} not supported")
+            return
+        sim = opsem.TILE_SIM.get(task.tile_op)
+        if sim is None:
             raise NotImplementedError(
                 f"schedule simulator: tile_op {task.tile_op} not supported")
-        n = task.p1
-        lo = e.tile_lo * tile_size
-        hi = min(e.tile_hi * tile_size, n)
-        if lo >= hi:
-            return
-        dst = view(task.dst)
-        subop = task.p0
-        if subop in (S.EW_ADD, S.EW_MUL, S.EW_SUB):
-            a = view(task.a)[lo:hi]
-            b = view(task.b)[lo:hi]
-            dst[lo:hi] = (a + b if subop == S.EW_ADD else
-                          a * b if subop == S.EW_MUL else a - b)
-        elif subop == S.EW_FILL:
-            dst[lo:hi] = _f32_from_bits(task.p2)
-        else:
-            raise NotImplementedError(
-                f"schedule simulator: EW subop {subop} not supported")
+        sim(task, e, sim_rt)
 
     def run_order(entries: list[tuple[int, ParsedEntry]], snapshot: np.ndarray):
         arena[:] = snapshot
