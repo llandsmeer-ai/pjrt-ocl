@@ -1,7 +1,7 @@
 /* Iota-along-dim tile op (TOP_IOTA_DIM). aux at task.p0:
  *   rank, out_dims[rank], dim.  dst[i] = coordinate of i along `dim`. */
 
-static void vmo_iota_tile(__global uchar *arena, __global const int *aux,
+static void vmo_iota_tile(__global uchar *arena, __global uchar **iop, __global const int *aux,
                       const task_t t, uint tile, uint lid, uint lsz)
 {
     __global const int *x = aux + t.p0;

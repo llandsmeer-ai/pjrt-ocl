@@ -3,7 +3,8 @@
  * vm2 is the per-lane interpreter over the schedule stream. */
 
 /* tile_op packs the base op in bits 0-7 and the dtype in bits 8-15. */
-static void vmo_exec_tiles(__global uchar *arena, __global const int *aux,
+static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
+                       __global const int *aux,
                        const task_t t, uint tile_lo, uint tile_hi,
                        __local float *As, __local float *Bs)
 {
@@ -17,16 +18,16 @@ static void vmo_exec_tiles(__global uchar *arena, __global const int *aux,
                    : (dt == DT_F16 || dt == DT_BF16) ? 2u : 4u;
     for (uint tile = tile_lo; tile < tile_hi; ++tile) {
         switch (op) {
-        case TOP_EW:       vmo_ew_tile(arena, t, tile, dt, adt, lid, lsz); break;
-        case TOP_MMA:      vmo_mma_tile(arena, t, tile, As, Bs); break;
-        case TOP_GATHER:   vmo_gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
-        case TOP_RED_PART: vmo_reduce_part_tile(arena, t, tile, As, dt, lid, lsz); break;
-        case TOP_RED_COMB: vmo_reduce_comb_tile(arena, t, dt, lid); break;
-        case TOP_IOTA_DIM: vmo_iota_tile(arena, aux, t, tile, lid, lsz); break;
-        case TOP_SCATTER:  vmo_scatter_tile(arena, aux, t, tile, esz, lid, lsz); break;
-        case TOP_DYN_GATHER:  vmo_dyn_gather_tile(arena, aux, t, tile, esz, lid, lsz); break;
-        case TOP_DYN_SCATTER: vmo_dyn_scatter_tile(arena, aux, t, tile, esz, lid, lsz); break;
-        case TOP_RED_WINDOW:  vmo_redwin_tile(arena, aux, t, tile, dt, lid, lsz); break;
+        case TOP_EW:       vmo_ew_tile(arena, iop, t, tile, dt, adt, lid, lsz); break;
+        case TOP_MMA:      vmo_mma_tile(arena, iop, t, tile, As, Bs); break;
+        case TOP_GATHER:   vmo_gather_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
+        case TOP_RED_PART: vmo_reduce_part_tile(arena, iop, t, tile, As, dt, lid, lsz); break;
+        case TOP_RED_COMB: vmo_reduce_comb_tile(arena, iop, t, dt, lid); break;
+        case TOP_IOTA_DIM: vmo_iota_tile(arena, iop, aux, t, tile, lid, lsz); break;
+        case TOP_SCATTER:  vmo_scatter_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
+        case TOP_DYN_GATHER:  vmo_dyn_gather_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
+        case TOP_DYN_SCATTER: vmo_dyn_scatter_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
+        case TOP_RED_WINDOW:  vmo_redwin_tile(arena, iop, aux, t, tile, dt, lid, lsz); break;
         default: break;
         }
     }
@@ -44,9 +45,11 @@ __kernel void vm2(__global uchar *arena,
                   __global const uint4 *lane_tab,    /* {off,count,root_len,pad} */
                   volatile __global uint *bar,       /* [0,1] barrier, [2] rank */
                   const uint nlanes,
-                  __global uint *stats)              /* arrival rank per
+                  __global uint *stats,              /* arrival rank per
                                                         [barrier_i*nlanes+lane] */
+                  VMO_IO_PARAMS)                     /* direct I/O buffers (ports) */
 {
+    VMO_IO_ARRAY;
     const uint lane = get_group_id(0);
     const uint lid = get_local_id(0);
     /* Shared local scratch: MMA staging (As/Bs panels) and REDUCE_PART tree
@@ -129,7 +132,7 @@ __kernel void vm2(__global uchar *arena,
         if (en.task != ENT_NOP) {
             /* wait_flag/signal_flag per-op counters are reserved (v0 emits
              * FLAG_NONE); wire a flags buffer through before enabling. */
-            vmo_exec_tiles(arena, aux, tasks[en.task], en.tile_lo, en.tile_hi,
+            vmo_exec_tiles(arena, iop, aux, tasks[en.task], en.tile_lo, en.tile_hi,
                        As, Bs);
         }
         st[sp].pc++;
@@ -149,8 +152,10 @@ __kernel void vm2_seg(__global uchar *arena,
                       __global const int *aux,
                       __global const task_t *tasks,
                       __global const entry_t *entries,
-                      __global const uint2 *seg_tab)   /* per-lane {off, count} */
+                      __global const uint2 *seg_tab,   /* per-lane {off, count} */
+                      VMO_IO_PARAMS)                    /* direct I/O buffers */
 {
+    VMO_IO_ARRAY;
     const uint lane = get_group_id(0);
     __local float As[MMA_ASZ];
     __local float Bs[MMA_BSZ];
@@ -158,7 +163,7 @@ __kernel void vm2_seg(__global uchar *arena,
     for (uint i = 0; i < seg.y; ++i) {
         const entry_t en = entries[seg.x + i];
         if (en.task != ENT_NOP)
-            vmo_exec_tiles(arena, aux, tasks[en.task], en.tile_lo, en.tile_hi,
+            vmo_exec_tiles(arena, iop, aux, tasks[en.task], en.tile_lo, en.tile_hi,
                            As, Bs);
     }
 }

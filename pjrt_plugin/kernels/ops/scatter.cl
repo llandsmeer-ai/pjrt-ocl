@@ -6,7 +6,7 @@
  *   rank u32, in_dims i32[rank], out_strides i32[rank], out_off i32
  * dtype-agnostic (copies whole elements): esz picks the width. */
 
-static void vmo_scatter_tile(__global uchar *arena, __global const int *aux,
+static void vmo_scatter_tile(__global uchar *arena, __global uchar **iop, __global const int *aux,
                          const task_t t, uint tile, uint esz, uint lid, uint lsz)
 {
     __global const int *x = aux + t.p0;

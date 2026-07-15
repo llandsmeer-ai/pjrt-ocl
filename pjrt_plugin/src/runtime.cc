@@ -6,8 +6,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <set>
 
 #include "vm_cl_source.h"  // generated: kVmClSource
 
@@ -354,6 +357,9 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->vm_seg_kernel_ = clCreateKernel(rt->program_, "vm2_seg", &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateKernel vm2_seg: " + std::to_string(cerr));
+  rt->dummy_buf_ = clCreateBuffer(rt->ctx_, CL_MEM_READ_WRITE, 4, nullptr, &cerr);
+  if (cerr != CL_SUCCESS)
+    return fail("clCreateBuffer dummy: " + std::to_string(cerr));
 
   // Engine selection: the persistent in-kernel spin-barrier requires all lanes
   // to be co-resident and balanced, which non-GPU (CPU) OpenCL runtimes do NOT
@@ -392,6 +398,7 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
 OclRuntime::~OclRuntime() {
   if (vm_kernel_) clReleaseKernel(vm_kernel_);
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
+  if (dummy_buf_) clReleaseMemObject(dummy_buf_);
   if (program_) clReleaseProgram(program_);
   if (queue_) clReleaseCommandQueue(queue_);
   if (ctx_) clReleaseContext(ctx_);
@@ -426,9 +433,38 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
                               &cerr);
   if (cerr != CL_SUCCESS) return fail("arena alloc: " + std::to_string(cerr));
 
-  // Byte offset into the arena (the VM is byte-addressed; each op casts a
-  // typed pointer at this base). Was f32-element (÷4) before dtypes.
-  auto elem_off = [&](uint32_t id) {
+  // --- zero-copy I/O port assignment (docs/decisions.md) ------------------
+  // A buffer used ONLY as an input or ONLY as an output (not both — donation
+  // aliasing falls back to arena) and among the first kNIoPorts such buffers is
+  // passed straight to the kernel, so the VM reads/writes it in place with no
+  // arena copy. Everything else (intermediates, consts, cond scalars) keeps an
+  // arena byte offset.
+  lp->input_port_.assign(p.inputs.size(), -1);
+  lp->output_port_.assign(p.outputs.size(), -1);
+  lp->io_bufs_.assign(LoadedProgram::kNIoPorts, nullptr);
+  std::set<uint32_t> in_ids(p.inputs.begin(), p.inputs.end());
+  std::set<uint32_t> out_ids(p.outputs.begin(), p.outputs.end());
+  std::map<uint32_t, int> port_of;
+  int next_port = 0;
+  auto assign_port = [&](uint32_t id) -> int {
+    if (in_ids.count(id) && out_ids.count(id)) return -1;  // both -> arena
+    auto it = port_of.find(id);
+    if (it != port_of.end()) return it->second;
+    if (next_port >= LoadedProgram::kNIoPorts) return -1;
+    return port_of[id] = next_port++;
+  };
+  for (size_t i = 0; i < p.inputs.size(); ++i)
+    lp->input_port_[i] = assign_port(p.inputs[i]);
+  for (size_t o = 0; o < p.outputs.size(); ++o)
+    lp->output_port_[o] = assign_port(p.outputs[o]);
+
+  // Resolve a buffer id to a 32-bit handle: a port (bit 31 set) if ported, else
+  // the arena byte offset (the VM is byte-addressed; each op casts a typed
+  // pointer at this base).
+  auto elem_off = [&](uint32_t id) -> uint32_t {
+    auto it = port_of.find(id);
+    if (it != port_of.end())
+      return 0x80000000u | static_cast<uint32_t>(it->second);
     return static_cast<uint32_t>(p.buffers[id].arena_byte_offset);
   };
   auto make_buf = [&](const void* data, size_t bytes, const char* what) {
@@ -507,37 +543,67 @@ bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
   std::lock_guard<std::mutex> lock(rt_->mu());
   cl_command_queue q = rt_->queue();
 
+  // Host I/O path (runtime_test): mirror the zero-copy port binding, but stage
+  // ported buffers through temporary device cl_mems (this path isn't the hot
+  // path). Non-ported buffers go through the arena as before.
+  std::fill(io_bufs_.begin(), io_bufs_.end(), nullptr);
+  std::vector<cl_mem> temp_io;
+  cl_int cerr;
+  auto cleanup = [&] { for (cl_mem m : temp_io) clReleaseMemObject(m); };
+
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& b = p.buffers[p.inputs[i]];
-    if (b.size_bytes &&
-        clEnqueueWriteBuffer(q, arena_, CL_FALSE, b.arena_byte_offset,
-                             b.size_bytes, inputs[i], 0, nullptr,
-                             nullptr) != CL_SUCCESS) {
-      *err = "Execute: input write failed";
-      return false;
+    if (!b.size_bytes) continue;
+    if (input_port_[i] >= 0) {
+      cl_mem in = clCreateBuffer(rt_->ctx(), CL_MEM_READ_WRITE, b.size_bytes,
+                                 nullptr, &cerr);
+      if (cerr != CL_SUCCESS) { cleanup(); *err = "Execute: in port alloc"; return false; }
+      temp_io.push_back(in);
+      io_bufs_[input_port_[i]] = in;
+      if (clEnqueueWriteBuffer(q, in, CL_FALSE, 0, b.size_bytes, inputs[i], 0,
+                               nullptr, nullptr) != CL_SUCCESS) {
+        cleanup(); *err = "Execute: input write failed"; return false;
+      }
+    } else if (clEnqueueWriteBuffer(q, arena_, CL_FALSE, b.arena_byte_offset,
+                                    b.size_bytes, inputs[i], 0, nullptr,
+                                    nullptr) != CL_SUCCESS) {
+      cleanup(); *err = "Execute: input write failed"; return false;
+    }
+  }
+  outputs->resize(p.outputs.size());
+  for (size_t o = 0; o < p.outputs.size(); ++o) {
+    const auto& b = p.buffers[p.outputs[o]];
+    if (output_port_[o] >= 0 && b.size_bytes) {
+      cl_mem out = clCreateBuffer(rt_->ctx(), CL_MEM_READ_WRITE, b.size_bytes,
+                                  nullptr, &cerr);
+      if (cerr != CL_SUCCESS) { cleanup(); *err = "Execute: out port alloc"; return false; }
+      temp_io.push_back(out);
+      io_bufs_[output_port_[o]] = out;
     }
   }
 
   if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
-                             : LaunchKernel(q, err)))
+                             : LaunchKernel(q, err))) {
+    cleanup();
     return false;
+  }
 
-  outputs->resize(p.outputs.size());
-  for (size_t i = 0; i < p.outputs.size(); ++i) {
-    const auto& b = p.buffers[p.outputs[i]];
-    (*outputs)[i].resize(b.size_bytes);
-    if (b.size_bytes &&
-        clEnqueueReadBuffer(q, arena_, CL_FALSE, b.arena_byte_offset,
-                            b.size_bytes, (*outputs)[i].data(), 0, nullptr,
+  for (size_t o = 0; o < p.outputs.size(); ++o) {
+    const auto& b = p.buffers[p.outputs[o]];
+    (*outputs)[o].resize(b.size_bytes);
+    if (!b.size_bytes) continue;
+    cl_mem src = output_port_[o] >= 0 ? io_bufs_[output_port_[o]] : arena_;
+    size_t off = output_port_[o] >= 0 ? 0 : b.arena_byte_offset;
+    if (clEnqueueReadBuffer(q, src, CL_FALSE, off, b.size_bytes,
+                            (*outputs)[o].data(), 0, nullptr,
                             nullptr) != CL_SUCCESS) {
-      *err = "Execute: output read failed";
-      return false;
+      cleanup(); *err = "Execute: output read failed"; return false;
     }
   }
   if (clFinish(q) != CL_SUCCESS) {
-    *err = "Execute: clFinish failed";
-    return false;
+    cleanup(); *err = "Execute: clFinish failed"; return false;
   }
+  cleanup();
   return true;
 }
 
@@ -561,6 +627,10 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
   clSetKernelArg(k, 5, sizeof(bar_buf_), &bar_buf_);
   clSetKernelArg(k, 6, sizeof(nlanes), &nlanes);
   clSetKernelArg(k, 7, sizeof(stats_buf_), &stats_buf_);
+  for (int pt = 0; pt < kNIoPorts; ++pt) {
+    cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+    clSetKernelArg(k, 8 + pt, sizeof(cl_mem), &b);
+  }
   if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
                              nullptr) != CL_SUCCESS) {
     *err = "Execute: kernel launch failed";
@@ -652,6 +722,10 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
     clSetKernelArg(k, 3, sizeof(entries_buf_), &entries_buf_);
     clSetKernelArg(k, 4, sizeof(seg_tab_buf_), &seg_tab_buf_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(k, 5 + pt, sizeof(cl_mem), &b);
+    }
     size_t lsz = 256, gsz = size_t{n} * lsz;
     if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
                                nullptr) != CL_SUCCESS) {
@@ -733,27 +807,38 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
   std::lock_guard<std::mutex> lock(rt_->mu());
   cl_command_queue q = rt_->queue();
 
-  // Device->device copy each input into its arena region (on-device bandwidth,
-  // no host round-trip).
+  // Optional phase breakdown (PJRT_OCL_PROFILE): clFinish between phases to
+  // isolate input-copy / kernel / output-copy wall-clock. Adds barriers, so
+  // only when profiling.
+  const bool prof = std::getenv("PJRT_OCL_PROFILE") != nullptr;
+  auto clk = [] { return std::chrono::steady_clock::now(); };
+  auto msec = [](auto a, auto b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  auto t0 = clk();
+  cl_int cerr;
+
+  // Bind I/O ports (zero-copy) and copy only the non-ported buffers through the
+  // arena. Inputs: ported -> the kernel reads the input cl_mem directly; else
+  // device->device copy into the arena. Outputs: allocate a fresh cl_mem for
+  // each; ported -> the kernel writes it directly (bound below, copied never);
+  // non-ported -> copied out of the arena after the launch.
+  std::fill(io_bufs_.begin(), io_bufs_.end(), nullptr);  // nullptr => dummy
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& b = p.buffers[p.inputs[i]];
-    if (b.size_bytes &&
-        clEnqueueCopyBuffer(q, inputs[i], arena_, 0, b.arena_byte_offset,
-                            b.size_bytes, 0, nullptr, nullptr) != CL_SUCCESS) {
+    if (input_port_[i] >= 0) {
+      io_bufs_[input_port_[i]] = inputs[i];
+    } else if (b.size_bytes &&
+               clEnqueueCopyBuffer(q, inputs[i], arena_, 0, b.arena_byte_offset,
+                                   b.size_bytes, 0, nullptr,
+                                   nullptr) != CL_SUCCESS) {
       *err = "ExecuteDevice: input copy failed";
       return false;
     }
   }
-
-  if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
-                             : LaunchKernel(q, err)))
-    return false;
-
-  // Each output stays on device: fresh cl_mem, device->device copy from arena.
   outputs->assign(p.outputs.size(), nullptr);
-  cl_int cerr;
-  for (size_t i = 0; i < p.outputs.size(); ++i) {
-    const auto& b = p.buffers[p.outputs[i]];
+  for (size_t o = 0; o < p.outputs.size(); ++o) {
+    const auto& b = p.buffers[p.outputs[o]];
     cl_mem out = clCreateBuffer(rt_->ctx(), CL_MEM_READ_WRITE,
                                 std::max<size_t>(b.size_bytes, 4), nullptr,
                                 &cerr);
@@ -763,22 +848,43 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
       outputs->clear();
       return false;
     }
-    if (b.size_bytes &&
-        clEnqueueCopyBuffer(q, arena_, out, b.arena_byte_offset, 0,
+    (*outputs)[o] = out;
+    if (output_port_[o] >= 0) io_bufs_[output_port_[o]] = out;
+  }
+  if (prof) clFinish(q);
+  auto t1 = clk();
+
+  if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
+                             : LaunchKernel(q, err))) {
+    for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
+    outputs->clear();
+    return false;
+  }
+  if (prof) clFinish(q);
+  auto t2 = clk();
+
+  // Non-ported outputs: device->device copy from the arena.
+  for (size_t o = 0; o < p.outputs.size(); ++o) {
+    const auto& b = p.buffers[p.outputs[o]];
+    if (output_port_[o] < 0 && b.size_bytes &&
+        clEnqueueCopyBuffer(q, arena_, (*outputs)[o], b.arena_byte_offset, 0,
                             b.size_bytes, 0, nullptr, nullptr) != CL_SUCCESS) {
       *err = "ExecuteDevice: output copy failed";
-      clReleaseMemObject(out);
       for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
       outputs->clear();
       return false;
     }
-    (*outputs)[i] = out;
   }
   if (cl_int e = clFinish(q); e != CL_SUCCESS) {
     *err = "ExecuteDevice: clFinish failed (" + std::to_string(e) +
            "; kernel execution error — likely the cross-workgroup barrier not "
            "co-residing on this device, or resource limits)";
     return false;
+  }
+  if (prof) {
+    auto t3 = clk();
+    fprintf(stderr, "PROFILE in_copy=%.4f kernel=%.4f out_copy=%.4f total=%.4f ms\n",
+            msec(t0, t1), msec(t1, t2), msec(t2, t3), msec(t0, t3));
   }
   return true;
 }

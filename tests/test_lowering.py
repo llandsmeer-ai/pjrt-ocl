@@ -370,8 +370,8 @@ def test_empty_stdin_exit3_json():
 def test_initialize_without_plugin_so_does_not_crash_jax():
     env = {k: v for k, v in os.environ.items() if k != "JAX_PLATFORMS"}
     # Point discovery at a nonexistent .so: initialize() must skip gracefully
-    # and jax must fall back to cpu (regardless of whether the real plugin is
-    # built at the default path).
+    # and jax must fall back to a real backend (cpu, or gpu/cuda if a CUDA
+    # jaxlib happens to be installed) — the point is no crash + graceful log.
     env["PJRT_OCL_PLUGIN_PATH"] = "/nonexistent/libpjrt_ocl.so"
     code = (
         "import jax, pjrt_ocl\n"          # jax import runs plugin discovery
@@ -381,7 +381,7 @@ def test_initialize_without_plugin_so_does_not_crash_jax():
     proc = subprocess.run([PYTHON, "-c", code], env=env, capture_output=True,
                           text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
-    assert "cpu" in proc.stdout
+    assert any(p in proc.stdout for p in ("cpu", "gpu", "cuda"))
     assert "not registered" in proc.stderr  # graceful, logged
 
 
