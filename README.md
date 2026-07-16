@@ -190,19 +190,19 @@ it's the alternative you'd actually use.
 ![ours (OpenCL/Xe2) vs JAX CPU, per-op N-vs-time](docs/bench_plot_xe2.png)
 
 - **Large arrays are where the iGPU pays off, and the gap grows with N**:
-  elementwise and `gather` at 16M run **~8–9x faster** than XLA CPU
+  elementwise and `gather` at 16M run **~6–8x faster** than XLA CPU
   (~100 GB/s effective — the zero-copy I/O ports matter doubly on an
   integrated GPU, where "device memory" is the same LPDDR5X). Crossover vs
-  XLA CPU: ~512K–1M elements for elementwise, ~4M for `gather`, ~64K for the
-  `while` loop. `dot_general` is faster at *every* size — ~1.1 TFLOP/s at
-  2048³ via the standalone SGEMM path, ~2.4x XLA CPU.
+  XLA CPU: ~2M elements for elementwise, ~4M for `gather`, ~256K for the
+  `while` loop. `dot_general` is faster from N≈256 up — ~1.1 TFLOP/s at
+  2048³ via the standalone SGEMM path, ~2.8x XLA CPU. `matrix × vector` is
+  at parity at 2048 via the dedicated `gemv` kernel.
 - **`while` loops**: ~23 µs/iteration overhead at small N (the affine-fold +
-  in-place-carry + barrier-spin fixes cut it ~5x), and 1.7x *faster* than XLA
+  in-place-carry + barrier-spin fixes cut it ~5x), and 1.6x *faster* than XLA
   CPU at 16M.
 - **Small ops are dispatch-bound** (~70–160 µs wall-clock vs XLA CPU's
-  ~10–30 µs): expect 2–10x slower below ~256K elements; batch or fuse small
-  work. `matrix × vector` stays memory-bound through the MMA tile kernel
-  (1.3–11x slower; a dedicated GEMV kernel is the known fix, same as NVIDIA).
+  ~10–30 µs): expect 2–6x slower below ~1M elements; batch or fuse small
+  work.
 - Bring-up found and fixed a real portability bug: lane count is now *measured*
   at init (occupancy discovery, `docs/decisions.md` §9) instead of derived from
   the vendor-ambiguous `CL_DEVICE_MAX_COMPUTE_UNITS`.
@@ -215,13 +215,21 @@ same 8 cores. It answers "what does the OpenCL detour cost on a CPU?" —
 
 ![ours (OpenCL/PoCL) vs JAX native CPU, per-op N-vs-time](docs/bench_plot_pocl.png)
 
-- **PoCL is the project's debug backend, not a performance target**: printf,
-  host debuggers, and sanitizers work there, which is why it exists in the
-  matrix. Numbers reflect that: elementwise ~2.6x slower than XLA CPU at 16M,
-  `while` ~5x, and naive-tile `dot_general` ~90x off XLA's vectorized matmul
-  at 2048³.
-- If your machine has *any* supported GPU — including an iGPU — use it
-  (see below). Choose PoCL for bring-up, debugging, and CI-without-GPU.
+- **PoCL started as the debug backend and is now genuinely fast on streaming
+  ops.** CPU OpenCL runtimes only auto-vectorize the implicit work-item loop,
+  which our in-kernel tile loops defeated — every hot tile body now has an
+  explicit-`float8` CPU variant selected by a device-keyed build define
+  (`poc/09-cpu-kernels`, `docs/decisions.md` §11). Result: at 16M elements
+  our OpenCL-on-CPU is **3.2x faster than native XLA CPU** on elementwise
+  (3.2 vs 10.5 ms, ~61 GB/s), **4.5x** on `dynamic_slice`, `while` and
+  `matvec` at parity.
+- **`dot_general` remains XLA's win** (~6.5x at 2048³: 77 GFLOP/s from the
+  barrier-free register-blocked kernel vs Eigen's ~600 — cache-blocking is
+  the known next rung, deliberately deferred). Below ~1M elements the ~17–50
+  µs PoCL launch floor keeps small ops 2–7x slower.
+- If your machine has *any* supported GPU — including an iGPU — prefer it
+  (see below). PoCL remains the bring-up/debug/CI backend: printf, host
+  debuggers, and sanitizers all work there.
 
 ### CPU vs GPU, same machine (Lunar Lake), both through pjrt-ocl
 
@@ -232,14 +240,15 @@ bytecode through this plugin
 
 ![ours Xe2 iGPU vs ours PoCL CPU, per-op N-vs-time](docs/bench_plot_lnl_xe2_vs_pocl.png)
 
-- The iGPU wins **everywhere except sub-64K elementwise**, where both are
-  dispatch-bound and tie: **~22–24x** on elementwise/`gather` at 16M, **~9x**
-  on the `while` loop, and **~200x** on `matmul`/`matvec` at 2048 (the CPU
-  runs the same naive tile kernels that the GPU parallelizes; XLA's own CPU
-  matmul is the fairer CPU baseline, see the PoCL section).
+- After the CPU kernel work, the two backends **converge on pure streaming**
+  (they share the same LPDDR5X): the iGPU leads ~1.7x on elementwise/`gather`
+  at 16M and ~1.8x on the `while` loop, and `matvec` is a tie. Compute
+  density still separates them: **~18x** on `matmul` at 2048³.
 - Practical guidance: on any machine with a working GPU ICD, the default
-  device selection (first GPU) is the right choice; select PoCL explicitly
-  (`PJRT_OCL_DEVICE=Portable`) only for debugging.
+  device selection (first GPU) is the right choice — it never loses, and wins
+  big on compute-dense programs. Select PoCL explicitly
+  (`PJRT_OCL_DEVICE=Portable`) for debugging (printf/sanitizers) or
+  CI-without-GPU.
 
 ## Inside the VM: scheduled vs. measured execution
 
