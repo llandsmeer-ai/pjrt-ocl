@@ -543,6 +543,65 @@ guard (poc first, per hard rules), via inline PTX `wmma.load.*.shared`/`wmma.mma
 `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`). The `mm2` dispatch path is already
 built to host it.
 
+### 10c. TF32 tensor cores for IN-PROGRAM matmul — SHIPPED (2026-07-16)
+
+Front #3: make matmuls that appear *inside* a larger program (transformer QKV/out/FFN
+projections + batched attention QKᵀ/AV) fast — they run in the megakernel's `vmo_mma_tile`,
+NOT the standalone `mm2` fast path, so §9b's `mm_tc` never touched them. Two candidates:
+(1) a guarded tensor-core body inside the megakernel; (2) selective per-phase dispatch of
+matmul phases onto the standalone TC kernel.
+
+**CHOSEN: (1) guarded TC `vmo_mma_tile` in a NVIDIA-only megakernel variant.** The vm2
+program is rebuilt a SECOND time with `-DVMO_NV_PTX` (only on NVIDIA, only when the portable
+build already got device fences); on success `vm_tc_kernel_` replaces `vm_kernel_` for
+execution, else it stays null and the persistent engine transparently uses the portable
+kernel (try-and-fallback, mirroring the dialect probe). Inline PTX therefore NEVER enters the
+portable program — PoCL/AMD/Intel are untouched (runtime_test + e2e PASS on PoCL, portable
+path). `PJRT_OCL_MEGA_TC=0` forces portable (A/B). The TC body computes the SAME 64×64 tile
+(scheduler `MMA_T=64`, batch via `t.p3` preserved → batched attention gets tensor cores too)
+with `wmma.mma.sync m16n16k8` tf32, reusing poc/08's driver workarounds (A.row/B.col,
+`cvta.to.shared` on `__local` ptrs, broken `wmma.store.d.shared` → hand-mapped masked global
+store). It keeps the SAME `As`/`Bs` local footprint (64×16 each) and a comparable register
+count (`acc[2][8]+af[4]+bf[4]≈24` vs scalar `acc[4][4]+a[4]+b[4]`).
+
+**The occupancy risk (the whole reason to fear approach 1) MEASURED AWAY.** WMMA fragments do
+cost co-residency: the probe (poc/08 discovery) reports **raw residency 564 workgroups for the
+portable vm2, 376 for the TF32 vm2** — a 33% drop. BUT the megakernel launch is already capped
+at `2×CU = 376` lanes (validated NVIDIA sizing, §9), and 376 ≤ 564, so BOTH variants launch
+the identical 376 lanes. The tax is fully absorbed by the existing cap → non-matmul ops are
+NOT regressed. Confirmed directly, not just by lane count: a 12-op elementwise chain (0.739 ms)
+and a 32-iter `while` (2.17 ms) are BIT-identical and TIME-identical between the two variants.
+Note the tile sits exactly at the occupancy boundary (TF32 residency 376 == the cap): a bigger
+register tile would push residency *below* 376 and then shrink every other op's lane count — so
+64×64/`acc[2][8]` is the largest tile affordable here, which is also why in-program TF32 can't
+reach the standalone `mm_tc`'s 128×128 intensity.
+
+**Measured (RTX PRO 6000 Blackwell, `PJRT_OCL_MEGA_TC=0` = portable baseline):**
+- In-program matmul (chained, stays in megakernel): N=512 3.8→**4.6** TFLOP/s (1.2×),
+  N=1024 11.7→**17.7** (1.5×), N=2048 17.1→**27.3** (1.6×). Smem-bandwidth bound (BK=16,
+  single-buffered), so ~2× under the standalone `mm_tc` — the occupancy-preserving tile trades
+  intensity for not taxing other ops.
+- Batched attention shape (G=32, 128×64×128): 2.1→**2.3** TFLOP/s (~1.1×) — these matmuls are
+  tiny (67 MFLOP each) and latency/overhead-bound, so tensor cores barely engage.
+- Transformer `--config base`: portable 14.52 → **13.70 ms** (1.06×), vs CUDA 0.458 ms
+  (gap 31.7× → **30.0×**). Correct: mean −0.0128 (=CUDA), std 1.1539 vs 1.1544 (TF32 ~1e-2 rel).
+
+**Honest conclusion.** TF32-in-megakernel is a clean, SAFE, always-correct win with zero
+portability cost and zero non-matmul regression — shipped ON by default on NVIDIA. But the
+transformer at base is **overhead/latency-bound, not matmul-bound**: its matmuls are small
+(M=512, attention K=64) where even portable matmul is far from compute-bound, so faster matmul
+only buys 1.06×. The remaining 30× gap to CUDA is dominated by per-phase barrier/launch and the
+many small elementwise/reduce/softmax/layernorm phases + per-Execute H2D/D2H — a different
+front (barrier elision for lane-diagonal loops, §10a; per-Execute overhead), not matmul.
+
+**REJECTED: (2) selective per-phase dispatch.** Its only advantage over (1) is giving matmul an
+independent register budget for a 128×128 tile — but (1) proved it needs no such rescue
+(occupancy untouched). Against it: the transformer has ~48 matmul phases/iter, each would need
+a `clFinish` barrier (breaking the single-launch megakernel), and the standalone kernel is not
+batch-aware. Since in-program matmuls at these sizes are already overhead-bound (batched
+2 TFLOP/s), pulling them into separate launches adds more overhead than the higher intensity
+saves. Only worth revisiting if approach (1) had hurt occupancy, which it did not.
+
 ## 11. Scheduler: fuse lane-local elementwise chains (2026-07-16)
 
 The scheduler split the dataflow into LEVELS (maximal antichains) with a global barrier

@@ -115,6 +115,14 @@ class OclRuntime {
   cl_device_id dev() const { return dev_; }
   cl_command_queue queue() const { return queue_; }
   cl_kernel vm_kernel() const { return vm_kernel_; }
+  // Megakernel actually launched by the persistent engine: the NVIDIA TF32
+  // tensor-core variant (vm_tc_kernel_, built with -DVMO_NV_PTX) when it
+  // compiled, else the portable vm_kernel_. Both share the vm2 ABI; only
+  // vmo_mma_tile's body differs (docs/decisions.md §10b). PJRT_OCL_MEGA_TC=0
+  // forces the portable one (for A/B occupancy measurement).
+  cl_kernel vm_exec_kernel() const {
+    return vm_tc_kernel_ ? vm_tc_kernel_ : vm_kernel_;
+  }
   cl_kernel vm_seg_kernel() const { return vm_seg_kernel_; }
   cl_kernel vm_one_kernel() const { return vm_one_kernel_; }
   cl_kernel mm_kernel() const { return mm_kernel_; }
@@ -187,7 +195,9 @@ class OclRuntime {
   cl_context ctx_ = nullptr;
   cl_command_queue queue_ = nullptr;
   cl_program program_ = nullptr;
+  cl_program tc_mega_program_ = nullptr;  // NVIDIA -DVMO_NV_PTX megakernel (inline PTX)
   cl_kernel vm_kernel_ = nullptr;
+  cl_kernel vm_tc_kernel_ = nullptr;   // TF32 tensor-core vm2 (null => portable)
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
   cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
   cl_kernel mm_kernel_ = nullptr;      // standalone SGEMM (pure-matmul fast path)
