@@ -63,15 +63,45 @@ static void vmo_reduce_part_tile(__global uchar *arena, __global uchar **iop, co
     const uint n = t.p0, chunk = t.p1, kind = t.p2;
     const uint lo = tile * chunk, hi = min(lo + chunk, n);
     __global const float *a = AP(const float, t.a);
-    float acc = kind == 0 ? 0.0f
-              : kind == 1 ? -INFINITY
-              : kind == 2 ? INFINITY : 1.0f;
+    const float init = kind == 0 ? 0.0f
+                     : kind == 1 ? -INFINITY
+                     : kind == 2 ? INFINITY : 1.0f;
+    float acc = init;
+#ifdef VMO_CPU_TILES
+    /* CPU shape (poc/09 / decisions.md #11): contiguous chunk per WI, 8-lane
+     * vector partials + horizontal combine. Reductions already reassociate
+     * (the tree below), so vector partials don't change the contract. */
+    {
+        const uint cw = (hi - lo + lsz - 1) / lsz;
+        const uint clo = min(lo + lid * cw, hi), chi = min(clo + cw, hi);
+        float8 a8 = (float8)(init);
+        uint i = clo;
+        for (; i + 8u <= chi; i += 8u) {
+            const float8 v = vload8(0, a + i);
+            a8 = kind == 0 ? a8 + v
+               : kind == 1 ? fmax(a8, v)
+               : kind == 2 ? fmin(a8, v) : a8 * v;
+        }
+        float h[8] = {a8.s0, a8.s1, a8.s2, a8.s3, a8.s4, a8.s5, a8.s6, a8.s7};
+        for (int j = 0; j < 8; ++j)
+            acc = kind == 0 ? acc + h[j]
+                : kind == 1 ? fmax(acc, h[j])
+                : kind == 2 ? fmin(acc, h[j]) : acc * h[j];
+        for (; i < chi; ++i) {
+            const float v = a[i];
+            acc = kind == 0 ? acc + v
+                : kind == 1 ? fmax(acc, v)
+                : kind == 2 ? fmin(acc, v) : acc * v;
+        }
+    }
+#else
     for (uint i = lo + lid; i < hi; i += lsz) {
         const float v = a[i];
         acc = kind == 0 ? acc + v
             : kind == 1 ? fmax(acc, v)
             : kind == 2 ? fmin(acc, v) : acc * v;
     }
+#endif
     As[lid] = acc;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint s = lsz / 2; s > 0; s >>= 1) {
