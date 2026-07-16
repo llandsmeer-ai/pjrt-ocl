@@ -19,7 +19,7 @@ static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
     for (uint tile = tile_lo; tile < tile_hi; ++tile) {
         switch (op) {
         case TOP_EW:       vmo_ew_tile(arena, iop, aux, t, tile, dt, adt, lid, lsz); break;
-        case TOP_MMA:      vmo_mma_tile(arena, iop, t, tile, As, Bs); break;
+        case TOP_MMA:      vmo_mma_tile(arena, iop, aux, t, tile, As, Bs); break;
         case TOP_GATHER:   vmo_gather_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
         case TOP_RED_PART: vmo_reduce_part_tile(arena, iop, t, tile, As, dt, lid, lsz); break;
         case TOP_RED_COMB: vmo_reduce_comb_tile(arena, iop, t, dt, lid); break;

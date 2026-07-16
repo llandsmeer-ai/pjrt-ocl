@@ -52,7 +52,8 @@
 #define TC_TNW 2             /* 16-wide col subtiles per warp (2*16 == 32) */
 #define TC_KSUB (MMA_BK / 8) /* wmma k-substeps per staged BK block */
 
-static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
+static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global const int *aux,
+                     const task_t t, uint tile,
                      __local float *As, __local float *Bs)
 {
     const uint M = t.p0, N = t.p1, K = t.p2;
@@ -66,8 +67,16 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, const task
     const uint warp = lid >> 5, lane = lid & 31;
     const uint wm = warp & 3;       /* 0..3  -> row block wm*16 (4*16 == 64) */
     const uint wn = warp >> 2;      /* 0..1  -> col block wn*32 (2*32 == 64) */
-    __global const float *ga = AP(const float, t.a) + (size_t)g * M * K;
-    __global const float *gb = AP(const float, t.b) + (size_t)g * K * N;
+    /* VIEW-folded operands (docs/decisions.md §13 applied to matmul): when
+     * av/bv != 0 the operand read is a strided gather (folded transpose/reshape/
+     * broadcast) over the pre-transpose SOURCE buffer, so element (g,m,k) reads
+     * base[view_idx(flat)] with flat = the contiguous [G,M,K] index. av==0 keeps
+     * the contiguous fast path (base + g*M*K, common case). */
+    const uint av = t.p4, bv = t.p5;
+    __global const float *ba = AP(const float, t.a);
+    __global const float *bb = AP(const float, t.b);
+    __global const float *ga = ba + (size_t)g * M * K;
+    __global const float *gb = bb + (size_t)g * K * N;
 
     float acc[TC_TNW][8];
     for (int j = 0; j < TC_TNW; j++)
@@ -77,12 +86,20 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, const task
         for (uint idx = lid; idx < MMA_TM * MMA_BK; idx += 256) {
             const uint m = idx / MMA_BK, kk = idx % MMA_BK;   /* As row-major */
             const uint gr = row0 + m, gk = k0 + kk;
-            As[m * MMA_BK + kk] = (gr < M && gk < K) ? ga[gr * K + gk] : 0.0f;
+            const bool in = (gr < M && gk < K);
+            As[m * MMA_BK + kk] = !in ? 0.0f
+                : av ? ba[vmo_view_idx(aux, av - 1u,
+                          (uint)((size_t)g * M * K + (size_t)gr * K + gk))]
+                     : ga[gr * K + gk];
         }
         for (uint idx = lid; idx < MMA_TN * MMA_BK; idx += 256) {
             const uint n = idx / MMA_BK, kk = idx % MMA_BK;   /* Bs col-major */
             const uint gk = k0 + kk, gc = col0 + n;
-            Bs[n * MMA_BK + kk] = (gk < K && gc < N) ? gb[gk * N + gc] : 0.0f;
+            const bool in = (gk < K && gc < N);
+            Bs[n * MMA_BK + kk] = !in ? 0.0f
+                : bv ? bb[vmo_view_idx(aux, bv - 1u,
+                          (uint)((size_t)g * K * N + (size_t)gk * N + gc))]
+                     : gb[gk * N + gc];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint ks = 0; ks < TC_KSUB; ks++) {
@@ -117,7 +134,8 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, const task
 
 #else  /* portable scalar 4x4 microtile */
 
-static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
+static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global const int *aux,
+                     const task_t t, uint tile,
                      __local float *As, __local float *Bs)
 {
     const uint M = t.p0, N = t.p1, K = t.p2;
@@ -129,9 +147,16 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, const task
     const uint row0 = tr * MMA_TM, col0 = tc * MMA_TN;
     const uint lid = get_local_id(0);
     const uint ty = lid / MMA_TDIM, tx = lid % MMA_TDIM;
-    /* batched matmul: each slice g is a contiguous M×K / K×N / M×N sub-matrix */
-    __global const float *ga = AP(const float, t.a) + (size_t)g * M * K;
-    __global const float *gb = AP(const float, t.b) + (size_t)g * K * N;
+    /* batched matmul: each slice g is a contiguous M×K / K×N / M×N sub-matrix.
+     * av/bv (t.p4/p5) != 0 => the operand is a folded shape op (transpose/
+     * reshape/broadcast), read strided from the pre-transpose SOURCE via
+     * vmo_view_idx over the contiguous [G,M,K] flat index (docs/decisions.md §13
+     * for matmul). av==0 keeps the contiguous fast path. */
+    const uint av = t.p4, bv = t.p5;
+    __global const float *ba = AP(const float, t.a);
+    __global const float *bb = AP(const float, t.b);
+    __global const float *ga = ba + (size_t)g * M * K;
+    __global const float *gb = bb + (size_t)g * K * N;
 
     float acc[MMA_RM][MMA_RN];
     for (int i = 0; i < MMA_RM; i++)
@@ -141,14 +166,20 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, const task
         for (uint idx = lid; idx < MMA_TM * MMA_BK; idx += 256) {
             const uint m = idx / MMA_BK, kk = idx % MMA_BK;
             const uint gr = row0 + m, gk = k0 + kk;
-            As[m * MMA_BK + kk] =
-                (gr < M && gk < K) ? ga[gr * K + gk] : 0.0f;
+            const bool in = (gr < M && gk < K);
+            As[m * MMA_BK + kk] = !in ? 0.0f
+                : av ? ba[vmo_view_idx(aux, av - 1u,
+                          (uint)((size_t)g * M * K + (size_t)gr * K + gk))]
+                     : ga[gr * K + gk];
         }
         for (uint idx = lid; idx < MMA_BK * MMA_TN; idx += 256) {
             const uint kk = idx / MMA_TN, n = idx % MMA_TN;
             const uint gk = k0 + kk, gc = col0 + n;
-            Bs[kk * MMA_TN + n] =
-                (gk < K && gc < N) ? gb[gk * N + gc] : 0.0f;
+            const bool in = (gk < K && gc < N);
+            Bs[kk * MMA_TN + n] = !in ? 0.0f
+                : bv ? bb[vmo_view_idx(aux, bv - 1u,
+                          (uint)((size_t)g * K * N + (size_t)gk * N + gc))]
+                     : gb[gk * N + gc];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint kk = 0; kk < MMA_BK; ++kk) {

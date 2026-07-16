@@ -202,6 +202,9 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
          base_op == kTopDynGather || base_op == kTopDynScatter ||
          base_op == kTopRedWindow) && t.p0 >= n_aux)
       return fail("task aux offset out of range");
+    // MMA operand VIEW aux-offsets (+1; 0 = contiguous) index the aux pool.
+    if (base_op == kTopMma && (t.p4 > n_aux || t.p5 > n_aux))
+      return fail("mma view aux offset out of range");
   }
   uint32_t barrier_count_ref = 0;
   bool first_lane = true;
@@ -647,8 +650,12 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
   // no barrier/control entries -> dispatch the standalone mm2 SGEMM instead of
   // the megakernel (which caps matmul occupancy). Handles/dims come straight
   // from the (now offset-patched) task.
+  // Exclude VIEW-folded matmuls (p4/p5 != 0): the standalone mm2/gemv kernels
+  // read contiguous operands and have no view descriptor path — those stay on
+  // the megakernel, which does implement the strided operand read.
   if (tasks.size() == 1 && (tasks[0].tile_op & 0xFFu) == kTopMma &&
-      ((tasks[0].tile_op >> 8) & 0xFFu) == kDtF32 && tasks[0].p3 <= 1) {
+      ((tasks[0].tile_op >> 8) & 0xFFu) == kDtF32 && tasks[0].p3 <= 1 &&
+      tasks[0].p4 == 0 && tasks[0].p5 == 0) {
     bool clean = true;
     for (const VmEntry& en : p.entries)
       if (en.task == kEntBarrier || en.task == kEntWhile || en.task == kEntIf)

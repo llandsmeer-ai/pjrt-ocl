@@ -129,15 +129,30 @@ def _dot_general(ctx, op):
 
 def _dot_to_task(ins) -> Task:
     M, N, K, G = _decode(ins)
+    # aview/bview (+1; 0 = contiguous): a folded transpose/reshape/broadcast on
+    # this operand (see lowering._fuse_matmul_views). The device reads the
+    # pre-transpose SOURCE via the gather descriptor at p4/p5-1.
     return Task(TILE_MMA, dst=ins.dst, a=ins.a, b=ins.b,
-                p0=M, p1=N, p2=K, p3=G)
+                p0=M, p1=N, p2=K, p3=G, p4=ins.aview, p5=ins.bview)
+
+
+def _dot_views(ins, rt):
+    """Recover (aview, bview) for a folded dot from the 2-word aux header at
+    ins.aux (0 = no fold). Written by lowering._finalize_matmul_views so the
+    tensor validator, which runs on re-parsed bytecode, can see the fold."""
+    if not ins.aux:
+        return 0, 0
+    return rt.aux[ins.aux], rt.aux[ins.aux + 1]
 
 
 def _dot_interp(ins, rt):
-    """Reference semantics (validator a): C[G,M,N] = A[G,M,K] @ B[G,K,N]."""
+    """Reference semantics (validator a): C[G,M,N] = A[G,M,K] @ B[G,K,N].
+    A folded operand reads its pre-transpose source through the strided view
+    (rt.viewed decodes the contiguous [G,M,K]/[G,K,N] flat index)."""
     M, N, K, G = _decode(ins)
-    a = rt.view(ins.a, G * M * K).reshape(G, M, K)
-    b = rt.view(ins.b, G * K * N).reshape(G, K, N)
+    av, bv = _dot_views(ins, rt)
+    a = rt.viewed(ins.a, G * M * K, av).reshape(G, M, K)
+    b = rt.viewed(ins.b, G * K * N, bv).reshape(G, K, N)
     rt.view(ins.dst, G * M * N)[:] = (a @ b).reshape(-1)
 
 
@@ -147,8 +162,13 @@ def _dot_tile_sim(task, entry, rt):
     tiles_n; g = tile // (tiles_m*tiles_n) selects the batch slice, then tr/tc
     within it (mirrors mma.cl's batched tile indexing)."""
     M, N, K, G = task.p0, task.p1, task.p2, max(1, task.p3)
-    a = rt.view(task.a).reshape(G, M, K)
-    b = rt.view(task.b).reshape(G, K, N)
+    # task.p4/p5 (+1; 0 = contiguous): folded operand read via the strided view
+    # (rt.viewed decodes the contiguous [G,M,K]/[G,K,N] flat index). rt.view()
+    # takes no element count here, so use the plain read on the contiguous path.
+    a = (rt.viewed(task.a, G * M * K, task.p4) if task.p4
+         else rt.view(task.a)).reshape(G, M, K)
+    b = (rt.viewed(task.b, G * K * N, task.p5) if task.p5
+         else rt.view(task.b)).reshape(G, K, N)
     c = rt.view(task.dst).reshape(G, M, N)
     tiles_n = math.ceil(N / MMA_T) if N else 1
     tiles_m = math.ceil(M / MMA_T) if M else 1

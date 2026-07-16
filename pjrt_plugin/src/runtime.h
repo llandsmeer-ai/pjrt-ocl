@@ -30,9 +30,11 @@ enum VmOp : uint32_t {
 
 // Schedule sections (v2.1 spec in docs/vmprogram.md).
 struct VmTask {
-  uint32_t tile_op, dst, a, b, p0, p1, p2, p3;
+  // p4/p5: MMA operand VIEW aux-offsets (+1; 0 = contiguous), for shape-op
+  // (transpose/reshape/broadcast) fold into the matmul operand read (§13).
+  uint32_t tile_op, dst, a, b, p0, p1, p2, p3, p4, p5;
 };
-static_assert(sizeof(VmTask) == 32);
+static_assert(sizeof(VmTask) == 40);
 
 struct VmEntry {
   uint32_t task, tile_lo, tile_hi, wait_flag, wait_count, signal_flag,
