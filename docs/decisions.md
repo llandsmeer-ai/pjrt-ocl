@@ -825,22 +825,24 @@ rule. Gather→gather→EW *composition* (compose two access maps) is still the 
 
 Measured ours (TF32 megakernel, NVIDIA) vs. native JAX CUDA on the same GPU, forward pass:
 
-| config   | ours (ms) | CUDA (ms) | gap    | ours GFLOP/s |
-|----------|-----------|-----------|--------|--------------|
-| tiny     | 1.58      | 0.13      | 11.9×  | 37           |
-| small    | 4.75      | 0.21      | 22.7×  | 198          |
-| base     | 9.90      | 0.44      | 22.5×  | 2,114        |
-| large_l1 | 5.83      | 0.57      | **10.2×** | **9,584**  |
+| config       | ours (ms) | CUDA (ms) | gap       | ours GFLOP/s |
+|--------------|-----------|-----------|-----------|--------------|
+| tiny         | 1.58      | 0.13      | 11.9×     | 37           |
+| small        | 4.75      | 0.21      | 22.7×     | 198          |
+| base         | 9.82      | 0.44      | 22.5×     | 2,132        |
+| large_l1     | 5.77      | 0.57      | 10.2×     | 9,683        |
+| **large** (6L) | **35.07** | **3.67** | **9.6×** | **9,553**  |
 
-`large_l1` = one layer of the compute-bound `large` shape (D=1024, ff=4096, 16 heads). As the
-work becomes matmul-dominated the picture inverts: our throughput jumps to **9.6 TFLOP/s** and the
-gap **halves** (22× → 10×). So base's 22× is overhead/small-op-bound (many tiny barrier phases,
-§14 profiling), NOT a fundamental matmul deficit — on compute-bound work we are within ~10×, and
-that residual is cuBLAS-vs-our-tiling (the in-megakernel TF32 path runs at ~10% of native; the
-tuned standalone `mm2` TF32 kernel is faster but only fires for pure-matmul programs, §10c/§10b).
-The honest answer to "comparable range of performance": **yes on compute-bound layers, no on
-tiny/overhead-bound ones.** The full multi-layer `large` is blocked on arena reuse (§16); re-measure
-the end-to-end large gap once that lands.
+`large` = the full compute-bound config (D=1024, ff=4096, 16 heads, 6 layers; `large_l1` is one
+such layer). As the work becomes matmul-dominated the picture inverts: our throughput jumps to
+**9.5 TFLOP/s** and the gap **more than halves** (22× → 9.6×) and *holds* at full depth. So base's
+22× is overhead/small-op-bound (many tiny barrier phases, §14 profiling), NOT a fundamental matmul
+deficit — on compute-bound work we are within ~10× at ~9.5 TFLOP/s, and that residual is
+cuBLAS-vs-our-tiling (the in-megakernel TF32 path runs at ~10% of native; the tuned standalone
+`mm2` TF32 kernel is faster but only fires for pure-matmul programs, §10c/§10b). The honest answer
+to "comparable range of performance": **yes on compute-bound layers (~10×, holds end-to-end at 6
+layers), no on tiny/overhead-bound ones.** (Full `large` measured after arena reuse §16 unblocked
+it — it was a hard LoweringError at 2 layers before.)
 
 ## 15. Fixed-trip while: OP_FOR + bytecode unroll (2026-07-16, poc/12)
 
