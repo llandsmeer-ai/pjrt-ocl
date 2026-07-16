@@ -685,13 +685,53 @@ def _while_mode() -> str:
 
 
 def _unroll_trip_limit() -> int:
-    """auto mode unrolls counted loops up to this trip count (PoC poc/12:
-    bytecode size grows linearly and compile/upload time with it, while the
-    per-iteration win over OP_FOR shrinks; see docs/decisions.md)."""
+    """auto mode unrolls counted loops up to this trip count (poc/12: unroll
+    wins by 10-20x at small sizes and stays ahead of OP_FOR well past 100
+    trips, but bytecode size and compile time grow linearly)."""
     try:
-        return int(os.environ.get("PJRT_OCL_UNROLL_TRIPS", "32"))
+        return int(os.environ.get("PJRT_OCL_UNROLL_TRIPS", "64"))
     except ValueError:
-        return 32
+        return 64
+
+
+def _unroll_arena_cap() -> int:
+    """auto mode's byte budget for unrolled intermediates. The arena allocator
+    is a bump allocator (no SSA liveness reuse yet), so unrolling allocates
+    fresh buffers per iteration: a 512-trip loop over 1M-element carries wants
+    gigabytes and dies (poc/12 measured). PJRT_OCL_UNROLL_ARENA_MB."""
+    try:
+        return int(os.environ.get("PJRT_OCL_UNROLL_ARENA_MB", "256")) << 20
+    except ValueError:
+        return 256 << 20
+
+
+def _unroll_bytes_estimate(ctx: _Ctx, block, depth: int = 0) -> int:
+    """Rough per-iteration arena bytes if this body block were unrolled: the
+    sum of every op result's tensor bytes (constants excluded — they lower
+    once), func.call bodies included. Over-approximates (DCE/fusion drop some)
+    but scales correctly with body size x carry size."""
+    from jaxlib.mlir import ir
+    if depth > 4:
+        return 0
+    total = 0
+    for inner in block.operations:
+        io = inner.operation
+        if io.name in ("stablehlo.return", "func.return", "stablehlo.constant"):
+            continue
+        if io.name == "func.call":
+            callee = ctx.funcs.get(
+                ir.FlatSymbolRefAttr(io.attributes["callee"]).value)
+            if callee is not None:
+                total += _unroll_bytes_estimate(
+                    ctx, callee.regions[0].blocks[0], depth + 1)
+            continue
+        for res in io.results:
+            try:
+                _, n_elems, dtype = _tensor_info(res.type)
+            except LoweringError:
+                continue
+            total += n_elems * DTYPE_NUMPY[dtype].itemsize
+    return total
 
 
 def _emit_const_scalar_int(ctx: _Ctx, val: int, dtype: int) -> int:
@@ -770,8 +810,13 @@ def _lower_while(ctx: _Ctx, op):
     mode = _while_mode()
     if fixed is not None and mode != "while":
         trip, ck, init, step, counter_dt = fixed
-        if mode == "unroll" or (mode == "auto"
-                                and trip <= _unroll_trip_limit()):
+        # auto: unroll when the trip count is modest AND the unrolled
+        # intermediates fit the arena budget (bump allocator, no reuse —
+        # poc/12: a 512-trip 1M-element unroll wants ~4 GB and dies).
+        if mode == "unroll" or (
+                mode == "auto" and trip <= _unroll_trip_limit()
+                and trip * _unroll_bytes_estimate(ctx, op.regions[1].blocks[0])
+                <= _unroll_arena_cap()):
             _unroll_while(ctx, op, trip, ck, init, step, counter_dt)
             return
     else:
@@ -891,16 +936,23 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
             continue
         ctx.instrs[pidx] = dataclasses.replace(prod, dst=cbuf)
         inplace[k] = True
+    # IDENTITY passthrough (ret == this carry's own buffer, e.g. scan's xs):
+    # the "new" value already IS the carry — both snapshot copies are pure
+    # waste (2 full-length passes/iteration over the largest carry in a scan).
+    # Nothing writes cbuf in the body (each in-place commit targets its own
+    # carry), so skipping is safe. NOT the same as `rb in carry_ids` with
+    # rb != cbuf (a swap) — that one keeps the two-phase snapshot.
+    skip = [ret_bufs[k] == carry[k][0] for k in range(n)]
     temps: dict[int, int] = {}
     for k in range(n):
-        if inplace[k]:
+        if inplace[k] or skip[k]:
             continue
         _, n_elems, dtype = carry[k]
         t = ctx.new_buffer(n_elems, dtype)
         ctx.emit(Instr(OP_COPY_F32, dst=t, a=ret_bufs[k], n=n_elems))
         temps[k] = t
     for k in range(n):
-        if inplace[k]:
+        if inplace[k] or skip[k]:
             continue
         cbuf, n_elems, _ = carry[k]
         ctx.emit(Instr(OP_COPY_F32, dst=cbuf, a=temps[k], n=n_elems))

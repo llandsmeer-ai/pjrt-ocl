@@ -83,7 +83,9 @@ def run_one(work: str, n: int, T: int, backend: str, mode: str,
     except subprocess.TimeoutExpired:
         return {"error": "TIMEOUT"}
     if p.returncode != 0:
-        return {"error": (p.stderr or "?").strip().splitlines()[-1][:120]}
+        lines = [l for l in (p.stderr or "").strip().splitlines()
+                 if "experimental" not in l] or [f"exit {p.returncode}"]
+        return {"error": lines[-1][:120]}
     return json.loads(p.stdout.strip().splitlines()[-1])
 
 

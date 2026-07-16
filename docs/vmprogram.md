@@ -22,7 +22,7 @@ entries: n_entries × 32B { task u32, tile_lo u32, tile_hi u32,
 ```
 
 - `task` sentinels: `0xFFFFFFFF` NOP, `0xFFFFFFFE` BARRIER (global; every lane must contain the
-  same barrier sequence), `0xFFFFFFFD` WHILE, `0xFFFFFFFC` IF.
+  same barrier sequence), `0xFFFFFFFD` WHILE, `0xFFFFFFFC` IF, `0xFFFFFFFB` FOR (fixed trip).
 - dst/a/b in tasks are BUFFER IDS (executor patches to element offsets at load, as v1).
 - tile_op vocabulary + params (element counts, not bytes):
 
@@ -50,6 +50,12 @@ entries: n_entries × 32B { task u32, tile_lo u32, tile_hi u32,
   wait_count = else_len, signal_flag = cond buffer id (patched). Semantics: BARRIER implicit
   before cond read is NOT added — scheduler must place a BARRIER entry before the IF/WHILE if
   the cond producer ran in the same phase.
+- FOR entry (fixed-trip counted loop, poc/12): tile_lo = body_start, tile_hi = body_len
+  (range within THIS lane's stream), wait_flag = TRIP COUNT (not a range; 0 = skip),
+  signal_flag = FLAG_NONE (no cond buffer — nothing to patch). Kernel semantics:
+  repeat trip times { run body range; BARRIER } — no cond sub-list, no cond read.
+  On the host-dispatch engine the whole loop streams into the enqueue ring with no
+  blocking per-iteration cond read (the reason FOR exists on CPU).
 - v0 scheduling contract: BARRIER between dataflow levels; WAIT/SIGNAL flags unused (all
   0xFFFFFFFF = FLAG_NONE) — reserved for per-op counters later. n_flags may be 0.
 - Executor: launches ONE kernel (n_lanes workgroups × 256); uploads tasks (patched), lane tab,
@@ -99,8 +105,9 @@ executor rejects v1 (producer and consumer live in one repo).
 | 27 | DOT | aux: `M u32, N u32, K u32` — `dst[MxN] = a[MxK] @ b[KxN]` row-major dense. `n` = M*N. |
 | 28 | IOTA_DIM | aux: `rank u32, out_dims i32[rank], dim u32` — `dst[i] = idx_dim(i)` |
 | 29 | IF | like WHILE: cond scalar = buffer `dst` (read atomically); then = instrs `[a, a+b)`, else = `[n, n+imm)` (either may be empty) |
+| 53 | FOR | fixed-trip loop: body = instrs `[n, n+imm)` run `b` times (`b` = compile-time trip count; `dst`/`a` unused = 0). Emitted for detected counted whiles (lax.scan / fori_loop); see PJRT_OCL_WHILE in the lowering. |
 
-Opcodes 0–7 unchanged from v1. WHILE/IF sub-list rules per v1 (linear, nested, frame stack —
+Opcodes 0–7 unchanged from v1. WHILE/IF/FOR sub-list rules per v1 (linear, nested, frame stack —
 shared depth ≤ 8 budget).
 
 # VMProgram v1 — binary format spec (historical)

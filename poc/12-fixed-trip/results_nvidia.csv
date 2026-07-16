@@ -1,0 +1,6 @@
+# device=NVIDIA
+work,n,T,mode,ms,compile_s,sig
+fori-ew,4096,8,xla-cpu,0.093,0.19,0.73754
+fori-ew,4096,8,while,0.523,0.19,0.73754
+fori-ew,4096,8,for,0.162,0.23,0.73754
+fori-ew,4096,8,unroll,0.092,0.18,0.73754
