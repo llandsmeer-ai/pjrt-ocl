@@ -10,3 +10,4 @@ poc/05-typed-lanes/poc
 poc/06-fast-mma/bench
 .claude/worktrees/
 *.egg-info/
+poc/08-occupancy-discovery/poc08
