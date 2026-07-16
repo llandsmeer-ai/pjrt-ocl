@@ -75,6 +75,10 @@ Key properties of the execution model:
   path — vendor-specific tuning goes behind the kernel-table override mechanism. Never assume fp64.
 - `docs/` holds distilled references (PJRT API notes, StableHLO op semantics, OpenCL memory-model
   notes). When you burn >15 min figuring out an external API fact, write it down there.
+- **New hardware/driver**: the first time any new OpenCL device, vendor, or major driver version
+  meets this codebase, work through `docs/hardware-bringup.md` end-to-end (testbench both engines,
+  lane-discovery tightness, perf vs native plugin, cost model, README "Hardware tested" entry).
+  A bring-up isn't done until its results are recorded per that checklist's step 6.
 
 ## Environment facts (verified 2026-07-14)
 

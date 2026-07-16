@@ -125,12 +125,26 @@ f16/bf16 use 2-byte storage with f32 compute (portable, no `cl_khr_fp16` require
 
 Anything unsupported raises a clear `LoweringError` naming the op.
 
-## Performance
+## Hardware tested & benchmarks
 
-Correctness comes first; performance is early. Below is per-op wall-clock vs
-problem size N — **our OpenCL backend against JAX's native CUDA (XLA + cuBLAS)
-on the same GPU** (NVIDIA RTX PRO 6000 Blackwell), so it's an apples-to-apples
-GPU-vs-GPU comparison of the VM against a production compiler.
+Correctness comes first; performance is early. Every device below runs the full
+test suite (198 tests: op families x the dtype matrix + e2e); benchmarks are
+per-op wall-clock vs problem size N so you can judge whether the library is
+worth it for *your* sizes and hardware. New devices go through
+[`docs/hardware-bringup.md`](docs/hardware-bringup.md).
+
+Reproduce any plot (writes the `.png` + `.csv`; picks native CUDA as reference
+when a CUDA jaxlib is installed, else JAX CPU):
+
+```bash
+. ./env.sh && python tools/plot_bench.py --device <platform substring>
+```
+
+### NVIDIA RTX PRO 6000 (Blackwell) — vs native CUDA
+
+**Testbench: full suite green.** Per-op wall-clock, **our OpenCL backend
+against JAX's native CUDA (XLA + cuBLAS) on the same GPU** — an
+apples-to-apples GPU-vs-GPU comparison of the VM against a production compiler.
 
 ![ours (OpenCL) vs JAX CUDA, per-op N-vs-time](docs/bench_plot.png)
 
@@ -148,12 +162,32 @@ Takeaways (higher = slower; both axes log):
   cross-workgroup barrier + control round-trip. Loop-body fusion and cheaper
   per-iteration sync are the obvious wins.
 
-Reproduce (writes `docs/bench_plot.png` + `.csv`; auto-uses native CUDA as the
-reference if a CUDA jaxlib is installed, else JAX CPU):
+### Intel Arc 140V (Xe2, Lunar Lake iGPU) — vs JAX CPU
 
-```bash
-. ./env.sh && python tools/plot_bench.py --device NVIDIA
-```
+**Testbench: full suite green** (both engines; `intel-opencl-icd` 26.22). No
+native JAX plugin exists for this iGPU, so the reference is JAX's XLA **CPU**
+backend on the same package (Core Ultra 9 288V) — cross-device but honest:
+it's the alternative you'd actually use.
+
+![ours (OpenCL/Xe2) vs JAX CPU, per-op N-vs-time](docs/bench_plot_xe2.png)
+
+- **Large arrays are where the iGPU pays off**: elementwise at 8–16M elements
+  runs ~1.7x *faster* than XLA CPU (~22 GB/s effective on LPDDR5X; zero-copy
+  USM is the obvious next win on an integrated GPU), and `dot_general` is
+  equal-or-faster at *every* size (~490 GFLOP/s at 2048³ from the naive tile
+  kernel — ~23% of the device's fp32 peak).
+- **Small ops are dispatch-bound** (~60–160 µs wall-clock vs XLA CPU's
+  ~10–30 µs): 2–10x slower below ~256K elements. Batch or fuse small work.
+- **`while` loops cost ~110 µs/iteration** at small N — far above the raw
+  1.9 µs cross-workgroup barrier (poc/08), so control-flow round-trips
+  dominate; the same gap seen on NVIDIA, same fix direction (loop-body fusion).
+- Bring-up found and fixed a real portability bug: lane count is now *measured*
+  at init (occupancy discovery, `docs/decisions.md` §9) instead of derived from
+  the vendor-ambiguous `CL_DEVICE_MAX_COMPUTE_UNITS`.
+
+### CPU via PoCL (Intel Core Ultra 9 288V) — vs JAX native CPU
+
+<!-- POCL_BENCH -->
 
 ## Development
 
