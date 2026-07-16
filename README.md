@@ -192,30 +192,46 @@ through the plugin with per-entry instrumentation and draws what the device real
 
 Reading it, top panel (the scheduler's intent, on its cost model's clock):
 
-- **Level 0**: the matmul's 16 tiles get lanes 0–4 while `c+c` and `c*c` run
-  concurrently on lanes 5–7 — independent ops really do run side by side.
+- **Level 0**: independent ops really do run side by side — the matmul's 16 tiles
+  fan out over several lanes while `c+c` and `c*c` run concurrently on others.
 - The dashed **barriers** separate levels: `s * p` and the final join each wait for
   every lane, because their inputs were produced across lanes.
-- Levels 1–2 have only 4 tiles for 8 lanes: lanes 4–7 are scheduled idle —
+- Levels 1–2 have only 4 tiles for 8 lanes: half the lanes are scheduled idle —
   a structural **bubble** visible at schedule time.
 
-Bottom panel (device timestamps from the same program, white gaps = bubbles):
+Bottom panel (device timestamps from the same program, white gaps = bubbles): this
+run was forced to the **unit-cost model** (`PJRT_OCL_CALIBRATE=0`), and on this CPU
+that model is badly wrong — a matmul tile really costs **~16×** an elementwise tile
+(measured), so the elementwise lanes finish in under a millisecond and stall at the
+barrier while the matmul lanes grind on: 42% of all lane-time is idle.
 
-- On this CPU the default cost model is wrong: a matmul tile costs roughly 25× an
-  elementwise tile, so lanes 5–7 finish in under a millisecond and then stall at the
-  barrier while the matmul lanes grind on — most of the idle time in the run.
-  Supplying measured per-tile costs (`--cost-table`, `PJRT_OCL_COST_TABLE`) lets the
-  scheduler rebalance exactly this.
-- The same command with `--device NVIDIA` shows a much flatter level 0: on that GPU
-  a matmul tile and an elementwise tile cost about the same. The schedule is
-  device-neutral but the costs are not — which is why per-tile costs are measured
-  per device rather than assumed.
+This is why the cost model is **measured, not assumed**. On first use the plugin runs
+a µbenchmark per tile-op family on the actual device (two tile counts, slope, so
+launch overhead cancels), caches the result under `~/.cache/pjrt-ocl/` keyed by
+device+driver, and every subsequent compile schedules with those costs — on this CPU
+`ew=310 mma=5073 reduce=89 gather=201` µs/tile, on the NVIDIA GPU
+`ew=15 mma=27 reduce=13 gather=21` (nearly uniform — same schedule, opposite balance).
+With measured costs the packer both **fans the matmul out over all lanes** and
+**sequentializes the cheap elementwise ops behind its chunks** instead of dedicating
+lanes to them:
+
+![scheduled vs measured, device-calibrated cost model](docs/schedule_diamond_calibrated.png)
+
+The planned and measured panels now agree structurally, and idle lane-time drops from
+42% to ~20% (the rest is the CPU runtime's own per-workgroup jitter, not scheduling).
+On shapes where cheap ops would otherwise steal lanes from a matmul (e.g. one matmul
++ seven small elementwise ops), the calibrated schedule is ~1.3× faster end-to-end on
+PoCL. Override knobs: `PJRT_OCL_COST_TABLE=<json>` (explicit table),
+`PJRT_OCL_CALIBRATE=0|1` (disable / force re-measure).
 
 Reproduce (any of `diamond`, `chain`, `wide`, or your own StableHLO):
 
 ```bash
 . ./env.sh
-python tools/plot_schedule.py --example diamond --device Portable --out docs/schedule_diamond.png
+python tools/plot_schedule.py --example diamond --device Portable \
+    --out docs/schedule_diamond_calibrated.png                 # measured costs (default)
+PJRT_OCL_CALIBRATE=0 python tools/plot_schedule.py --example diamond \
+    --device Portable --out docs/schedule_diamond.png          # unit-cost model
 python tools/plot_schedule.py --stablehlo my_program.mlir      # planned timeline only
 ```
 

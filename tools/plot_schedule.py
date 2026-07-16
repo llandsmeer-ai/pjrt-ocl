@@ -121,8 +121,10 @@ def plan_schedule(artifact: bytes, lanes: int, cost_table: str | None):
     from pjrt_ocl import scheduler as S
     costs = {}
     if cost_table:
-        costs = {k: float(v) for k, v in
-                 json.loads(pathlib.Path(cost_table).read_text()).items()}
+        raw = json.loads(pathlib.Path(cost_table).read_text())
+        costs = {k: float(raw[k]) for k in ("ew_tile_us", "mma_tile_us",
+                                            "gather_tile_us", "reduce_tile_us")
+                 if k in raw}
     config = S.DeviceConfig(nlanes=lanes, costs=costs)
     prog = L.lower_artifact(artifact)
     return S, config, S.schedule_program(prog, config)
@@ -260,7 +262,8 @@ def draw_panel(ax, blocks, barriers, makespan, n_lanes, color_of, label_of,
         s.set_visible(False)
 
 
-def plot(sched, planned, measured, device, name, out: pathlib.Path):
+def plot(sched, planned, measured, device, name, out: pathlib.Path,
+         calibrated=False):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -284,6 +287,7 @@ def plot(sched, planned, measured, device, name, out: pathlib.Path):
 
     blocks, barriers, makespan = planned
     draw_panel(axes[0][0], blocks, barriers, makespan, n, color_of, label_of,
+               "cost-model time (µs/tile table)" if calibrated else
                "cost-model time (unit-cost x tiles)",
                f"{name}: scheduled — per-lane streams on the cost model's "
                "clock (dashed = global barrier)")
@@ -330,6 +334,13 @@ def collect_trace(example: str, device: str, lanes: int,
                PJRT_OCL_VM_LANES=str(lanes), PJRT_OCL_VM_TRACE=str(trace))
     env.setdefault("PJRT_OCL_PLUGIN_PATH",
                    str(REPO / "build" / "pjrt_plugin" / "libpjrt_ocl.so"))
+    # Pin the lowering/scheduler to THIS checkout (an installed pjrt_ocl from
+    # another tree would schedule differently than the planned panel).
+    env.setdefault("PJRT_OCL_LOWER_SERVICE",
+                   str(REPO / "python" / "pjrt_ocl" / "lower_service.py"))
+    env["PYTHONPATH"] = (str(REPO / "python") +
+                         (":" + env["PYTHONPATH"] if env.get("PYTHONPATH")
+                          else ""))
     env.setdefault("POCL_CACHE_DIR", str(REPO / "third_party" / "pocl-cache"))
     if cost_table:
         env["PJRT_OCL_COST_TABLE"] = str(pathlib.Path(cost_table).resolve())
@@ -376,25 +387,38 @@ def main():
         fn, fargs = build_example(args.example)
         artifact = artifact_of(fn, fargs)
 
-    S, config, sched = plan_schedule(artifact, args.lanes, args.cost_table)
-    planned = planned_timeline(S, config, sched)
-
-    measured = None
+    measured, rec, cost_table = None, None, args.cost_table
     if not args.stablehlo:
+        # Trace first: the plugin resolves the device's measured cost table
+        # (first-run calibration, runtime.cc) and records its path in the
+        # trace, so the planned panel below uses the SAME costs the plugin's
+        # scheduler packed with.
         trace = collect_trace(args.example, args.device, args.lanes,
                               args.cost_table)
+        first = json.loads(trace.read_text().splitlines()[0])
+        if not cost_table and first.get("cost_table"):
+            if pathlib.Path(first["cost_table"]).is_file():
+                cost_table = first["cost_table"]
+                print(f"cost table (device-calibrated): {cost_table}")
+    else:
+        print("note: --stablehlo plots the planned timeline only "
+              "(no host program to execute)")
+
+    S, config, sched = plan_schedule(artifact, args.lanes, cost_table)
+    planned = planned_timeline(S, config, sched)
+
+    if not args.stablehlo:
         rec = read_trace(trace, sched.tasks, args.lanes)
         measured = measured_timeline(rec)
         device = rec["device"]
         trace.unlink()
     else:
         device = args.device
-        print("note: --stablehlo plots the planned timeline only "
-              "(no host program to execute)")
 
     name = (pathlib.Path(args.stablehlo).name if args.stablehlo
             else args.example)
-    plot(sched, planned, measured, device, name, pathlib.Path(args.out))
+    plot(sched, planned, measured, device, name, pathlib.Path(args.out),
+         calibrated=bool(cost_table))
 
 
 if __name__ == "__main__":

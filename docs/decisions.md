@@ -95,6 +95,43 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
   balance — reconfirms measure-don't-assume; the cost-table (`PJRT_OCL_COST_TABLE`)
   is the rebalancing lever. Verified: runtime_test PoCL+NVIDIA PASS, 197 pytest pass,
   traced diamond output matches numpy (max |err| 4.8e-7 — f32 matmul accumulation).
+- ✅ **SHIPPED 2026-07-16: measured per-device cost model + sequentializing lane packer**
+  — closes the "cost model is MEASURED, not assumed" spec item (was designed 2026-07-14,
+  validated in poc/04, then never wired into the tree: DeviceConfig defaulted every
+  tile-op to 1.0 and nothing generated PJRT_OCL_COST_TABLE). Trigger: the trace-mode
+  diamond plot — unit costs made the scheduler give the matmul 5–6 lanes and dedicate
+  lanes to two cheap EW ops, which then sat 97–99% idle at the barrier (user diagnosis:
+  they should have been sequentialized onto shared lanes).
+  - **Calibration (runtime.cc `CalibrateCosts`, runs at client init):** per tile-op
+    family (ew/mma/reduce/gather), execute a hand-built single-lane program (fill
+    inputs → barrier → K op tiles) at K and 2K tiles; **µs/tile = slope** — fills and
+    launch overhead cancel (poc/04's contamination lesson). Cached as JSON at
+    `${XDG_CACHE_HOME:-~/.cache}/pjrt-ocl/costs-<fnv(platform|device|driver)>.json`;
+    `PJRT_OCL_CALIBRATE=0|1` disables/forces; a user `PJRT_OCL_COST_TABLE` supersedes;
+    plugin.cc forwards the resolved path to the lowering subprocess, so every compile
+    is cost-aware with zero user action. Trace mode is suppressed during calibration
+    (per-entry launches would distort the measurement). Measured: PoCL ew=310
+    mma=5073 reduce=89 gather=201 µs/tile (MMA:EW ≈ 16×); NVIDIA ew=15 mma=27
+    reduce=13 gather=21 (≈1.8×) — reconfirms poc/04's "same graph, different balance"
+    at the ratio level. (The trace-mode ~25× estimate was under 8-lane contention;
+    calibration is single-lane. Ratios, not absolutes, drive packing.)
+  - **Packer (scheduler.py `_pack_level`): chunk + LPT, one regime.** Each task splits
+    into k = min(tiles, ceil(n_lanes·cost_share)) contiguous chunks; all chunks LPT
+    onto least-loaded lanes; a lane may carry MULTIPLE entries per level. Replaces the
+    old primary/overflow pair, whose ≥1-dedicated-lane-per-task invariant made
+    sequentialization impossible. Diamond with measured costs: matmul chunks on ALL 8
+    lanes, add/mul stacked behind lanes 0–1; model makespan 75 → 56 cost units.
+  - **Validated:** 199 pytest (incl. new sequentialization test + rewritten
+    proportional-allocation test; simulators already supported multi-entry lanes),
+    runtime_test PASS PoCL+NVIDIA, calibrated e2e correct on the NVIDIA megakernel.
+    Traced diamond on PoCL: planned and measured panels now structurally agree; idle
+    lane-time 42–50% → ~20% (rest is PoCL per-workgroup jitter, not scheduling).
+    **Wall-clock:** diamond unchanged within PoCL noise (model gain 1.17× ≪ jitter);
+    the lane-stealing shape (1 matmul + 7 cheap EW) improves 14.2 → 10.7 ms median
+    (**1.33×**) with calibration on. NVIDIA at these sizes is launch-bound (no change,
+    no regression). plot_schedule.py planned panel now reads the cost table the plugin
+    actually used (path recorded in each trace line).
+
 - ⚠️ **CONFIRMED #1 RISK 2026-07-15: cross-workgroup spin-barrier is UNRELIABLE on PoCL under
   iteration (LIVENESS axis — still open; poc/07 fixed only the visibility axis above).** The persistent-VLIW engine (vm2.cl) uses the poc/01 global barrier between schedule
   phases. On NVIDIA it is rock-solid (500 two-level + 300 chained-matmul back-to-back runs, zero

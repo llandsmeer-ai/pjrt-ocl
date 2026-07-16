@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <set>
 
@@ -404,6 +405,7 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
   rt->local_size_ = 256;
+  rt->CalibrateCosts();
   return rt;
 }
 
@@ -693,7 +695,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
   // start/end. clFinish over the lane queues replaces the one-launch clFinish
   // as the phase barrier. Records are appended to trace_path() as one JSON
   // line per Execute when the walk completes.
-  const bool tracing = !rt_->trace_path().empty();
+  const bool tracing = !rt_->trace_path().empty() && !rt_->trace_suppressed();
   struct TraceEv { uint32_t phase, lane, entry; cl_event ev; };
   std::vector<TraceEv> tevs;
   uint32_t phase_i = 0;
@@ -891,8 +893,11 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     // patched), so tools can name blocks by op and destination buffer.
     std::FILE* f = std::fopen(rt_->trace_path().c_str(), "a");
     if (f) {
-      std::fprintf(f, "{\"device\":\"%s\",\"n_lanes\":%u,\"tasks\":[",
-                   rt_->info().device_name.c_str(), n);
+      std::fprintf(f,
+                   "{\"device\":\"%s\",\"cost_table\":\"%s\",\"n_lanes\":%u,"
+                   "\"tasks\":[",
+                   rt_->info().device_name.c_str(),
+                   rt_->cost_table_path().c_str(), n);
       for (size_t i = 0; i < p.tasks.size(); ++i)
         std::fprintf(f, "%s[%u,%u,%u,%u]", i ? "," : "", p.tasks[i].tile_op,
                      p.tasks[i].dst, p.tasks[i].p0, p.tasks[i].p1);
@@ -1069,6 +1074,210 @@ bool OclRuntime::ReadFromDevice(cl_mem src, void* host, size_t bytes,
     return false;
   }
   return true;
+}
+
+// ---- Cost calibration ---------------------------------------------------------
+// First-run µbenchmark for the scheduler's cost model (docs/decisions.md #1):
+// per tile-op family, run a hand-built single-lane program at T and 2T tiles
+// and take the SLOPE (t(2T)-t(T))/T as µs/tile — fills, launches, and the
+// barrier are identical in both runs, so fixed overhead cancels (the poc/04
+// lesson: 1-point calibration is contaminated by launch overhead). Results are
+// cached as JSON keyed by (platform, device, driver); plugin.cc forwards the
+// path to the lowering subprocess so every compile is cost-aware.
+
+namespace {
+
+constexpr uint32_t kFlagNone = 0xFFFFFFFFu;
+constexpr uint32_t kEwSubMul = 1, kEwSubFill = 18;
+
+// Single-lane calibration program: fill the input buffers with 1.0f (garbage
+// arena memory could hold denormals/NaNs and skew the timing), one barrier,
+// then `tiles` tiles of the measured op.
+class CalBuilder {
+ public:
+  uint32_t Buf(uint64_t elems) {
+    prog_.buffers.push_back({arena_, elems * 4, kDtF32});
+    arena_ += (elems * 4 + 63) & ~uint64_t{63};
+    return static_cast<uint32_t>(prog_.buffers.size() - 1);
+  }
+  void Fill(uint32_t buf, uint64_t elems) {
+    const uint32_t one = 0x3f800000u;  // 1.0f
+    Op({kTopEw, buf, 0, 0, kEwSubFill, static_cast<uint32_t>(elems), one, 0},
+       static_cast<uint32_t>((elems + kEwTile - 1) / kEwTile));
+  }
+  void Op(VmTask t, uint32_t tiles) {
+    prog_.tasks.push_back(t);
+    entries_.push_back({static_cast<uint32_t>(prog_.tasks.size() - 1), 0,
+                        tiles, kFlagNone, 0, kFlagNone, 0, 0});
+  }
+  void Barrier() {
+    entries_.push_back({kEntBarrier, 0, 0, kFlagNone, 0, kFlagNone, 0, 0});
+  }
+  VmProgram Done() {
+    prog_.arena_bytes = std::max<uint64_t>(arena_, 4);
+    prog_.n_lanes = 1;
+    prog_.n_barriers = 1;
+    prog_.lane_tab = {{0, static_cast<uint32_t>(entries_.size()),
+                       static_cast<uint32_t>(entries_.size()), 0}};
+    prog_.entries = entries_;
+    return std::move(prog_);
+  }
+  static constexpr uint32_t kEwTile = 16384;  // scheduler TILE_SIZE
+  std::vector<int32_t>* aux() { return &prog_.aux; }
+
+ private:
+  VmProgram prog_;
+  uint64_t arena_ = 0;
+  std::vector<VmEntry> entries_;
+};
+
+VmProgram BuildCalProgram(uint32_t family, uint32_t tiles) {
+  CalBuilder b;
+  const uint64_t kEw = CalBuilder::kEwTile;
+  switch (family) {
+    case kTopEw: {
+      const uint64_t n = tiles * kEw;
+      uint32_t a = b.Buf(n), c = b.Buf(n), d = b.Buf(n);
+      b.Fill(a, n);
+      b.Fill(c, n);
+      b.Barrier();
+      b.Op({kTopEw, d, a, c, kEwSubMul, static_cast<uint32_t>(n), 0, 0}, tiles);
+      break;
+    }
+    case kTopMma: {
+      // 64x64 output tiles (kernel MMA_TM/TN): M = 64*tiles, N = 64, K = 256.
+      const uint32_t M = 64 * tiles, N = 64, K = 256;
+      uint32_t a = b.Buf(uint64_t{M} * K), c = b.Buf(uint64_t{K} * N),
+               d = b.Buf(uint64_t{M} * N);
+      b.Fill(a, uint64_t{M} * K);
+      b.Fill(c, uint64_t{K} * N);
+      b.Barrier();
+      b.Op({kTopMma, d, a, c, M, N, K, 0}, tiles);
+      break;
+    }
+    case kTopRedPart: {
+      const uint64_t n = tiles * kEw;
+      uint32_t a = b.Buf(n), parts = b.Buf(tiles);
+      b.Fill(a, n);
+      b.Barrier();
+      b.Op({kTopRedPart, parts, a, 0, static_cast<uint32_t>(n),
+            static_cast<uint32_t>(kEw), 0 /*sum*/, 0}, tiles);
+      break;
+    }
+    case kTopGather: {
+      // rank-1 identity gather: aux = [rank=1, out_dim=N, stride=1, src_off=0]
+      const uint64_t n = tiles * kEw;
+      uint32_t a = b.Buf(n), d = b.Buf(n);
+      *b.aux() = {1, static_cast<int32_t>(n), 1, 0};
+      b.Fill(a, n);
+      b.Barrier();
+      b.Op({kTopGather, d, a, 0, 0 /*aux off*/, static_cast<uint32_t>(n), 0, 0},
+           tiles);
+      break;
+    }
+  }
+  return b.Done();
+}
+
+// Best-of-reps wall seconds for one Execute of a calibration program.
+double TimeCalProgram(OclRuntime* rt, uint32_t family, uint32_t tiles,
+                      std::string* err) {
+  std::unique_ptr<LoadedProgram> lp =
+      LoadedProgram::Load(rt, BuildCalProgram(family, tiles), err);
+  if (!lp) return -1.0;
+  std::vector<std::vector<uint8_t>> outs;
+  if (!lp->Execute({}, &outs, err)) return -1.0;  // warmup
+  double best = 1e30;
+  for (int rep = 0; rep < 3; ++rep) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!lp->Execute({}, &outs, err)) return -1.0;
+    best = std::min(best, std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - t0).count());
+  }
+  return best;
+}
+
+}  // namespace
+
+void OclRuntime::CalibrateCosts() {
+  const bool log = [] {
+    const char* v = std::getenv("PJRT_OCL_LOG");
+    return v && v[0] && std::strcmp(v, "0") != 0;
+  }();
+  // A user-supplied cost table supersedes calibration entirely.
+  if (const char* ct = std::getenv("PJRT_OCL_COST_TABLE"); ct && ct[0]) return;
+  const char* cal = std::getenv("PJRT_OCL_CALIBRATE");
+  if (cal && !std::strcmp(cal, "0")) return;
+  const bool force = cal && !std::strcmp(cal, "1");
+
+  // Cache path: ${PJRT_OCL_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/pjrt-ocl}
+  // keyed by FNV-1a of platform+device+driver.
+  std::string dir;
+  if (const char* d = std::getenv("PJRT_OCL_CACHE_DIR"); d && d[0]) dir = d;
+  else if (const char* x = std::getenv("XDG_CACHE_HOME"); x && x[0])
+    dir = std::string(x) + "/pjrt-ocl";
+  else if (const char* h = std::getenv("HOME"); h && h[0])
+    dir = std::string(h) + "/.cache/pjrt-ocl";
+  else return;
+  const std::string key =
+      info_.platform_name + "|" + info_.device_name + "|" +
+      info_.driver_version;
+  uint64_t hash = 1469598103934665603ull;
+  for (unsigned char c : key) hash = (hash ^ c) * 1099511628211ull;
+  char hex[17];
+  std::snprintf(hex, sizeof hex, "%016llx",
+                static_cast<unsigned long long>(hash));
+  const std::string path = dir + "/costs-" + hex + ".json";
+
+  std::error_code ec;
+  if (!force && std::filesystem::exists(path, ec)) {
+    cost_table_path_ = path;
+    if (log) std::fprintf(stderr, "[pjrt-ocl] cost table (cached): %s\n",
+                          path.c_str());
+    return;
+  }
+
+  trace_suppressed_ = true;
+  struct Fam { uint32_t op; uint32_t t_lo; const char* json_key; };
+  // MMA gets small tile counts: one 64x64x256 tile is ~ms on a CPU device.
+  const Fam fams[] = {{kTopEw, 16, "ew_tile_us"},
+                      {kTopMma, 2, "mma_tile_us"},
+                      {kTopRedPart, 16, "reduce_tile_us"},
+                      {kTopGather, 16, "gather_tile_us"}};
+  double us[4];
+  std::string err;
+  for (int i = 0; i < 4; ++i) {
+    const double a = TimeCalProgram(this, fams[i].op, fams[i].t_lo, &err);
+    const double b = TimeCalProgram(this, fams[i].op, 2 * fams[i].t_lo, &err);
+    if (a < 0 || b < 0) {
+      trace_suppressed_ = false;
+      if (log) std::fprintf(stderr, "[pjrt-ocl] cost calibration failed: %s\n",
+                            err.c_str());
+      return;  // unit costs
+    }
+    us[i] = std::max(0.01, (b - a) * 1e6 / fams[i].t_lo);
+  }
+  trace_suppressed_ = false;
+
+  std::filesystem::create_directories(dir, ec);
+  std::FILE* f = std::fopen(path.c_str(), "w");
+  if (!f) {
+    if (log) std::fprintf(stderr, "[pjrt-ocl] cost cache unwritable: %s\n",
+                          path.c_str());
+    return;
+  }
+  std::fprintf(f, "{");
+  for (int i = 0; i < 4; ++i)
+    std::fprintf(f, "\"%s\": %.3f, ", fams[i].json_key, us[i]);
+  std::fprintf(f, "\"device\": \"%s\", \"driver\": \"%s\"}\n",
+               info_.device_name.c_str(), info_.driver_version.c_str());
+  std::fclose(f);
+  cost_table_path_ = path;
+  if (log)
+    std::fprintf(stderr,
+                 "[pjrt-ocl] cost table (measured): ew=%.2f mma=%.2f "
+                 "reduce=%.2f gather=%.2f us/tile -> %s\n",
+                 us[0], us[1], us[2], us[3], path.c_str());
 }
 
 // ---- Lowering subprocess ----------------------------------------------------

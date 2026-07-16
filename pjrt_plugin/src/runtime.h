@@ -123,6 +123,17 @@ class OclRuntime {
   // JSON line per Execute. For engineering timeline plots (tools/
   // plot_schedule.py) — per-entry launches add overhead, don't benchmark it.
   const std::string& trace_path() const { return trace_path_; }
+  // True while the first-run cost calibration executes its µbenchmark
+  // programs: they must run on the UNTRACED path (per-entry trace launches
+  // would distort the measured per-tile costs and pollute the trace file).
+  bool trace_suppressed() const { return trace_suppressed_; }
+  // Measured per-tile-op cost model (docs/decisions.md #1): Create() runs a
+  // first-run µbenchmark per tile-op family (slope over two tile counts, so
+  // launch overhead cancels) and caches the result as JSON keyed by
+  // (platform, device, driver). Empty when calibration is disabled
+  // (PJRT_OCL_CALIBRATE=0), superseded by a user PJRT_OCL_COST_TABLE, or
+  // failed. PJRT_OCL_CALIBRATE=1 forces re-measurement past the cache.
+  const std::string& cost_table_path() const { return cost_table_path_; }
   cl_uint ngroups() const { return ngroups_; }
   size_t local_size() const { return local_size_; }
   // Host-dispatch engine: the host drives control flow and enforces the
@@ -154,6 +165,11 @@ class OclRuntime {
 
  private:
   OclRuntime() = default;
+  // First-run µbenchmark: measure per-tile costs for the tile-op families the
+  // scheduler's cost model keys on, write/reuse the cached JSON, set
+  // cost_table_path_. Never fails the client — on any error the path stays
+  // empty (scheduler falls back to unit costs).
+  void CalibrateCosts();
   DeviceInfo info_;
   cl_device_id dev_ = nullptr;
   cl_context ctx_ = nullptr;
@@ -163,6 +179,8 @@ class OclRuntime {
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
   cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
   std::string trace_path_;             // empty = tracing off
+  bool trace_suppressed_ = false;      // true during cost calibration
+  std::string cost_table_path_;        // measured cost JSON ("" = unit costs)
   cl_mem dummy_buf_ = nullptr;         // placeholder for unused I/O ports
   cl_uint ngroups_ = 0;    // co-resident workgroups (poc/01 rule: <= CUs)
   size_t local_size_ = 64;
