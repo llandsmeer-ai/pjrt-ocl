@@ -201,7 +201,7 @@ Sources: hgemmtest `hgemm.cl`; `sschaetz/nvidia-opencl-examples/.../inlinePTX.cl
 
 ## Working discipline
 - Work in the provided **git worktree** (isolated); do NOT touch `main`. Commit small and
-  often on your branch. Never leave undocumented findings — update `poc/08/README.md` and
+  often on your branch. Never leave undocumented findings — update `poc/11/README.md` and
   `docs/decisions.md` §9b as you go.
 - Unverified work is treated as not done: every result needs a correctness check + a measured
   number. If a phase gate fails, stop and report the exact error/measurement rather than
