@@ -542,3 +542,30 @@ guard (poc first, per hard rules), via inline PTX `wmma.load.*.shared`/`wmma.mma
 (hgemmtest passes `__local` ptrs as `"l"` into `.shared` WMMA ops; CUTLASS
 `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`). The `mm2` dispatch path is already
 built to host it.
+
+## 11. CPU performance: why XLA CPU wins, and the fix (2026-07-16, poc/09)
+
+- Context: first honest PoCL-vs-native-XLA-CPU bench (README, 2026-07-16) showed 2.6x (EW 16M)
+  to ~90x (matmul 2048) to ~320x (matvec) deficits. poc/09 microbenches candidate kernel shapes
+  on PoCL AND Xe2 against an 8-thread memcpy wall (84.7 GB/s).
+- ❌ **Root cause 1 (EW): PoCL's work-group vectorizer only vectorizes the implicit WI loop.**
+  Any explicit in-kernel loop around the body — including our tile loop, restructured variants
+  with straight-line bodies, with or without guards — leaves the kernel SCALAR: 5 GB/s vs
+  46 GB/s for explicit float8 (a4). Not fixable by loop restructuring; measured, not assumed.
+- ❌ **Root cause 2 (matmul/matvec): the GPU MMA tile shape is pessimal on CPU.** __local
+  staging is an extra memcpy and every WG barrier makes PoCL loop-split; barrier-free
+  register-blocked float8 (1 WI/WG) is 4x faster standalone (60.9 vs 15.6 GFLOP/s @1024) and
+  ~11x vs in-VM; GEMV via a row-dot kernel beats the MMA tile on BOTH devices (12.7 vs ~0.6
+  GB/s PoCL; 73 vs 37 Xe2).
+- ❌ **Root cause 3 (small ops): PoCL's launch floor is 17–52 µs** (pipelined, measured) vs
+  XLA's ~12 µs full dispatch. Not ours to fix in-kernel; accepted.
+- ✅ **No single EW pattern wins both device classes** (a4: CPU 46 / Xe2 62; current a1: CPU 5 /
+  Xe2 104; a2 wins both but needs element-sized grids, incompatible with the lane/tile model).
+  **CHOSEN: device-keyed build define `-DVMO_CPU_TILES` (set when `!is_gpu`) selects an
+  explicit-float8 per-WI-contiguous EW tile body; GPUs keep the scalar coalesced loop.** This
+  is the CLAUDE.md "vendor tuning behind the kernel-table" mechanism, realized as a build
+  variant of the same source (precedent: the -cl-std probe, §3b).
+- ✅ CPU-shaped SGEMM + GEMV kernels routed via the pure-matmul fast path (precedent: mm2,
+  §10b). Iteration ladder recorded in poc/09 README: land b2 shape first (~11x), cache
+  blocking/packing later (Eigen parity NOT the goal; ~8x off is acceptable for a debug backend
+  that was ~90x off).
