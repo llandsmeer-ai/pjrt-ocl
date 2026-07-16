@@ -99,8 +99,8 @@ enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
 #define FLAG_NONE   0xFFFFFFFFu
 
 typedef struct {
-    uint tile_op, dst, a, b, p0, p1, p2, p3;
-} task_t;
+    uint tile_op, dst, a, b, p0, p1, p2, p3, p4, p5;
+} task_t;   /* p4/p5: MMA operand VIEW aux-offsets (+1; 0 = contiguous) */
 
 typedef struct {
     uint task, tile_lo, tile_hi, wait_flag, wait_count, signal_flag,

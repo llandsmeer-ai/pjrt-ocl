@@ -151,10 +151,10 @@ def test_golden_layout_exact_bytes():
     assert n_entries == 3 + 7 * 1  # lane0: E,BAR,E ; lanes1-7: BAR
     pos += 16
 
-    # task 0: EW add, dst=3 a=0 b=1 p0=0(add) p1=3(n_elems)
-    t0 = struct.unpack_from("<8I", blob, pos)
-    assert t0 == (S.TILE_EW, 3, 0, 1, S.EW_ADD, 3, 0, 0)
-    pos += 32 * n_tasks  # skip past both tasks
+    # task 0: EW add, dst=3 a=0 b=1 p0=0(add) p1=3(n_elems); p4/p5 (view) = 0
+    t0 = struct.unpack_from("<10I", blob, pos)
+    assert t0 == (S.TILE_EW, 3, 0, 1, S.EW_ADD, 3, 0, 0, 0, 0)
+    pos += 40 * n_tasks  # skip past both tasks (task_t is 40B now)
 
     # lane table (n_lanes x {entry_off, entry_count}); lane 0 owns E,BAR,E = 3
     off0, cnt0 = struct.unpack_from("<II", blob, pos)
@@ -167,7 +167,7 @@ def test_golden_layout_exact_bytes():
     e1 = struct.unpack_from("<8I", blob, pos + 32)
     assert e1 == (BARRIER, 0, 0, FLAG_NONE, 0, FLAG_NONE, 0, 0)
 
-    assert len(blob) == tensor_len + 16 + 32 * n_tasks + 16 * n_lanes + 32 * n_entries
+    assert len(blob) == tensor_len + 16 + 40 * n_tasks + 16 * n_lanes + 32 * n_entries
 
 
 def test_golden_layout_jax_lowered_add():
@@ -223,9 +223,10 @@ def test_golden_layout_jax_lowered_add():
     assert (n_tasks, n_flags, n_lanes) == (1, 0, 8)
     assert n_entries == 1           # one task entry on lane0, no barrier
     pos += 16
-    assert struct.unpack_from("<8I", blob, pos) == (S.TILE_EW, 2, 0, 1,
-                                                    S.EW_ADD, 8, 0, 0)
-    pos += 32 * n_tasks + 16 * n_lanes
+    # task_t is 10 u32 words (p4/p5 = MMA view offsets, 0 for this EW task).
+    assert struct.unpack_from("<10I", blob, pos) == (S.TILE_EW, 2, 0, 1,
+                                                     S.EW_ADD, 8, 0, 0, 0, 0)
+    pos += 40 * n_tasks + 16 * n_lanes
     # the single entry = task 0 tiles [0,1)
     assert struct.unpack_from("<8I", blob, pos)[:3] == (0, 0, 1)
     pos += 32 * n_entries

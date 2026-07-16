@@ -757,7 +757,8 @@ heads, 6 layers, batch=4) OpenCL/NVIDIA vs native JAX CUDA. **14.5 ms → 7.6 ms
   (`(B,T,H,hd)→(B,H,T,hd)`) materialize full tensors + are phases. The fix is the access-map
   principle applied to matmul: **strided/batched matmul operands** so the dot reads the
   pre-transpose buffer via per-dim strides (batch may decompose into multiple strided sub-dims).
-  Highest single value (~1 ms) but a substantial mma-kernel + dot-lowering change. 🔬 delegated.
+  Highest single value (~1 ms) but a substantial mma-kernel + dot-lowering change.
+  ✅ **SHIPPED 2026-07-16 (§14a below): correct + portable, but a WALL-CLOCK WASH here.**
 - **Gather chains (gather→gather→EW):** the inner gather can't fold because the outer already
   viewed the operand — needs strided-view *composition* (compose two access maps into one).
   Low value here (broadcasts are tiny) — deferred.
@@ -768,6 +769,57 @@ heads, 6 layers, batch=4) OpenCL/NVIDIA vs native JAX CUDA. **14.5 ms → 7.6 ms
 
 Conclusion: the general mechanisms (access-map fusion, collaborative reduce, TF32) are in and
 correct; closing the last ~17× is a set of large, mostly-independent efforts, not a single fix.
+
+### 14a. Shape-op → matmul operand fold (strided/batched matmul reads) — SHIPPED 2026-07-16
+
+Front "transposes into matmul": extend the §13 access-map fold (which handled only elementwise
+operands, `_fuse_views`) to **matmul operands**. A dot operand `A[g,m,k]` (`B[g,k,n]`) that was
+produced by a transpose/reshape/broadcast (an `OP_GATHER_STRIDED` pure index map) now reads the
+**pre-transpose SOURCE** in place instead of materializing the transposed tensor + a barrier phase.
+
+**Mechanism (the clean insight): reuse the gather descriptor + the contiguous flat index.** The
+dot treats its operand as a contiguous `[G,M,K]` tensor — element `(g,m,k)` at flat index
+`g*M*K+m*K+k` — and the gather output IS that operand row-major. So the fold needs **no new index
+math**: pass the contiguous `[G,M,K]`/`[G,K,N]` flat index through the gather's OWN descriptor
+(`vmo_view_idx`, the same `{rank,out_dims,in_strides,src_off}` map). This is fully general — any
+number of batch/M/K axes, and the attention batch `g=(b,h)` decomposing into two strided sub-dims
+falls out for free (it's just the leading axes of `out_dims`). No new descriptor format.
+- **Encoding:** task_t widened `32→40 B` with **p4/p5 = operand a/b VIEW aux-offset (+1; 0 =
+  contiguous)** (all of p0–p3 = M,N,K,G were taken). Lowering carries them on `Instr.aview/bview`
+  (non-serialized, like `reads_hint`) → scheduler → task p4/p5; a 2-word aux header at `Instr.aux`
+  mirrors them so the tensor-interpreter validator (runs on re-parsed bytecode) recovers the fold.
+- **Kernel:** both `vmo_mma_tile` variants (portable scalar 4×4 AND the `-DVMO_NV_PTX` TF32
+  tensor-core body) branch on av/bv in the As/Bs staging load; **av==0 keeps the exact contiguous
+  fast path** (no regression to the common case, no PoCL/AMD/Intel changes — the branch is uniform).
+- **Lowering pass** `_fuse_matmul_views` (mirrors `_fuse_views`): a gather folds iff **every** reader
+  is a dot reading it on a not-yet-viewed slot; retarget each dot operand to the gather source +
+  descriptor, NOP the gather (DCE). `PJRT_OCL_MM_VIEWFOLD=0` disables (A/B + revert lever).
+- ⚠️ **BUG FOUND + FIXED (regression-tested): unwritten view source.** When the SAME buffer feeds
+  a dot operand directly AND (via a second gather) the other operand as a view (self-attention
+  `q @ q.T`), folding the shared gather away leaves the view reading an **unwritten** buffer.
+  Symptom: portable result rel-err ≈ 1.0 (garbage) on large random values — INVISIBLE to the small
+  integer-valued unit tests (they happened to still match). Fix: a gather is not foldable into a dot
+  if that dot already references the gather's output as a **viewed** operand source (it must stay
+  materialized). Caught only by an fp comparison on random-magnitude data → added that as a test.
+
+**Measured (base transformer, this machine's baseline is ~9.9 ms, not §14's 7.6 ms — clock/driver
+drift; A/B on the SAME build via the flag):**
+- **Eliminated 24 gather phases/model** (66→42 GATHER tasks, 4/layer: split(q), k-transpose,
+  split(v), out-merge-transpose), **18 matmuls/model now fold** their transpose reads (~96 fewer
+  per-lane barrier entries). No tensor materialized for those transposes.
+- **NVIDIA wall-clock: WASH** — 9.90 ms fold-off vs 9.90 ms fold-on. **PoCL: wash** (small 283 vs
+  290 ms). The strided staging load adds a per-load rank-wise div/mod that ≈ cancels the saved
+  phase cost, and §14 already established the base transformer is **latency/overhead-bound, not
+  matmul-bound** (its matmuls are tiny: M=512, attn K=64). This is the honest outcome, not a win.
+- **Correct + portable:** portable megakernel (NVIDIA `MEGA_TC=0`) and PoCL host-dispatch both
+  **f32-exact vs JAX CPU (max |err| 2.2e-6)**; TF32 megakernel matches JAX CUDA (max |err| 4.6e-3,
+  TF32 noise). 215 pytest (+5 fold tests incl. the self-attn regression) + runtime_test PASS on
+  NVIDIA **and** PoCL; both mma variants + all engines exercised.
+
+**Kept ON by default** (it's the general access-map mechanism and does remove real
+materialization + phases — a memory/phase win that a *compute*-bound or larger workload would feel;
+harmless where latency-bound). Behind `PJRT_OCL_MM_VIEWFOLD=0` per the "revert if it ever regresses"
+rule. Gather→gather→EW *composition* (compose two access maps) is still the deferred sibling (§14).
 
 ## 15. Fixed-trip while: OP_FOR + bytecode unroll (2026-07-16, poc/12)
 

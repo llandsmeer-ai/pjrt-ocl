@@ -75,11 +75,11 @@ _TENSOR_TO_EW = {
 _REGION_OPS = {L.OP_WHILE, L.OP_FOR}
 
 SCHED_HDR_STRUCT = struct.Struct("<IIII")      # n_tasks,n_entries,n_flags,n_lanes
-TASK_STRUCT = struct.Struct("<IIIIIIII")       # 32B
+TASK_STRUCT = struct.Struct("<IIIIIIIIII")     # 40B (p4/p5 = MMA view offsets)
 LANETAB_STRUCT = struct.Struct("<IIII")        # 16B: off, count, root_len, pad
 ENTRY_STRUCT = struct.Struct("<IIIIIIII")      # 32B
 assert SCHED_HDR_STRUCT.size == 16
-assert TASK_STRUCT.size == 32
+assert TASK_STRUCT.size == 40
 assert LANETAB_STRUCT.size == 16
 assert ENTRY_STRUCT.size == 32
 
@@ -144,6 +144,8 @@ class Task:
     p1: int = 0
     p2: int = 0
     p3: int = 0
+    p4: int = 0           # MMA operand-a VIEW aux-offset (+1; 0 = contiguous)
+    p5: int = 0           # MMA operand-b VIEW aux-offset (+1; 0 = contiguous)
     dtype: int = 0        # DT_* result dtype (how the VM writes the output)
     adtype: int = 0       # DT_* operand dtype (compare/convert differ from dtype)
 
@@ -204,7 +206,7 @@ class Schedule:
         for t in self.tasks:
             out += TASK_STRUCT.pack(
             t.tile_op | (t.dtype << 8) | (t.adtype << 16), t.dst, t.a, t.b,
-            t.p0, t.p1, t.p2, t.p3)
+            t.p0, t.p1, t.p2, t.p3, t.p4, t.p5)
         for off, count, root_len in lane_tab:
             out += LANETAB_STRUCT.pack(off, count, root_len, 0)
         for e in flat:

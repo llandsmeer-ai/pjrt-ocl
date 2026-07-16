@@ -208,6 +208,13 @@ class Instr:
     # whose ids ride in the aux pool the scheduler can't inspect). Consumed by
     # the scheduler's dependency analysis only — NOT serialized.
     reads_hint: tuple = ()
+    # OP_DOT operand VIEW aux-offsets (+1; 0 = contiguous) set by
+    # _fuse_matmul_views when a transpose/reshape/broadcast folds into the
+    # matmul operand read (§13). NOT serialized: the scheduler reads these
+    # in-memory (-> task p4/p5); validator a reads the mirror aux header at
+    # ins.aux (written by _finalize_matmul_views, so it survives serialization).
+    aview: int = 0
+    bview: int = 0
 
 
 def _pad8(out: bytearray) -> None:
@@ -1165,6 +1172,89 @@ def _fuse_views(ctx: _Ctx) -> None:
             changed = True
 
 
+def _fuse_matmul_views(ctx: _Ctx) -> None:
+    """Access-map fusion for matmul (§13, §14): fold a shape op (transpose/
+    reshape/broadcast/slice/reverse — all OP_GATHER_STRIDED) that feeds a
+    matmul operand into the matmul's strided operand READ instead of
+    materializing the whole tensor + a barrier phase.
+
+    Attention does q.reshape(B,T,H,hd).transpose(0,2,1,3) then a batched dot;
+    the transpose is a gather feeding the dot. Because the dot treats its
+    operand as a contiguous [G,M,K] tensor (element (g,m,k) at flat index
+    g*M*K+m*K+k) and the gather output IS that operand row-major, the dot can
+    read the PRE-transpose source at src[view_index(flat)] using the SAME
+    descriptor the gather already carries — no new math, just the flat [G,M,K]/
+    [G,K,N] index passed through vmo_view_idx.
+
+    A gather g folds iff every reader of its result is an OP_DOT reading it as
+    operand a or b on a not-yet-viewed slot (mirrors _fuse_views' all-readers
+    gate). Each such dot's operand is retargeted to the gather SOURCE with the
+    gather's descriptor as its view; g becomes NOP (DCE'd). A gather with any
+    non-dot reader (or already-viewed slot) stays materialized.
+
+    PJRT_OCL_MM_VIEWFOLD=0 disables the fold (A/B + revert lever): the strided
+    operand read replaces a materialize+contiguous read, a win only when the
+    eliminated gather phase costs more than the extra per-load index math."""
+    if os.environ.get("PJRT_OCL_MM_VIEWFOLD", "1") == "0":
+        return
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+    changed = True
+    while changed:
+        changed = False
+        for gi, g in enumerate(instrs):
+            if g.op != OP_GATHER_STRIDED or g.dst in outs:
+                continue
+            if ctx.buffers[g.dst].dtype != DT_F32:
+                continue
+            gbuf = g.dst
+            readers = [(j, ins) for j, ins in enumerate(instrs)
+                       if ins.op != OP_NOP and gbuf in _reads_of(ins)]
+            if not readers:
+                continue
+
+            def foldable(r):
+                if r.op != OP_DOT:
+                    return False
+                # gbuf must NOT already be a materialized view SOURCE of this dot:
+                # if another gather already folded onto a slot whose source is
+                # gbuf (r.a==gbuf & aview, or r.b==gbuf & bview), gbuf's output is
+                # read strided and must stay materialized — folding it away would
+                # leave that view reading an unwritten buffer. (Hit when the SAME
+                # tensor feeds one operand directly and the other via a transpose,
+                # e.g. self-attention q @ q.T.)
+                if (r.a == gbuf and r.aview != 0) or (r.b == gbuf and r.bview != 0):
+                    return False
+                # foldable only if gbuf is read on a direct (unviewed) slot.
+                if r.a == gbuf and r.aview == 0:
+                    return True
+                if r.b == gbuf and r.bview == 0:
+                    return True
+                return False
+            if not all(foldable(r) for _, r in readers):
+                continue
+            for j, r in readers:
+                if r.a == gbuf and r.aview == 0:
+                    r = dataclasses.replace(r, a=g.a, aview=g.aux + 1)
+                if r.b == gbuf and r.bview == 0:
+                    r = dataclasses.replace(r, b=g.a, bview=g.aux + 1)
+                instrs[j] = r
+            instrs[gi] = Instr(OP_NOP)
+            changed = True
+
+
+def _finalize_matmul_views(ctx: _Ctx) -> None:
+    """Mirror each folded DOT's (aview, bview) into a 2-word aux header and point
+    ins.aux at it, so the tensor-interpreter validator (which runs on the
+    re-parsed, serialized bytecode and cannot see the in-memory aview/bview) can
+    recover the views. The scheduler uses the in-memory fields directly; the
+    device uses the resulting task p4/p5."""
+    for idx, ins in enumerate(ctx.instrs):
+        if ins.op == OP_DOT and (ins.aview or ins.bview):
+            hdr = ctx.add_aux([ins.aview, ins.bview])
+            ctx.instrs[idx] = dataclasses.replace(ins, aux=hdr)
+
+
 def lower_module(module) -> VMProgram:
     """Lower a deserialized stablehlo module's public @main to a VMProgram."""
     from jaxlib.mlir import ir
@@ -1203,9 +1293,14 @@ def lower_module(module) -> VMProgram:
 
     # perf peepholes (index-stable, NOP-substituting): collapse scale/bias chains
     # into one in-place affine pass, fold shape ops (broadcast/transpose/slice)
-    # into consuming elementwise operands as strided views, then DCE the dead.
+    # into consuming matmul operands (strided read) then elementwise operands
+    # (strided views), then DCE the dead. Matmul fold runs first: a gather feeds
+    # EITHER a dot or EW readers (disjoint by _fuse_views' viewable-EW gate), so
+    # order only matters for a gather read by both — those don't fold either way.
     _compose_affines(ctx)
+    _fuse_matmul_views(ctx)
     _fuse_views(ctx)
+    _finalize_matmul_views(ctx)
     _dce_nops(ctx)
 
     # Arena offsets are patched into u32 task fields and bit 31 is the I/O-port

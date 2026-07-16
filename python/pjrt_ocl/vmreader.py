@@ -137,6 +137,8 @@ class ParsedTask:
     p1: int
     p2: int
     p3: int
+    p4: int = 0           # MMA operand-a VIEW aux-offset (+1; 0 = contiguous)
+    p5: int = 0           # MMA operand-b VIEW aux-offset (+1; 0 = contiguous)
     dtype: int = 0        # result dtype (tile_op bits 8-15)
     adtype: int = 0       # operand dtype (tile_op bits 16-23)
 
@@ -321,7 +323,7 @@ def _parse_schedule(data: bytes, pos: int, n_buffers: int) -> ParsedSchedule:
     for i in range(n_tasks):
         fields = S.TASK_STRUCT.unpack_from(data, pos)
         pos += S.TASK_STRUCT.size
-        packed, dst, a, b, p0, p1, p2, p3 = fields
+        packed, dst, a, b, p0, p1, p2, p3, p4, p5 = fields
         tile_op = packed & 0xFF            # base op
         dtype = (packed >> 8) & 0xFF       # result dtype
         adtype = (packed >> 16) & 0xFF     # operand dtype
@@ -331,7 +333,7 @@ def _parse_schedule(data: bytes, pos: int, n_buffers: int) -> ParsedSchedule:
                 if bid >= n_buffers:
                     raise FormatError(
                         f"task[{i}] {name}={bid} out of range ({n_buffers})")
-        tasks.append(ParsedTask(tile_op, dst, a, b, p0, p1, p2, p3,
+        tasks.append(ParsedTask(tile_op, dst, a, b, p0, p1, p2, p3, p4, p5,
                                 dtype=dtype, adtype=adtype))
 
     lane_tab: list[tuple[int, int]] = []
