@@ -148,8 +148,13 @@ def worker_env(backend: str, device: str, engine: str | None) -> dict:
     if backend == "ours":
         env["JAX_PLATFORMS"] = "opencl"
         env["PJRT_OCL_DEVICE"] = device
-        env.setdefault("PJRT_OCL_PLUGIN_PATH",
-                       str(REPO / "build" / "pjrt_plugin" / "libpjrt_ocl.so"))
+        # Only pin the plugin path if the dev-tree .so is actually there;
+        # otherwise let the package's own search (env -> wheel -> dev tree)
+        # find it. A wrong pinned path fails plugin discovery and every op
+        # silently benches as NaN.
+        so = REPO / "pjrt_plugin" / "build" / "libpjrt_ocl.so"
+        if so.exists():
+            env.setdefault("PJRT_OCL_PLUGIN_PATH", str(so))
         if engine:
             env["PJRT_OCL_ENGINE"] = engine
     else:
@@ -169,6 +174,14 @@ def collect(label: str, env: dict) -> dict:
     for line in proc.stdout.splitlines():
         op, n, ms = line.rsplit(",", 2)
         data.setdefault(op, {})[int(n)] = float(ms)
+    # A backend that failed to initialize benches every op as nan with the
+    # real error hidden in stderr — surface it instead of plotting nothing.
+    vals = [ms for per_op in data.values() for ms in per_op.values()]
+    if vals and all(np.isnan(v) for v in vals):
+        skips = proc.stderr.strip().splitlines()
+        raise SystemExit(f"worker {label}: ALL results are nan — backend "
+                         "broken, not 'unsupported ops'. First errors:\n  " +
+                         "\n  ".join(skips[:5]))
     return data
 
 
