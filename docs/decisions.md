@@ -874,3 +874,32 @@ unnecessary; only data dependencies between iterations need synchronization.
 **Decision**: `auto` is the default (unroll small, OP_FOR the rest, plain WHILE only for genuine
 data-dependent conds). Detection is deliberately narrow (LT/signed, positive const step) —
 widen only when a real program shows a different counted shape.
+
+## 16. Arena is a bump allocator — no liveness reuse (found 2026-07-16, transformer `large`)
+
+**Discovery**: added a compute-bound `large` transformer config (8×256×1024, 16 heads, ff 4096,
+6 layers) to test whether the CUDA gap closes when matmul dominates (base is small-op/overhead-
+bound, §14). It **crashes** — but not at runtime: lowering raises
+`arena 2174157440 bytes exceeds the 31-bit offset space` at just **L=2**. (Bisected: L=1 lowers
+& runs correct vs JAX-CPU; L≥2 overflows.)
+
+**Root cause**: `_Ctx.new_buffer` (lowering.py) is a pure **bump allocator** —
+`offset = self._arena; self._arena += aligned_size`. Buffer offsets are assigned once at creation
+and never reused, so the arena grows with the **sum of every intermediate ever emitted**, not the
+**peak live set**. A 2-layer large transformer emits ~236 instrs whose temporaries (attention
+scores 33.6 MB, ffn hidden 33.6 MB, plus every EW temp) accumulate to 2.17 GB, past the u32
+offset cap (2^31; bit 31 is the I/O-port flag). This is the M1 "SSA liveness for reuse" item —
+deferred and never done (the only reuse today is the narrow in-place while-carry + viewfold).
+
+**Not** a resource limit (device max-alloc 23.7 GB, biggest single tensor 33.6 MB) and **not**
+the megakernel/barrier (individual large matmuls, softmax, layernorm all run fine; L=1 runs).
+
+**Fix (delegated 2026-07-16)**: a post-emission **liveness-reuse pass** that reassigns arena
+offsets by live interval (linear-scan / register-allocation style), keeping the arena bounded by
+peak concurrent liveness. Bounds the `large` arena to ~one layer's peak (weights are inputs/ports;
+activations reused across layers) — well under 2^31. Also cuts memory + improves cache for **every**
+config. Correctness-critical (early free = silent corruption): must keep outputs live to end,
+constants pinned (uploaded once at load), I/O ports out of the arena, WHILE/IF region operands
+live across the whole region, in-place aliasing, and viewfold gather sources live for their
+viewers. Verify: arena size drops, 215 pytest pass, transformer correct on both devices/both mm
+variants, and `large` lowers < 2^31 and matches JAX-CPU.

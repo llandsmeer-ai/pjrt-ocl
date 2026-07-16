@@ -67,6 +67,12 @@ CONFIGS = {
     "tiny":  (1, 64, 128, 4, 512, 2),
     "small": (1, 128, 256, 4, 1024, 4),
     "base":  (4, 128, 512, 8, 2048, 6),
+    # compute-bound: large D/F make the projections + FFN dominate, where TF32
+    # tensor cores should shine and the small-op/barrier overhead amortizes.
+    "large": (8, 256, 1024, 16, 4096, 6),
+    # single large layer: fits the arena today; the full 6-layer `large` needs
+    # arena liveness-reuse (bump allocator overflows the u32 offset cap — §15).
+    "large_l1": (8, 256, 1024, 16, 4096, 1),
 }
 
 
