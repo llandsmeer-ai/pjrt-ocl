@@ -370,8 +370,8 @@ def test_empty_stdin_exit3_json():
 def test_initialize_without_plugin_so_does_not_crash_jax():
     env = {k: v for k, v in os.environ.items() if k != "JAX_PLATFORMS"}
     # Point discovery at a nonexistent .so: initialize() must skip gracefully
-    # and jax must fall back to cpu (regardless of whether the real plugin is
-    # built at the default path).
+    # and jax must fall back to a real backend (cpu, or gpu/cuda if a CUDA
+    # jaxlib happens to be installed) — the point is no crash + graceful log.
     env["PJRT_OCL_PLUGIN_PATH"] = "/nonexistent/libpjrt_ocl.so"
     code = (
         "import jax, pjrt_ocl\n"          # jax import runs plugin discovery
@@ -381,7 +381,7 @@ def test_initialize_without_plugin_so_does_not_crash_jax():
     proc = subprocess.run([PYTHON, "-c", code], env=env, capture_output=True,
                           text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
-    assert "cpu" in proc.stdout
+    assert any(p in proc.stdout for p in ("cpu", "gpu", "cuda"))
     assert "not registered" in proc.stderr  # graceful, logged
 
 
@@ -551,22 +551,71 @@ def _two_add_prog(n0: int, n1: int) -> L.VMProgram:
 
 
 def test_scheduler_lane_allocation_proportional_to_cost():
-    """When two independent EW ops co-schedule, lanes are allocated in
-    proportion to cost (= tiles x unit cost). Current ops are all EW (uniform
-    unit cost), so the bigger op gets more lanes: 8 tiles vs 2 tiles over
-    8 lanes => 6 lanes vs 2 lanes."""
+    """When two independent EW ops co-schedule, chunks are allocated in
+    proportion to cost (= tiles x unit cost) and LPT-balanced; a lane may
+    carry entries of BOTH tasks (sequentialized) instead of each task owning
+    dedicated lanes. 8 tiles vs 2 tiles over 8 lanes: the big op fans out to
+    7 lanes, the small one rides on the remaining capacity, and no lane
+    carries more than ceil(10 tiles / 8 lanes) = 2 (optimal makespan)."""
     prog = _two_add_prog(8 * S.TILE_SIZE, 2 * S.TILE_SIZE)
     sched = S.schedule_program(prog, S.DeviceConfig(nlanes=8, costs={}))
-    lanes0 = sum(1 for st in sched.lane_streams for e in st if e.task == 0)
-    lanes1 = sum(1 for st in sched.lane_streams for e in st if e.task == 1)
-    assert lanes0 > lanes1
-    assert lanes0 + lanes1 <= 8
-    assert (lanes0, lanes1) == (6, 2)
+    lanes0 = {i for i, st in enumerate(sched.lane_streams)
+              for e in st if e.task == 0}
+    lanes1 = {i for i, st in enumerate(sched.lane_streams)
+              for e in st if e.task == 1}
+    assert len(lanes0) > len(lanes1)
+    loads = [sum(e.tile_hi - e.tile_lo for e in st if e.task != S.TASK_BARRIER)
+             for st in sched.lane_streams]
+    assert max(loads) == 2                       # LPT: optimal makespan
     # tiles split contiguously and cover each task's tiles exactly once
     R.execute_schedule(
         R.parse(prog.serialize(sched)),
         [np.zeros(8 * S.TILE_SIZE, np.float32)] * 2 +
         [np.zeros(2 * S.TILE_SIZE, np.float32)] * 2)
+
+
+def test_scheduler_sequentializes_cheap_tasks_with_cost_table():
+    """The diamond regression (docs/decisions.md #1 trace findings): with a
+    measured cost table where an MMA tile dwarfs an EW tile, the matmul must
+    fan out over ALL lanes and the cheap elementwise ops must be stacked
+    BEHIND its chunks on shared lanes — not hold dedicated lanes hostage."""
+    import jax.numpy as jnp
+
+    def f(a, b, c):
+        m = a @ b
+        s = c + c
+        p = c * c
+        q = s * p
+        return q + m
+
+    x = jnp.ones((256, 256), jnp.float32)
+    artifact = serialize_as_plugin_would_receive(f, x, x, x)
+    prog = L.lower_artifact(artifact)
+    cfg = S.DeviceConfig(nlanes=8,
+                         costs={"mma_tile_us": 25.0, "ew_tile_us": 1.0})
+    sched = S.schedule_program(prog, cfg)
+    mma_ids = {i for i, t in enumerate(sched.tasks) if t.tile_op == S.TILE_MMA}
+    assert len(mma_ids) == 1
+    # level 0 = every lane's entries before its first barrier
+    level0 = [[] for _ in range(8)]
+    for lane, st in enumerate(sched.lane_streams):
+        for e in st:
+            if e.task == S.TASK_BARRIER:
+                break
+            level0[lane].append(e)
+    mma_lanes = {ln for ln in range(8)
+                 if any(e.task in mma_ids for e in level0[ln])}
+    assert mma_lanes == set(range(8))            # matmul on every lane
+    for ln in range(8):                          # cheap EW rides along, never
+        for e in level0[ln]:                     # displaces an MMA chunk
+            if e.task not in mma_ids:
+                assert any(e2.task in mma_ids for e2 in level0[ln])
+    # correctness of the multi-entry-per-lane schedule
+    args = [np.full((256, 256), 0.5, np.float32)] * 3
+    outs = R.execute_schedule(R.parse(prog.serialize(sched)), args)
+    exp = f(*[jnp.asarray(a) for a in args])
+    np.testing.assert_allclose(outs[0].reshape(256, 256), np.asarray(exp),
+                               rtol=1e-5)
 
 
 def test_scheduler_equal_cost_even_split():

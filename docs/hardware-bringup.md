@@ -93,20 +93,22 @@ JAX_PLATFORMS=opencl PJRT_OCL_DEVICE=<substr> PJRT_OCL_ENGINE=host .venv/bin/pyt
 
 ## 5. Scheduler / cost model check
 
-The scheduler packs lanes using per-tile-op costs (µs/tile) from
-`PJRT_OCL_COST_TABLE` (JSON: `ew_tile_us`, `mma_tile_us`, `gather_tile_us`,
-`reduce_tile_us`; **default is all-1.0** — almost certainly wrong on new hardware).
+The scheduler packs lanes using per-tile-op costs (µs/tile) that are
+**auto-calibrated on first run** (`CalibrateCosts` µbenchmark at init; cached
+JSON keyed by platform+device+driver under `~/.cache/pjrt-ocl/`, overridable
+via `PJRT_OCL_CACHE_DIR`). On a new device, verify rather than assume:
 
-- Measure per-tile-op µs on this device (per-op timings from step 4 ÷ tiles),
-  write `third_party/cost_<name>.json`, re-run the mixed-op benches with
-  `PJRT_OCL_COST_TABLE=$PWD/third_party/cost_<name>.json` and compare wall time
-  against the default table. Improvement ⇒ commit the table as a documented
-  example; no change ⇒ note that lane packing isn't the bottleneck yet.
-- Bubble check: `vm2` already records per-barrier arrival ranks in the stats
-  buffer, but **host readback/reporting is still TODO** (decisions §1 lists
-  bubble-% under `PJRT_OCL_VM_STATS=1` as a spec-level goal). Until that lands,
-  eyeball schedule quality via the simulator in `python/pjrt_ocl/` tests and the
-  lane-scaling curve (flat scaling with idle lanes = bubbles).
+- Run once with `PJRT_OCL_LOG=1` and confirm the "cost table" line reports
+  measured-or-cached, not "calibration failed"; sanity-check the JSON ratios
+  against the device (e.g. an MMA tile is ~25x an EW tile on PoCL, near parity
+  on a big GPU). `PJRT_OCL_CALIBRATE=1` forces re-measurement past the cache;
+  a hand-written `PJRT_OCL_COST_TABLE` supersedes calibration for experiments.
+- Bubble check: trace mode — run a representative program with
+  `PJRT_OCL_VM_TRACE=<file>` and plot with `tools/plot_schedule.py`
+  (scheduled-vs-measured lane timelines; forces the host-dispatch engine, so
+  it's a timeline, not a benchmark). Lanes idling at barriers = the cost model
+  or packer mis-estimates on this device — recalibrate, re-trace, and if the
+  gap persists file a decisions.md entry with the plot.
 
 ## 6. Write it down (nothing is done until this is)
 

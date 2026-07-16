@@ -6,8 +6,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <map>
+#include <set>
 
 #include "vm_cl_source.h"  // generated: kVmClSource
 
@@ -354,6 +358,15 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->vm_seg_kernel_ = clCreateKernel(rt->program_, "vm2_seg", &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateKernel vm2_seg: " + std::to_string(cerr));
+  rt->vm_one_kernel_ = clCreateKernel(rt->program_, "vm2_one", &cerr);
+  if (cerr != CL_SUCCESS)
+    return fail("clCreateKernel vm2_one: " + std::to_string(cerr));
+  rt->mm_kernel_ = clCreateKernel(rt->program_, "mm2", &cerr);
+  if (cerr != CL_SUCCESS)
+    return fail("clCreateKernel mm2: " + std::to_string(cerr));
+  rt->dummy_buf_ = clCreateBuffer(rt->ctx_, CL_MEM_READ_WRITE, 4, nullptr, &cerr);
+  if (cerr != CL_SUCCESS)
+    return fail("clCreateBuffer dummy: " + std::to_string(cerr));
 
   // Engine selection: the persistent in-kernel spin-barrier requires all lanes
   // to be co-resident and balanced, which non-GPU (CPU) OpenCL runtimes do NOT
@@ -378,6 +391,15 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
     // "auto" (or anything else) keeps the default.
   }
 
+  // Execution tracing (PJRT_OCL_VM_TRACE=<path>): per-entry event profiling
+  // only exists on the host-dispatch engine (the megakernel's entries are not
+  // individually observable from the host — only barrier arrival ranks are),
+  // so tracing forces host-dispatch, overriding PJRT_OCL_ENGINE=mega.
+  if (const char* t = std::getenv("PJRT_OCL_VM_TRACE"); t && t[0]) {
+    rt->trace_path_ = t;
+    rt->host_dispatch_ = true;
+  }
+
   // Lanes advertised to the python scheduler (PJRT_OCL_NLANES).
   // CL_DEVICE_MAX_COMPUTE_UNITS is NOT a portable residency unit: NVIDIA
   // reports SMs (2 lanes/CU validated at 256 threads, poc/01/04) but Intel
@@ -395,6 +417,11 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
       rt->ngroups_ = std::min(rt->ngroups_, measured);
   if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
+  // Calibration executes µbenchmark programs through the normal engine, so
+  // lane sizing must be final first. (Today's calibration programs are all
+  // n_lanes=1 and immune to oversubscription; the ordering keeps that from
+  // becoming a hidden assumption.)
+  rt->CalibrateCosts();
   return rt;
 }
 
@@ -409,17 +436,19 @@ cl_uint OclRuntime::ProbeResidency() {
     clReleaseMemObject(d);
     return 0;
   }
-  // vm2 checks nlanes==0 before touching any other argument, so every buffer
-  // arg except bar can be the same small dummy.
+  // vm2 checks nlanes==0 before dereferencing any other argument, so every
+  // buffer arg except bar (arg 5) — including the 8 I/O ports — can be the
+  // same small dummy.
   const cl_uint nlanes = 0;  // probe-mode sentinel
-  bool ok = clSetKernelArg(vm_kernel_, 0, sizeof(dummy), &dummy) == CL_SUCCESS &&
-            clSetKernelArg(vm_kernel_, 1, sizeof(dummy), &dummy) == CL_SUCCESS &&
-            clSetKernelArg(vm_kernel_, 2, sizeof(dummy), &dummy) == CL_SUCCESS &&
-            clSetKernelArg(vm_kernel_, 3, sizeof(dummy), &dummy) == CL_SUCCESS &&
-            clSetKernelArg(vm_kernel_, 4, sizeof(dummy), &dummy) == CL_SUCCESS &&
-            clSetKernelArg(vm_kernel_, 5, sizeof(d), &d) == CL_SUCCESS &&
-            clSetKernelArg(vm_kernel_, 6, sizeof(nlanes), &nlanes) == CL_SUCCESS &&
-            clSetKernelArg(vm_kernel_, 7, sizeof(dummy), &dummy) == CL_SUCCESS;
+  bool ok = true;
+  for (cl_uint i = 0; i < 16 && ok; ++i) {
+    if (i == 5)
+      ok = clSetKernelArg(vm_kernel_, i, sizeof(d), &d) == CL_SUCCESS;
+    else if (i == 6)
+      ok = clSetKernelArg(vm_kernel_, i, sizeof(nlanes), &nlanes) == CL_SUCCESS;
+    else
+      ok = clSetKernelArg(vm_kernel_, i, sizeof(dummy), &dummy) == CL_SUCCESS;
+  }
   cl_uint count = 0;
   if (ok) {
     // Oversized on purpose: ticketless groups exit immediately, so this
@@ -444,6 +473,11 @@ cl_uint OclRuntime::ProbeResidency() {
 OclRuntime::~OclRuntime() {
   if (vm_kernel_) clReleaseKernel(vm_kernel_);
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
+  if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
+  if (mm_kernel_) clReleaseKernel(mm_kernel_);
+  if (dummy_buf_) clReleaseMemObject(dummy_buf_);
+  for (auto& [sz, v] : buf_pool_)
+    for (cl_mem m : v) clReleaseMemObject(m);
   if (program_) clReleaseProgram(program_);
   if (queue_) clReleaseCommandQueue(queue_);
   if (ctx_) clReleaseContext(ctx_);
@@ -478,9 +512,38 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
                               &cerr);
   if (cerr != CL_SUCCESS) return fail("arena alloc: " + std::to_string(cerr));
 
-  // Byte offset into the arena (the VM is byte-addressed; each op casts a
-  // typed pointer at this base). Was f32-element (÷4) before dtypes.
-  auto elem_off = [&](uint32_t id) {
+  // --- zero-copy I/O port assignment (docs/decisions.md) ------------------
+  // A buffer used ONLY as an input or ONLY as an output (not both — donation
+  // aliasing falls back to arena) and among the first kNIoPorts such buffers is
+  // passed straight to the kernel, so the VM reads/writes it in place with no
+  // arena copy. Everything else (intermediates, consts, cond scalars) keeps an
+  // arena byte offset.
+  lp->input_port_.assign(p.inputs.size(), -1);
+  lp->output_port_.assign(p.outputs.size(), -1);
+  lp->io_bufs_.assign(LoadedProgram::kNIoPorts, nullptr);
+  std::set<uint32_t> in_ids(p.inputs.begin(), p.inputs.end());
+  std::set<uint32_t> out_ids(p.outputs.begin(), p.outputs.end());
+  std::map<uint32_t, int> port_of;
+  int next_port = 0;
+  auto assign_port = [&](uint32_t id) -> int {
+    if (in_ids.count(id) && out_ids.count(id)) return -1;  // both -> arena
+    auto it = port_of.find(id);
+    if (it != port_of.end()) return it->second;
+    if (next_port >= LoadedProgram::kNIoPorts) return -1;
+    return port_of[id] = next_port++;
+  };
+  for (size_t i = 0; i < p.inputs.size(); ++i)
+    lp->input_port_[i] = assign_port(p.inputs[i]);
+  for (size_t o = 0; o < p.outputs.size(); ++o)
+    lp->output_port_[o] = assign_port(p.outputs[o]);
+
+  // Resolve a buffer id to a 32-bit handle: a port (bit 31 set) if ported, else
+  // the arena byte offset (the VM is byte-addressed; each op casts a typed
+  // pointer at this base).
+  auto elem_off = [&](uint32_t id) -> uint32_t {
+    auto it = port_of.find(id);
+    if (it != port_of.end())
+      return 0x80000000u | static_cast<uint32_t>(it->second);
     return static_cast<uint32_t>(p.buffers[id].arena_byte_offset);
   };
   auto make_buf = [&](const void* data, size_t bytes, const char* what) {
@@ -503,6 +566,37 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
     t.b = elem_off(t.b);
     if ((t.tile_op & 0xFFu) == kTopEw && t.p0 == kEwSubSelect)
       t.p3 = elem_off(t.p3);
+  }
+
+  // Pure-matmul fast path (docs/decisions.md #9b): exactly one f32 MMA task and
+  // no barrier/control entries -> dispatch the standalone mm2 SGEMM instead of
+  // the megakernel (which caps matmul occupancy). Handles/dims come straight
+  // from the (now offset-patched) task.
+  if (tasks.size() == 1 && (tasks[0].tile_op & 0xFFu) == kTopMma &&
+      ((tasks[0].tile_op >> 8) & 0xFFu) == kDtF32) {
+    bool clean = true;
+    for (const VmEntry& en : p.entries)
+      if (en.task == kEntBarrier || en.task == kEntWhile || en.task == kEntIf)
+        clean = false;
+    // Gate to LARGE matmul: the 8x4 tile needs enough output tiles to fill the
+    // SMs. Below ~1024 the megakernel's 4x4/256-thread MMA (more workgroups per
+    // unit work, better latency hiding) is faster; above it mm2 wins ~1.2-1.3x
+    // (measured, docs/decisions.md #9b). PJRT_OCL_MM_KERNEL=0/1 forces it.
+    const uint32_t M = tasks[0].p0, N = tasks[0].p1, Kd = tasks[0].p2;
+    // GPU only: the mm2 tile is tuned for GPU occupancy; CPU/host-dispatch
+    // devices keep their validated path.
+    bool big = !rt->host_dispatch() && M >= 1024 && N >= 1024 && Kd >= 256;
+    if (const char* e = std::getenv("PJRT_OCL_MM_KERNEL"); e && e[0])
+      big = (e[0] != '0') && !rt->host_dispatch();
+    if (clean && big) {
+      lp->mm_ok_ = true;
+      lp->mm_M_ = M;
+      lp->mm_N_ = N;
+      lp->mm_K_ = Kd;
+      lp->mm_dst_ = tasks[0].dst;
+      lp->mm_a_ = tasks[0].a;
+      lp->mm_b_ = tasks[0].b;
+    }
   }
   // Patch control-entry cond buffer ids.
   std::vector<VmEntry> entries = p.entries;
@@ -545,6 +639,23 @@ LoadedProgram::~LoadedProgram() {
   for (cl_mem m : {arena_, aux_buf_, tasks_buf_, entries_buf_, lane_tab_buf_,
                    bar_buf_, stats_buf_, seg_tab_buf_})
     if (m) clReleaseMemObject(m);
+  for (cl_command_queue q : trace_queues_)
+    if (q) clReleaseCommandQueue(q);
+}
+
+bool LoadedProgram::EnsureTraceQueues(std::string* err) {
+  if (!trace_queues_.empty()) return true;
+  trace_queues_.resize(prog_.n_lanes, nullptr);
+  for (auto& q : trace_queues_) {
+    cl_int cerr;
+    q = clCreateCommandQueue(rt_->ctx(), rt_->dev(),
+                             CL_QUEUE_PROFILING_ENABLE, &cerr);
+    if (cerr != CL_SUCCESS) {
+      *err = "trace: profiling queue create failed: " + std::to_string(cerr);
+      return false;
+    }
+  }
+  return true;
 }
 
 bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
@@ -559,37 +670,67 @@ bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
   std::lock_guard<std::mutex> lock(rt_->mu());
   cl_command_queue q = rt_->queue();
 
+  // Host I/O path (runtime_test): mirror the zero-copy port binding, but stage
+  // ported buffers through temporary device cl_mems (this path isn't the hot
+  // path). Non-ported buffers go through the arena as before.
+  std::fill(io_bufs_.begin(), io_bufs_.end(), nullptr);
+  std::vector<cl_mem> temp_io;
+  cl_int cerr;
+  auto cleanup = [&] { for (cl_mem m : temp_io) clReleaseMemObject(m); };
+
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& b = p.buffers[p.inputs[i]];
-    if (b.size_bytes &&
-        clEnqueueWriteBuffer(q, arena_, CL_FALSE, b.arena_byte_offset,
-                             b.size_bytes, inputs[i], 0, nullptr,
-                             nullptr) != CL_SUCCESS) {
-      *err = "Execute: input write failed";
-      return false;
+    if (!b.size_bytes) continue;
+    if (input_port_[i] >= 0) {
+      cl_mem in = clCreateBuffer(rt_->ctx(), CL_MEM_READ_WRITE, b.size_bytes,
+                                 nullptr, &cerr);
+      if (cerr != CL_SUCCESS) { cleanup(); *err = "Execute: in port alloc"; return false; }
+      temp_io.push_back(in);
+      io_bufs_[input_port_[i]] = in;
+      if (clEnqueueWriteBuffer(q, in, CL_FALSE, 0, b.size_bytes, inputs[i], 0,
+                               nullptr, nullptr) != CL_SUCCESS) {
+        cleanup(); *err = "Execute: input write failed"; return false;
+      }
+    } else if (clEnqueueWriteBuffer(q, arena_, CL_FALSE, b.arena_byte_offset,
+                                    b.size_bytes, inputs[i], 0, nullptr,
+                                    nullptr) != CL_SUCCESS) {
+      cleanup(); *err = "Execute: input write failed"; return false;
+    }
+  }
+  outputs->resize(p.outputs.size());
+  for (size_t o = 0; o < p.outputs.size(); ++o) {
+    const auto& b = p.buffers[p.outputs[o]];
+    if (output_port_[o] >= 0 && b.size_bytes) {
+      cl_mem out = clCreateBuffer(rt_->ctx(), CL_MEM_READ_WRITE, b.size_bytes,
+                                  nullptr, &cerr);
+      if (cerr != CL_SUCCESS) { cleanup(); *err = "Execute: out port alloc"; return false; }
+      temp_io.push_back(out);
+      io_bufs_[output_port_[o]] = out;
     }
   }
 
   if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
-                             : LaunchKernel(q, err)))
+                             : LaunchKernel(q, err))) {
+    cleanup();
     return false;
+  }
 
-  outputs->resize(p.outputs.size());
-  for (size_t i = 0; i < p.outputs.size(); ++i) {
-    const auto& b = p.buffers[p.outputs[i]];
-    (*outputs)[i].resize(b.size_bytes);
-    if (b.size_bytes &&
-        clEnqueueReadBuffer(q, arena_, CL_FALSE, b.arena_byte_offset,
-                            b.size_bytes, (*outputs)[i].data(), 0, nullptr,
+  for (size_t o = 0; o < p.outputs.size(); ++o) {
+    const auto& b = p.buffers[p.outputs[o]];
+    (*outputs)[o].resize(b.size_bytes);
+    if (!b.size_bytes) continue;
+    cl_mem src = output_port_[o] >= 0 ? io_bufs_[output_port_[o]] : arena_;
+    size_t off = output_port_[o] >= 0 ? 0 : b.arena_byte_offset;
+    if (clEnqueueReadBuffer(q, src, CL_FALSE, off, b.size_bytes,
+                            (*outputs)[o].data(), 0, nullptr,
                             nullptr) != CL_SUCCESS) {
-      *err = "Execute: output read failed";
-      return false;
+      cleanup(); *err = "Execute: output read failed"; return false;
     }
   }
   if (clFinish(q) != CL_SUCCESS) {
-    *err = "Execute: clFinish failed";
-    return false;
+    cleanup(); *err = "Execute: clFinish failed"; return false;
   }
+  cleanup();
   return true;
 }
 
@@ -613,9 +754,40 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
   clSetKernelArg(k, 5, sizeof(bar_buf_), &bar_buf_);
   clSetKernelArg(k, 6, sizeof(nlanes), &nlanes);
   clSetKernelArg(k, 7, sizeof(stats_buf_), &stats_buf_);
+  for (int pt = 0; pt < kNIoPorts; ++pt) {
+    cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+    clSetKernelArg(k, 8 + pt, sizeof(cl_mem), &b);
+  }
   if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
                              nullptr) != CL_SUCCESS) {
     *err = "Execute: kernel launch failed";
+    return false;
+  }
+  return true;
+}
+
+// Standalone SGEMM launch: one 256-thread workgroup per 128x128 output tile.
+// mm2(arena, io0..io7, M, N, K, dst, a, b). No barrier buffer / lanes / tasks.
+bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
+  cl_kernel k = rt_->mm_kernel();
+  constexpr uint32_t kTM = 128, kTN = 64;  // must match MM2_TM/MM2_TN
+  const size_t tiles_m = (mm_M_ + kTM - 1) / kTM;
+  const size_t tiles_n = (mm_N_ + kTN - 1) / kTN;
+  const size_t lsz = 256, gsz = tiles_m * tiles_n * lsz;   // MM2_NT threads/wg
+  clSetKernelArg(k, 0, sizeof(arena_), &arena_);
+  for (int pt = 0; pt < kNIoPorts; ++pt) {
+    cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+    clSetKernelArg(k, 1 + pt, sizeof(cl_mem), &b);
+  }
+  clSetKernelArg(k, 9, sizeof(uint32_t), &mm_M_);
+  clSetKernelArg(k, 10, sizeof(uint32_t), &mm_N_);
+  clSetKernelArg(k, 11, sizeof(uint32_t), &mm_K_);
+  clSetKernelArg(k, 12, sizeof(uint32_t), &mm_dst_);
+  clSetKernelArg(k, 13, sizeof(uint32_t), &mm_a_);
+  clSetKernelArg(k, 14, sizeof(uint32_t), &mm_b_);
+  if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                             nullptr) != CL_SUCCESS) {
+    *err = "Execute: mm2 launch failed";
     return false;
   }
   return true;
@@ -636,6 +808,28 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
   const uint32_t n = p.n_lanes;
   constexpr uint32_t WIDX_ROOT = 0xFFFFFFFFu;
   constexpr int MAX_DEPTH = 8;
+
+  // Trace mode: each entry runs as its own single-workgroup vm2_one launch on
+  // its lane's profiling queue (lanes stay concurrent — verified: PoCL and
+  // NVIDIA overlap kernels across queues), and its event yields device-clock
+  // start/end. clFinish over the lane queues replaces the one-launch clFinish
+  // as the phase barrier. Records are appended to trace_path() as one JSON
+  // line per Execute when the walk completes.
+  const bool tracing = !rt_->trace_path().empty() && !rt_->trace_suppressed();
+  struct TraceEv { uint32_t phase, lane, entry; cl_event ev; };
+  std::vector<TraceEv> tevs;
+  uint32_t phase_i = 0;
+  if (tracing) {
+    if (!EnsureTraceQueues(err)) return false;
+    // Input writes were enqueued on the main queue; lane queues must see them.
+    if (clFinish(q) != CL_SUCCESS) {
+      *err = "trace: pre-phase clFinish failed";
+      return false;
+    }
+  }
+  auto release_tevs = [&tevs]() {
+    for (auto& t : tevs) clReleaseEvent(t.ev);
+  };
 
   if (!seg_tab_buf_) {
     cl_int cerr;
@@ -692,6 +886,37 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
   };
 
   auto launch_seg = [&]() -> bool {
+    if (tracing) {
+      cl_kernel k = rt_->vm_one_kernel();
+      clSetKernelArg(k, 0, sizeof(arena_), &arena_);
+      clSetKernelArg(k, 1, sizeof(aux_buf_), &aux_buf_);
+      clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
+      clSetKernelArg(k, 3, sizeof(entries_buf_), &entries_buf_);
+      for (int pt = 0; pt < kNIoPorts; ++pt) {
+        cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+        clSetKernelArg(k, 5 + pt, sizeof(cl_mem), &b);
+      }
+      size_t lsz = 256, gsz = lsz;  // one workgroup per entry, like vm2_seg
+      for (uint32_t L = 0; L < n; ++L) {
+        for (uint32_t e = seg[2 * L]; e < seg[2 * L] + seg[2 * L + 1]; ++e) {
+          if (p.entries[e].task == kEntNop) continue;
+          cl_event ev = nullptr;
+          clSetKernelArg(k, 4, sizeof(e), &e);
+          if (clEnqueueNDRangeKernel(trace_queues_[L], k, 1, nullptr, &gsz,
+                                     &lsz, 0, nullptr, &ev) != CL_SUCCESS) {
+            *err = "trace: entry launch failed";
+            return false;
+          }
+          tevs.push_back({phase_i, L, e, ev});
+        }
+      }
+      for (uint32_t L = 0; L < n; ++L)  // <-- this IS the phase barrier
+        if (clFinish(trace_queues_[L]) != CL_SUCCESS) {
+          *err = "trace: clFinish (phase barrier) failed";
+          return false;
+        }
+      return true;
+    }
     if (clEnqueueWriteBuffer(q, seg_tab_buf_, CL_TRUE, 0,
                              sizeof(cl_uint) * 2 * n, seg.data(), 0, nullptr,
                              nullptr) != CL_SUCCESS) {
@@ -704,6 +929,10 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
     clSetKernelArg(k, 3, sizeof(entries_buf_), &entries_buf_);
     clSetKernelArg(k, 4, sizeof(seg_tab_buf_), &seg_tab_buf_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(k, 5 + pt, sizeof(cl_mem), &b);
+    }
     size_t lsz = 256, gsz = size_t{n} * lsz;
     if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
                                nullptr) != CL_SUCCESS) {
@@ -720,6 +949,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
   for (long guard = 0;; ++guard) {
     if (guard > 100000000L) {
       *err = "host-dispatch: runaway control loop";
+      release_tevs();
       return false;
     }
     const Ev ev = advance(0);
@@ -727,11 +957,16 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     for (uint32_t L = 1; L < n; ++L) {
       if (advance(L) != ev) {
         *err = "host-dispatch: non-uniform control across lanes";
+        release_tevs();
         return false;
       }
       if (seg[2 * L + 1] > 0) any = true;
     }
-    if (any && !launch_seg()) return false;
+    if (any && !launch_seg()) {
+      release_tevs();
+      return false;
+    }
+    phase_i++;
 
     if (ev == EV_DONE) break;
     if (ev == EV_BARRIER) {
@@ -746,6 +981,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       if (clEnqueueReadBuffer(q, arena_, CL_TRUE, off, 4, &cbits, 0, nullptr,
                               nullptr) != CL_SUCCESS) {
         *err = "host-dispatch: cond read failed";
+        release_tevs();
         return false;
       }
       for (uint32_t L = 0; L < n; ++L) {
@@ -770,6 +1006,43 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       }
     }
   }
+
+  if (tracing) {
+    // One JSON line per Execute: task table + per-entry device timestamps.
+    // tasks carry ORIGINAL buffer ids (only the device copy was offset-
+    // patched), so tools can name blocks by op and destination buffer.
+    std::FILE* f = std::fopen(rt_->trace_path().c_str(), "a");
+    if (f) {
+      std::fprintf(f,
+                   "{\"device\":\"%s\",\"cost_table\":\"%s\",\"n_lanes\":%u,"
+                   "\"tasks\":[",
+                   rt_->info().device_name.c_str(),
+                   rt_->cost_table_path().c_str(), n);
+      for (size_t i = 0; i < p.tasks.size(); ++i)
+        std::fprintf(f, "%s[%u,%u,%u,%u]", i ? "," : "", p.tasks[i].tile_op,
+                     p.tasks[i].dst, p.tasks[i].p0, p.tasks[i].p1);
+      std::fprintf(f, "],\"events\":[");
+      bool first = true;
+      for (const auto& t : tevs) {
+        cl_ulong t0 = 0, t1 = 0;
+        if (clGetEventProfilingInfo(t.ev, CL_PROFILING_COMMAND_START,
+                                    sizeof(t0), &t0, nullptr) != CL_SUCCESS ||
+            clGetEventProfilingInfo(t.ev, CL_PROFILING_COMMAND_END, sizeof(t1),
+                                    &t1, nullptr) != CL_SUCCESS)
+          continue;  // profiling info unavailable on this device: skip entry
+        const VmEntry& en = p.entries[t.entry];
+        std::fprintf(f,
+                     "%s[%u,%u,%u,%u,%u,%u,%llu,%llu]", first ? "" : ",",
+                     t.phase, t.lane, t.entry, en.task, en.tile_lo, en.tile_hi,
+                     static_cast<unsigned long long>(t0),
+                     static_cast<unsigned long long>(t1));
+        first = false;
+      }
+      std::fprintf(f, "]}\n");
+      std::fclose(f);
+    }
+    release_tevs();
+  }
   return true;
 }
 
@@ -785,46 +1058,71 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
   std::lock_guard<std::mutex> lock(rt_->mu());
   cl_command_queue q = rt_->queue();
 
-  // Device->device copy each input into its arena region (on-device bandwidth,
-  // no host round-trip).
+  // Optional phase breakdown (PJRT_OCL_PROFILE): clFinish between phases to
+  // isolate input-copy / kernel / output-copy wall-clock. Adds barriers, so
+  // only when profiling.
+  const bool prof = std::getenv("PJRT_OCL_PROFILE") != nullptr;
+  auto clk = [] { return std::chrono::steady_clock::now(); };
+  auto msec = [](auto a, auto b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  auto t0 = clk();
+
+  // Bind I/O ports (zero-copy) and copy only the non-ported buffers through the
+  // arena. Inputs: ported -> the kernel reads the input cl_mem directly; else
+  // device->device copy into the arena. Outputs: allocate a fresh cl_mem for
+  // each; ported -> the kernel writes it directly (bound below, copied never);
+  // non-ported -> copied out of the arena after the launch.
+  std::fill(io_bufs_.begin(), io_bufs_.end(), nullptr);  // nullptr => dummy
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& b = p.buffers[p.inputs[i]];
-    if (b.size_bytes &&
-        clEnqueueCopyBuffer(q, inputs[i], arena_, 0, b.arena_byte_offset,
-                            b.size_bytes, 0, nullptr, nullptr) != CL_SUCCESS) {
+    if (input_port_[i] >= 0) {
+      io_bufs_[input_port_[i]] = inputs[i];
+    } else if (b.size_bytes &&
+               clEnqueueCopyBuffer(q, inputs[i], arena_, 0, b.arena_byte_offset,
+                                   b.size_bytes, 0, nullptr,
+                                   nullptr) != CL_SUCCESS) {
       *err = "ExecuteDevice: input copy failed";
       return false;
     }
   }
-
-  if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
-                             : LaunchKernel(q, err)))
-    return false;
-
-  // Each output stays on device: fresh cl_mem, device->device copy from arena.
   outputs->assign(p.outputs.size(), nullptr);
-  cl_int cerr;
-  for (size_t i = 0; i < p.outputs.size(); ++i) {
-    const auto& b = p.buffers[p.outputs[i]];
-    cl_mem out = clCreateBuffer(rt_->ctx(), CL_MEM_READ_WRITE,
-                                std::max<size_t>(b.size_bytes, 4), nullptr,
-                                &cerr);
-    if (cerr != CL_SUCCESS) {
+  for (size_t o = 0; o < p.outputs.size(); ++o) {
+    const auto& b = p.buffers[p.outputs[o]];
+    cl_mem out = rt_->PoolAlloc(std::max<size_t>(b.size_bytes, 4), err);
+    if (!out) {
       *err = "ExecuteDevice: output alloc failed";
       for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
       outputs->clear();
       return false;
     }
-    if (b.size_bytes &&
-        clEnqueueCopyBuffer(q, arena_, out, b.arena_byte_offset, 0,
+    (*outputs)[o] = out;
+    if (output_port_[o] >= 0) io_bufs_[output_port_[o]] = out;
+  }
+  if (prof) clFinish(q);
+  auto t1 = clk();
+
+  if (!(mm_ok_               ? LaunchMatmul(q, err)
+        : rt_->host_dispatch() ? LaunchHostDispatch(q, err)
+                             : LaunchKernel(q, err))) {
+    for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
+    outputs->clear();
+    return false;
+  }
+  if (prof) clFinish(q);
+  auto t2 = clk();
+
+  // Non-ported outputs: device->device copy from the arena.
+  for (size_t o = 0; o < p.outputs.size(); ++o) {
+    const auto& b = p.buffers[p.outputs[o]];
+    if (output_port_[o] < 0 && b.size_bytes &&
+        clEnqueueCopyBuffer(q, arena_, (*outputs)[o], b.arena_byte_offset, 0,
                             b.size_bytes, 0, nullptr, nullptr) != CL_SUCCESS) {
       *err = "ExecuteDevice: output copy failed";
-      clReleaseMemObject(out);
       for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
       outputs->clear();
       return false;
     }
-    (*outputs)[i] = out;
   }
   if (cl_int e = clFinish(q); e != CL_SUCCESS) {
     *err = "ExecuteDevice: clFinish failed (" + std::to_string(e) +
@@ -832,18 +1130,47 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
            "co-residing on this device, or resource limits)";
     return false;
   }
+  if (prof) {
+    auto t3 = clk();
+    fprintf(stderr, "PROFILE in_copy=%.4f kernel=%.4f out_copy=%.4f total=%.4f ms\n",
+            msec(t0, t1), msec(t1, t2), msec(t2, t3), msec(t0, t3));
+  }
   return true;
 }
 
-cl_mem OclRuntime::AllocDevice(size_t bytes, std::string* err) {
+cl_mem OclRuntime::PoolAlloc(size_t bytes, std::string* err) {
+  const size_t sz = std::max<size_t>(bytes, 4);
+  {
+    std::lock_guard<std::mutex> lk(pool_mu_);
+    auto it = buf_pool_.find(sz);
+    if (it != buf_pool_.end() && !it->second.empty()) {
+      cl_mem m = it->second.back();
+      it->second.pop_back();
+      return m;  // reuse a recently-freed same-size buffer (no lazy re-alloc)
+    }
+  }
   cl_int cerr;
-  cl_mem m = clCreateBuffer(ctx_, CL_MEM_READ_WRITE, std::max<size_t>(bytes, 4),
-                            nullptr, &cerr);
+  cl_mem m = clCreateBuffer(ctx_, CL_MEM_READ_WRITE, sz, nullptr, &cerr);
   if (cerr != CL_SUCCESS) {
-    *err = "AllocDevice failed: " + std::to_string(cerr);
+    *err = "PoolAlloc failed: " + std::to_string(cerr);
     return nullptr;
   }
   return m;
+}
+
+void OclRuntime::PoolFree(cl_mem m, size_t bytes) {
+  if (!m) return;
+  const size_t sz = std::max<size_t>(bytes, 4);
+  std::lock_guard<std::mutex> lk(pool_mu_);
+  auto& v = buf_pool_[sz];
+  if (v.size() < kPoolPerSize)
+    v.push_back(m);
+  else
+    clReleaseMemObject(m);
+}
+
+cl_mem OclRuntime::AllocDevice(size_t bytes, std::string* err) {
+  return PoolAlloc(bytes, err);
 }
 
 bool OclRuntime::WriteToDevice(cl_mem dst, const void* host, size_t bytes,
@@ -868,6 +1195,210 @@ bool OclRuntime::ReadFromDevice(cl_mem src, void* host, size_t bytes,
     return false;
   }
   return true;
+}
+
+// ---- Cost calibration ---------------------------------------------------------
+// First-run µbenchmark for the scheduler's cost model (docs/decisions.md #1):
+// per tile-op family, run a hand-built single-lane program at T and 2T tiles
+// and take the SLOPE (t(2T)-t(T))/T as µs/tile — fills, launches, and the
+// barrier are identical in both runs, so fixed overhead cancels (the poc/04
+// lesson: 1-point calibration is contaminated by launch overhead). Results are
+// cached as JSON keyed by (platform, device, driver); plugin.cc forwards the
+// path to the lowering subprocess so every compile is cost-aware.
+
+namespace {
+
+constexpr uint32_t kFlagNone = 0xFFFFFFFFu;
+constexpr uint32_t kEwSubMul = 1, kEwSubFill = 18;
+
+// Single-lane calibration program: fill the input buffers with 1.0f (garbage
+// arena memory could hold denormals/NaNs and skew the timing), one barrier,
+// then `tiles` tiles of the measured op.
+class CalBuilder {
+ public:
+  uint32_t Buf(uint64_t elems) {
+    prog_.buffers.push_back({arena_, elems * 4, kDtF32});
+    arena_ += (elems * 4 + 63) & ~uint64_t{63};
+    return static_cast<uint32_t>(prog_.buffers.size() - 1);
+  }
+  void Fill(uint32_t buf, uint64_t elems) {
+    const uint32_t one = 0x3f800000u;  // 1.0f
+    Op({kTopEw, buf, 0, 0, kEwSubFill, static_cast<uint32_t>(elems), one, 0},
+       static_cast<uint32_t>((elems + kEwTile - 1) / kEwTile));
+  }
+  void Op(VmTask t, uint32_t tiles) {
+    prog_.tasks.push_back(t);
+    entries_.push_back({static_cast<uint32_t>(prog_.tasks.size() - 1), 0,
+                        tiles, kFlagNone, 0, kFlagNone, 0, 0});
+  }
+  void Barrier() {
+    entries_.push_back({kEntBarrier, 0, 0, kFlagNone, 0, kFlagNone, 0, 0});
+  }
+  VmProgram Done() {
+    prog_.arena_bytes = std::max<uint64_t>(arena_, 4);
+    prog_.n_lanes = 1;
+    prog_.n_barriers = 1;
+    prog_.lane_tab = {{0, static_cast<uint32_t>(entries_.size()),
+                       static_cast<uint32_t>(entries_.size()), 0}};
+    prog_.entries = entries_;
+    return std::move(prog_);
+  }
+  static constexpr uint32_t kEwTile = 16384;  // scheduler TILE_SIZE
+  std::vector<int32_t>* aux() { return &prog_.aux; }
+
+ private:
+  VmProgram prog_;
+  uint64_t arena_ = 0;
+  std::vector<VmEntry> entries_;
+};
+
+VmProgram BuildCalProgram(uint32_t family, uint32_t tiles) {
+  CalBuilder b;
+  const uint64_t kEw = CalBuilder::kEwTile;
+  switch (family) {
+    case kTopEw: {
+      const uint64_t n = tiles * kEw;
+      uint32_t a = b.Buf(n), c = b.Buf(n), d = b.Buf(n);
+      b.Fill(a, n);
+      b.Fill(c, n);
+      b.Barrier();
+      b.Op({kTopEw, d, a, c, kEwSubMul, static_cast<uint32_t>(n), 0, 0}, tiles);
+      break;
+    }
+    case kTopMma: {
+      // 64x64 output tiles (kernel MMA_TM/TN): M = 64*tiles, N = 64, K = 256.
+      const uint32_t M = 64 * tiles, N = 64, K = 256;
+      uint32_t a = b.Buf(uint64_t{M} * K), c = b.Buf(uint64_t{K} * N),
+               d = b.Buf(uint64_t{M} * N);
+      b.Fill(a, uint64_t{M} * K);
+      b.Fill(c, uint64_t{K} * N);
+      b.Barrier();
+      b.Op({kTopMma, d, a, c, M, N, K, 0}, tiles);
+      break;
+    }
+    case kTopRedPart: {
+      const uint64_t n = tiles * kEw;
+      uint32_t a = b.Buf(n), parts = b.Buf(tiles);
+      b.Fill(a, n);
+      b.Barrier();
+      b.Op({kTopRedPart, parts, a, 0, static_cast<uint32_t>(n),
+            static_cast<uint32_t>(kEw), 0 /*sum*/, 0}, tiles);
+      break;
+    }
+    case kTopGather: {
+      // rank-1 identity gather: aux = [rank=1, out_dim=N, stride=1, src_off=0]
+      const uint64_t n = tiles * kEw;
+      uint32_t a = b.Buf(n), d = b.Buf(n);
+      *b.aux() = {1, static_cast<int32_t>(n), 1, 0};
+      b.Fill(a, n);
+      b.Barrier();
+      b.Op({kTopGather, d, a, 0, 0 /*aux off*/, static_cast<uint32_t>(n), 0, 0},
+           tiles);
+      break;
+    }
+  }
+  return b.Done();
+}
+
+// Best-of-reps wall seconds for one Execute of a calibration program.
+double TimeCalProgram(OclRuntime* rt, uint32_t family, uint32_t tiles,
+                      std::string* err) {
+  std::unique_ptr<LoadedProgram> lp =
+      LoadedProgram::Load(rt, BuildCalProgram(family, tiles), err);
+  if (!lp) return -1.0;
+  std::vector<std::vector<uint8_t>> outs;
+  if (!lp->Execute({}, &outs, err)) return -1.0;  // warmup
+  double best = 1e30;
+  for (int rep = 0; rep < 3; ++rep) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!lp->Execute({}, &outs, err)) return -1.0;
+    best = std::min(best, std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - t0).count());
+  }
+  return best;
+}
+
+}  // namespace
+
+void OclRuntime::CalibrateCosts() {
+  const bool log = [] {
+    const char* v = std::getenv("PJRT_OCL_LOG");
+    return v && v[0] && std::strcmp(v, "0") != 0;
+  }();
+  // A user-supplied cost table supersedes calibration entirely.
+  if (const char* ct = std::getenv("PJRT_OCL_COST_TABLE"); ct && ct[0]) return;
+  const char* cal = std::getenv("PJRT_OCL_CALIBRATE");
+  if (cal && !std::strcmp(cal, "0")) return;
+  const bool force = cal && !std::strcmp(cal, "1");
+
+  // Cache path: ${PJRT_OCL_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/pjrt-ocl}
+  // keyed by FNV-1a of platform+device+driver.
+  std::string dir;
+  if (const char* d = std::getenv("PJRT_OCL_CACHE_DIR"); d && d[0]) dir = d;
+  else if (const char* x = std::getenv("XDG_CACHE_HOME"); x && x[0])
+    dir = std::string(x) + "/pjrt-ocl";
+  else if (const char* h = std::getenv("HOME"); h && h[0])
+    dir = std::string(h) + "/.cache/pjrt-ocl";
+  else return;
+  const std::string key =
+      info_.platform_name + "|" + info_.device_name + "|" +
+      info_.driver_version;
+  uint64_t hash = 1469598103934665603ull;
+  for (unsigned char c : key) hash = (hash ^ c) * 1099511628211ull;
+  char hex[17];
+  std::snprintf(hex, sizeof hex, "%016llx",
+                static_cast<unsigned long long>(hash));
+  const std::string path = dir + "/costs-" + hex + ".json";
+
+  std::error_code ec;
+  if (!force && std::filesystem::exists(path, ec)) {
+    cost_table_path_ = path;
+    if (log) std::fprintf(stderr, "[pjrt-ocl] cost table (cached): %s\n",
+                          path.c_str());
+    return;
+  }
+
+  trace_suppressed_ = true;
+  struct Fam { uint32_t op; uint32_t t_lo; const char* json_key; };
+  // MMA gets small tile counts: one 64x64x256 tile is ~ms on a CPU device.
+  const Fam fams[] = {{kTopEw, 16, "ew_tile_us"},
+                      {kTopMma, 2, "mma_tile_us"},
+                      {kTopRedPart, 16, "reduce_tile_us"},
+                      {kTopGather, 16, "gather_tile_us"}};
+  double us[4];
+  std::string err;
+  for (int i = 0; i < 4; ++i) {
+    const double a = TimeCalProgram(this, fams[i].op, fams[i].t_lo, &err);
+    const double b = TimeCalProgram(this, fams[i].op, 2 * fams[i].t_lo, &err);
+    if (a < 0 || b < 0) {
+      trace_suppressed_ = false;
+      if (log) std::fprintf(stderr, "[pjrt-ocl] cost calibration failed: %s\n",
+                            err.c_str());
+      return;  // unit costs
+    }
+    us[i] = std::max(0.01, (b - a) * 1e6 / fams[i].t_lo);
+  }
+  trace_suppressed_ = false;
+
+  std::filesystem::create_directories(dir, ec);
+  std::FILE* f = std::fopen(path.c_str(), "w");
+  if (!f) {
+    if (log) std::fprintf(stderr, "[pjrt-ocl] cost cache unwritable: %s\n",
+                          path.c_str());
+    return;
+  }
+  std::fprintf(f, "{");
+  for (int i = 0; i < 4; ++i)
+    std::fprintf(f, "\"%s\": %.3f, ", fams[i].json_key, us[i]);
+  std::fprintf(f, "\"device\": \"%s\", \"driver\": \"%s\"}\n",
+               info_.device_name.c_str(), info_.driver_version.c_str());
+  std::fclose(f);
+  cost_table_path_ = path;
+  if (log)
+    std::fprintf(stderr,
+                 "[pjrt-ocl] cost table (measured): ew=%.2f mma=%.2f "
+                 "reduce=%.2f gather=%.2f us/tile -> %s\n",
+                 us[0], us[1], us[2], us[3], path.c_str());
 }
 
 // ---- Lowering subprocess ----------------------------------------------------

@@ -150,17 +150,35 @@ apples-to-apples GPU-vs-GPU comparison of the VM against a production compiler.
 
 Takeaways (higher = slower; both axes log):
 
-- **Small sizes are dispatch-bound and competitive** — within ~1.3x of CUDA for
-  elementwise/gather, since both are dominated by launch/execute overhead.
-- **Large elementwise / gather** run ~4–8x slower: our megakernel is not yet
-  bandwidth-optimal (note the step near 512K elements — a lane/tile scaling
-  threshold worth tuning).
-- **`dot_general`** is ~7.5x off cuBLAS at 2048³ — expected for a naive
-  register-blocked tile kernel vs a tuned library; the kernel-table override
-  mechanism is the intended path to close this.
-- **`while` loops** are the biggest gap (~10–30x): every iteration pays a
-  cross-workgroup barrier + control round-trip. Loop-body fusion and cheaper
-  per-iteration sync are the obvious wins.
+- **Elementwise (add / mul) is at parity** — within **~1.3x** of CUDA at 16M
+  elements, and actually *faster* than CUDA across the small-to-mid range. Two
+  optimizations got us here: **zero-copy I/O** (input/output buffers are passed
+  straight to the kernel instead of copied through a staging arena) and a
+  **buffer pool** (reused output allocations, which removed a 3.5x step at 512K
+  caused by NVIDIA's lazy ≥2MB allocation). The kernel itself was already
+  bandwidth-competitive.
+- **`gather` (`dynamic_slice`)** ~2.2x at 16M, faster than CUDA below ~64K.
+- **`matrix × vector`** ~3.7x — memory-bound but routed through the tiled MMA
+  kernel, which wastes most of a tile on a width-1 RHS; a dedicated GEMV kernel
+  would close most of this.
+- **`dot_general`** ~5.5x off cuBLAS at 2048³. Large matmul now runs a
+  **standalone SGEMM** (`mm2`, launched outside the megakernel so an 8×4 register
+  tile doesn't inflate the shared register budget) — 17→21 TFLOP/s at 2048.
+  But cuBLAS hits **134 TFLOP/s at 4096, above Blackwell's f32 peak**, i.e. it is
+  TF32 **tensor-core** bound; a portable f32 kernel can't reach that. Closing the
+  rest needs an NVIDIA-only TF32 tensor-core tile (inline-PTX WMMA behind the
+  kernel-table override — the `mm2` dispatch path is built to host it).
+- **`while` loops** went from **~28x to ~4x** at 16M elements. Three fixes:
+  (1) an **affine op** `d = a·s + t` that folds scalar-constant scale/bias
+  (`x*1.5+1` was materializing two full-length broadcast buffers per iteration →
+  now one fused pass); (2) **in-place carry updates** so a loop-carried buffer
+  stays L2-resident across iterations instead of being copied twice per step; and
+  (3) a **contention-free barrier spin** (coherent `atomic_load` instead of an
+  atomic RMW that ping-ponged the phase cache line across ~376 workgroups). The
+  affine folding is a general win for any `x*c`/`x+c`/affine chain.
+
+The remaining end-to-end gap on the closest ops is largely fixed jax→PJRT
+per-dispatch overhead, which amortizes in real fused programs.
 
 ### Intel Arc 140V (Xe2, Lunar Lake iGPU) — vs JAX CPU
 
@@ -188,6 +206,86 @@ it's the alternative you'd actually use.
 ### CPU via PoCL (Intel Core Ultra 9 288V) — vs JAX native CPU
 
 <!-- POCL_BENCH -->
+
+## Inside the VM: scheduled vs. measured execution
+
+How does a `jax.jit` function actually run on the device? Take a program with both
+parallel and sequential structure — a heavy matmul next to a cheap elementwise chain,
+joined at the end:
+
+```python
+def f(a, b, c):          # all 256x256 f32
+    m = a @ b            # heavy matmul            \  independent -> same dataflow
+    s = c + c            # cheap elementwise        } level, scheduled onto
+    p = c * c            # cheap elementwise       /  different lanes in parallel
+    q = s * p            # needs s and p  -> next level (after a global barrier)
+    return q + m         # needs q and m  -> final level (the join)
+```
+
+The compile pipeline turns this into the per-lane schedule below. Lowering emits one
+**task** per op and splits each into **tiles** (16K elements for elementwise, 64×64
+output blocks for matmul). The scheduler then groups independent ops into **dataflow
+levels**, packs each level's tiles onto **lanes** (persistent workgroups) by cost
+(LPT), and separates levels with **global barriers** — that schedule *is* the bytecode
+the engines execute. `tools/plot_schedule.py` draws it (top), then runs the program
+through the plugin with per-entry instrumentation and draws what the device really did
+(bottom):
+
+![scheduled vs measured lane timeline](docs/schedule_diamond.png)
+
+Reading it, top panel (the scheduler's intent, on its cost model's clock):
+
+- **Level 0**: independent ops really do run side by side — the matmul's 16 tiles
+  fan out over several lanes while `c+c` and `c*c` run concurrently on others.
+- The dashed **barriers** separate levels: `s * p` and the final join each wait for
+  every lane, because their inputs were produced across lanes.
+- Levels 1–2 have only 4 tiles for 8 lanes: half the lanes are scheduled idle —
+  a structural **bubble** visible at schedule time.
+
+Bottom panel (device timestamps from the same program, white gaps = bubbles): this
+run was forced to the **unit-cost model** (`PJRT_OCL_CALIBRATE=0`), and on this CPU
+that model is badly wrong — a matmul tile really costs **~16×** an elementwise tile
+(measured), so the elementwise lanes finish in under a millisecond and stall at the
+barrier while the matmul lanes grind on: 42% of all lane-time is idle.
+
+This is why the cost model is **measured, not assumed**. On first use the plugin runs
+a µbenchmark per tile-op family on the actual device (two tile counts, slope, so
+launch overhead cancels), caches the result under `~/.cache/pjrt-ocl/` keyed by
+device+driver, and every subsequent compile schedules with those costs — on this CPU
+`ew=310 mma=5073 reduce=89 gather=201` µs/tile, on the NVIDIA GPU
+`ew=15 mma=27 reduce=13 gather=21` (nearly uniform — same schedule, opposite balance).
+With measured costs the packer both **fans the matmul out over all lanes** and
+**sequentializes the cheap elementwise ops behind its chunks** instead of dedicating
+lanes to them:
+
+![scheduled vs measured, device-calibrated cost model](docs/schedule_diamond_calibrated.png)
+
+The planned and measured panels now agree structurally, and idle lane-time drops from
+42% to ~20% (the rest is the CPU runtime's own per-workgroup jitter, not scheduling).
+On shapes where cheap ops would otherwise steal lanes from a matmul (e.g. one matmul
++ seven small elementwise ops), the calibrated schedule is ~1.3× faster end-to-end on
+PoCL. Override knobs: `PJRT_OCL_COST_TABLE=<json>` (explicit table),
+`PJRT_OCL_CALIBRATE=0|1` (disable / force re-measure).
+
+Reproduce (any of `diamond`, `chain`, `wide`, or your own StableHLO):
+
+```bash
+. ./env.sh
+python tools/plot_schedule.py --example diamond --device Portable \
+    --out docs/schedule_diamond_calibrated.png                 # measured costs (default)
+PJRT_OCL_CALIBRATE=0 python tools/plot_schedule.py --example diamond \
+    --device Portable --out docs/schedule_diamond.png          # unit-cost model
+python tools/plot_schedule.py --stablehlo my_program.mlir      # planned timeline only
+```
+
+How the measurement works: `PJRT_OCL_VM_TRACE=<file>` switches execution to the
+host-dispatch engine and runs **every schedule entry as its own single-workgroup
+launch on a per-lane profiling queue** (lanes still run concurrently — verified on
+PoCL and NVIDIA), so each entry gets device-clock start/end timestamps via OpenCL
+event profiling, appended as JSON per execute. Two caveats: per-entry launches add
+overhead (~tens of µs each), so treat it as a timeline, not a benchmark — and the
+GPU megakernel path is not per-entry observable from the host (only barrier arrival
+ranks), so traces always reflect the host-dispatch engine.
 
 ## Development
 
@@ -222,9 +320,10 @@ core path, and it never assumes fp64. Design decisions and their rationale live 
   launch per phase. This is required on CPU — an in-kernel spin-barrier deadlocks on a
   non-preemptive CPU runtime (imbalance-starvation; it's why OpenCL mandates kernel
   boundaries for cross-group sync). Override with `PJRT_OCL_ENGINE=host|mega|auto`.
-- Performance is improving but not yet tuned: matmul runs a register-blocked tile kernel;
-  memory-bound ops are currently limited by arena-copy traffic (see
-  [`docs/perf-findings.md`](docs/perf-findings.md)).
+- Performance is improving but not yet tuned. Elementwise/gather are near CUDA;
+  large matmul uses a standalone SGEMM but full parity needs TF32 tensor cores
+  (inline-PTX WMMA behind the kernel-table override — not yet built); `while` is
+  down to ~4x via affine folding + in-place carries (see `docs/decisions.md` §9).
 
 ## License
 

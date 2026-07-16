@@ -643,7 +643,8 @@ static PJRT_Error* Impl_PJRT_Client_BufferFromHostBuffer(
 
 static PJRT_Error* Impl_PJRT_Buffer_Destroy(PJRT_Buffer_Destroy_Args* args) {
   if (args->buffer && args->buffer->mem)
-    clReleaseMemObject(args->buffer->mem);
+    args->buffer->client->runtime->PoolFree(args->buffer->mem,
+                                            args->buffer->size_bytes);
   delete args->buffer;
   return nullptr;
 }
@@ -694,7 +695,8 @@ static PJRT_Error* Impl_PJRT_Buffer_Memory(PJRT_Buffer_Memory_Args* args) {
 static PJRT_Error* Impl_PJRT_Buffer_Delete(PJRT_Buffer_Delete_Args* args) {
   args->buffer->deleted = true;
   if (args->buffer->mem) {
-    clReleaseMemObject(args->buffer->mem);
+    args->buffer->client->runtime->PoolFree(args->buffer->mem,
+                                            args->buffer->size_bytes);
     args->buffer->mem = nullptr;
   }
   return nullptr;
@@ -769,6 +771,11 @@ static PJRT_Error* Impl_PJRT_Client_Compile(PJRT_Client_Compile_Args* args) {
       {"PJRT_OCL_NLANES", std::to_string(client->runtime->ngroups())}};
   if (const char* ct = std::getenv("PJRT_OCL_COST_TABLE"); ct && ct[0])
     sub_env.push_back({"PJRT_OCL_COST_TABLE", ct});
+  else if (!client->runtime->cost_table_path().empty())
+    // First-run device calibration (runtime.cc CalibrateCosts): the scheduler
+    // packs lanes with measured per-tile costs instead of unit costs.
+    sub_env.push_back(
+        {"PJRT_OCL_COST_TABLE", client->runtime->cost_table_path()});
   if (!pjrt_ocl::RunLoweringSubprocess(client->python_exe,
                                        client->lower_service, artifact,
                                        sub_env, &vmp_bytes, &err, &unsupported))

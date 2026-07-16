@@ -70,6 +70,12 @@ def _broadcast_in_dim(ctx, op):
     dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]), out_strides,
                        dtype=in_dt)
     ctx.value_to_buf[op.results[0]] = dst
+    # scalar-const broadcast (rank-0 f32 -> full shape): record the constant so
+    # an elementwise consumer can fold `x*s`/`x+t` into OP_AFFINE_F32 and let the
+    # now-dead gather be NOP'd (perf: kills scalar-broadcast materialization).
+    src = op.operands[0]
+    if src in ctx.const_scalar and all(s == 0 for s in out_strides):
+        ctx.scalar_bcast[op.results[0]] = ctx.const_scalar[src]
 
 
 @L.handles("stablehlo.reshape")

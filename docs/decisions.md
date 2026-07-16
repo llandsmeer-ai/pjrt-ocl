@@ -73,6 +73,65 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     still deadlocks (flag works). 197 pytest + 3 e2e pass. **PoCL is deadlock-free for the first time.**
   - Supersedes the vaguer fix-options in
   the node below.
+
+- ✅ **SHIPPED 2026-07-15: execution-trace instrumentation + timeline plots**
+  (`PJRT_OCL_VM_TRACE=<file>` + `tools/plot_schedule.py`) — delivers the spec-level
+  instrumentation item (bubble % now visible per lane, plotted planned-vs-measured).
+  Design: OpenCL gives per-COMMAND timestamps only (no portable in-kernel clock), so
+  per-entry timing requires one launch per entry → trace mode forces the host-dispatch
+  engine and runs every schedule entry as its own single-workgroup `vm2_one` launch on a
+  per-lane `CL_QUEUE_PROFILING_ENABLE` queue; `clFinish` over the lane queues is the
+  phase barrier; one JSON line (task table + per-entry device-clock start/end) appended
+  per Execute. **Pre-verified assumption: lanes stay concurrent across queues** — 8
+  spin kernels on 8 queues take 1.06× one kernel on PoCL (events on a common timebase),
+  and NVIDIA maps queues to streams; without that the traced timeline would be fiction.
+  Caveats (recorded in README + tool docstring): (a) per-entry launches add ~tens of µs
+  each — it's a timeline, not a benchmark; (b) the GPU megakernel is NOT per-entry
+  observable from the host (only the existing barrier arrival-rank stats), so traces
+  always measure the host-dispatch engine. Findings from the `diamond` example
+  (matmul ∥ EW chain, then join): PoCL runs level 0 with lanes 5–7 (EW) 97–98% idle —
+  an MMA tile costs ~25× an EW tile there vs the unit-cost default (~50% of lane-time
+  idle overall); NVIDIA's level 0 is nearly flat (ratio ≈ 1). Same schedule, opposite
+  balance — reconfirms measure-don't-assume; the cost-table (`PJRT_OCL_COST_TABLE`)
+  is the rebalancing lever. Verified: runtime_test PoCL+NVIDIA PASS, 197 pytest pass,
+  traced diamond output matches numpy (max |err| 4.8e-7 — f32 matmul accumulation).
+- ✅ **SHIPPED 2026-07-16: measured per-device cost model + sequentializing lane packer**
+  — closes the "cost model is MEASURED, not assumed" spec item (was designed 2026-07-14,
+  validated in poc/04, then never wired into the tree: DeviceConfig defaulted every
+  tile-op to 1.0 and nothing generated PJRT_OCL_COST_TABLE). Trigger: the trace-mode
+  diamond plot — unit costs made the scheduler give the matmul 5–6 lanes and dedicate
+  lanes to two cheap EW ops, which then sat 97–99% idle at the barrier (user diagnosis:
+  they should have been sequentialized onto shared lanes).
+  - **Calibration (runtime.cc `CalibrateCosts`, runs at client init):** per tile-op
+    family (ew/mma/reduce/gather), execute a hand-built single-lane program (fill
+    inputs → barrier → K op tiles) at K and 2K tiles; **µs/tile = slope** — fills and
+    launch overhead cancel (poc/04's contamination lesson). Cached as JSON at
+    `${XDG_CACHE_HOME:-~/.cache}/pjrt-ocl/costs-<fnv(platform|device|driver)>.json`;
+    `PJRT_OCL_CALIBRATE=0|1` disables/forces; a user `PJRT_OCL_COST_TABLE` supersedes;
+    plugin.cc forwards the resolved path to the lowering subprocess, so every compile
+    is cost-aware with zero user action. Trace mode is suppressed during calibration
+    (per-entry launches would distort the measurement). Measured: PoCL ew=310
+    mma=5073 reduce=89 gather=201 µs/tile (MMA:EW ≈ 16×); NVIDIA ew=15 mma=27
+    reduce=13 gather=21 (≈1.8×) — reconfirms poc/04's "same graph, different balance"
+    at the ratio level. (The trace-mode ~25× estimate was under 8-lane contention;
+    calibration is single-lane. Ratios, not absolutes, drive packing.)
+  - **Packer (scheduler.py `_pack_level`): chunk + LPT, one regime.** Each task splits
+    into k = min(tiles, ceil(n_lanes·cost_share)) contiguous chunks; all chunks LPT
+    onto least-loaded lanes; a lane may carry MULTIPLE entries per level. Replaces the
+    old primary/overflow pair, whose ≥1-dedicated-lane-per-task invariant made
+    sequentialization impossible. Diamond with measured costs: matmul chunks on ALL 8
+    lanes, add/mul stacked behind lanes 0–1; model makespan 75 → 56 cost units.
+  - **Validated:** 199 pytest (incl. new sequentialization test + rewritten
+    proportional-allocation test; simulators already supported multi-entry lanes),
+    runtime_test PASS PoCL+NVIDIA, calibrated e2e correct on the NVIDIA megakernel.
+    Traced diamond on PoCL: planned and measured panels now structurally agree; idle
+    lane-time 42–50% → ~20% (rest is PoCL per-workgroup jitter, not scheduling).
+    **Wall-clock:** diamond unchanged within PoCL noise (model gain 1.17× ≪ jitter);
+    the lane-stealing shape (1 matmul + 7 cheap EW) improves 14.2 → 10.7 ms median
+    (**1.33×**) with calibration on. NVIDIA at these sizes is launch-bound (no change,
+    no regression). plot_schedule.py planned panel now reads the cost table the plugin
+    actually used (path recorded in each trace line).
+
 - ⚠️ **CONFIRMED #1 RISK 2026-07-15: cross-workgroup spin-barrier is UNRELIABLE on PoCL under
   iteration (LIVENESS axis — still open; poc/07 fixed only the visibility axis above).** The persistent-VLIW engine (vm2.cl) uses the poc/01 global barrier between schedule
   phases. On NVIDIA it is rock-solid (500 two-level + 300 chained-matmul back-to-back runs, zero
@@ -399,3 +458,87 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
     future kernel is preemptible, over-discovery is harmless (preemption keeps the spin-barrier
     live). Liveness at discovered count: PASS (1.9 µs/barrier on Xe2, 225 µs on PoCL);
     discovered+1 on Xe2: spins >60 s, host-killed — discovery is TIGHT.
+## 10. Perf: while + matmul (2026-07-16)
+
+Focus session on the two biggest gaps vs native CUDA (see docs/bench_plot.png): `while`
+(was 28x at 16M elems) and `matmul` (6.8x). Two background research agents mined
+HazyResearch/Megakernels (sync/scheduling) and the tensor-core GEMM refs
+(ihavnoid/hgemmtest inline-PTX WMMA from OpenCL, CUTLASS m16n8k8 TF32 string).
+
+### 10a. `while` — SOLVED (28x → ~4x at 16M, and the small-N floor halved)
+
+Profiled the benchmark `fori_loop(0,32, v: v*1.5+1, x)`. Three independent costs, none of
+them the barrier at large N:
+
+1. **Scalar-const broadcasts materialized.** `v*1.5+1` lowered to `gather_strided`
+   (broadcast 1.5 → full N-vector) + `mul` + `gather_strided`(1.0) + `add` — two full
+   N-length const buffers written and read every iteration. FIX: **OP_AFFINE_F32**
+   (`d = a*s + t`, s/t scalar immediates) + a lowering peephole that folds
+   `mul(x, bcast_const)` / `add(x, bcast_const)` into it, **composes affine∘affine chains**
+   (`(x*s1+t1)*s2+t2`), and DCEs the dead broadcasts (index-stable NOP substitution so
+   WHILE cond/body ranges stay valid). `v*1.5+1` → ONE affine op, ZERO broadcast buffers.
+2. **Redundant copy-back.** The while lowering snapshotted body returns into temps then
+   copied temps→carries (2 full-length passes/iter, for swap/passthrough safety). FIX:
+   **in-place carry update** — when a carry's new value is produced by a single
+   elementwise (index-aligned) op that is the only body reader of that carry, retarget the
+   producer to write the carry directly and drop both copies. Guarded off for bodies with
+   nested WHILE/IF (a nested region's carry-init copy would otherwise be mistaken for the
+   producer — caught by test_nested_while). Net: body of the benchmark = `c_x = c_x*1.5+1`
+   IN PLACE, so the 64 MB carry stays **L2-resident** across all 32 iterations (Blackwell
+   has 96 MB L2), matching CUDA's fused-loop traffic. 16M: 22.5 ms → **3.2 ms** (bit-exact
+   vs JAX CPU).
+3. **Barrier contention (small-N floor).** The spin-barrier used `atomic_add(&bar[1],0)` as
+   a *read* — an atomic RMW forces every one of the (up to 376) spinning workgroups to take
+   the phase cache line EXCLUSIVE, so it ping-pongs (~38 µs/barrier). FIX: coherent
+   `atomic_load_explicit(..., relaxed, memory_scope_device)` — the line stays Shared, only
+   invalidated once at the phase flip. 4K while: 2.47 → 1.8 ms. (The true small-N fix is
+   barrier ELISION for lane-diagonal loops — each lane runs the whole loop with per-lane
+   control, zero grid barriers — designed but not built; the megakernel research confirms
+   it's the right model. Deferred.)
+
+Encoding note: OP_AFFINE_F32 needs TWO f32 immediates but `imm` is the only free-form
+serialized instr word (`dst/a/b` are range-checked, `aux` must be ≤ n_aux, `p3` is the
+SELECT pred). Repurposed the 8th instr word (was a zero pad `pad1`) as `imm2` (the `t`
+bits); parse allows it nonzero only for OP_AFFINE_F32. Device reads s/t from task p2/p3
+(unvalidated for EW-affine). `mad(a,s,t)` matches JAX CPU's fma bit-for-bit.
+
+These are GENERAL wins, not while-specific: scalar scale/bias folding helps any program
+with `x*c`/`x+c`/affine chains (bias, normalization, scaling).
+
+### 10b. `matmul` — megakernel register ceiling (open)
+
+Baseline 17 TFLOP/s @ N=2048 vs cuBLAS 117 TFLOP/s (6.8x). Key facts established:
+- cuBLAS at N=2048 gets only 117 TFLOP/s — well under TF32 tensor-core peak (~400+), so it
+  is NOT tensor-core-bound at these sizes; Blackwell FP32 peak is ~125 TFLOP/s. So a
+  well-tuned **portable** SGEMM could in principle approach cuBLAS here WITHOUT tensor cores.
+- The kernel is **local-memory-bandwidth bound**: the 4×4 register microtile does only
+  2 FMA per local load (global reuse is already high, so float4 *global* loads won't help).
+  Raising arithmetic intensity needs a bigger register microtile.
+- **8×8 (128×128 tile) HANGS the matmul at runtime** (not compile — runtime_test's EW/while
+  pass at 128×128). 64 live accumulator registers in the SHARED megakernel almost certainly
+  spill catastrophically (the megakernel's register budget is the max over ALL op paths).
+  Rolling the K-loop didn't help. This is the fundamental tension the CLAUDE.md notes:
+  aggressive matmul tiling is incompatible with one-kernel-does-everything.
+
+SHIPPED (path a, partial): a standalone `mm2` SGEMM kernel + a pure-matmul fast path.
+`runtime.cc` detects a program that is a single f32 TILE_MMA with no barrier/control
+entries and, for LARGE matmul on GPU (M,N≥1024, K≥256; `PJRT_OCL_MM_KERNEL` forces),
+launches `mm2` (one 256-thread workgroup per 128×64 tile, 8×4 register microtile,
+double-buffered smem, transposed As for vectorized local loads) instead of the megakernel.
+Standalone => independent register budget, so an 8×4 tile does not spill. N=2048:
+17.1 → **21.1 TFLOP/s** (1.23×). Gated because below ~1024 the megakernel's 4×4/256-thread
+MMA wins (more workgroups per unit work → better latency hiding). Correct on non-square /
+non-tile-multiple / large shapes; 199 pytest + runtime_test green.
+
+What the tuning sweep established (all standalone, N=2048/4096): tile/register configs
+4×4-256t, 8×8-64t, 8×8-256t(128²), 8×4-256t all **plateau at ~17–23 TFLOP/s** — the 8×8's
+64 accumulator registers cap occupancy at ~25% (2 workgroups/SM), and without
+bank-conflict-free smem swizzling + register-level (not just smem) prefetch the kernel
+can't approach the ~100 TFLOP/s a production FP32 SGEMM reaches. **cuBLAS hits 134 TFLOP/s
+at N=4096 — ABOVE Blackwell's ~125 FP32 peak — so it is TENSOR-CORE (TF32) bound.** Hard
+conclusion: **matmul parity REQUIRES TF32 tensor cores**; portable FP32 tops out ~1.3× off
+even when perfect. Next: an NVIDIA-only TF32 tensor-core body inside `mm2` behind a build
+guard (poc first, per hard rules), via inline PTX `wmma.load.*.shared`/`wmma.mma.sync`
+(hgemmtest passes `__local` ptrs as `"l"` into `.shared` WMMA ops; CUTLASS
+`mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`). The `mm2` dispatch path is already
+built to host it.

@@ -24,8 +24,26 @@
 
 #define EW_TS 16384u
 
-/* Typed element pointer at byte base `base` into the byte-addressed arena. */
-#define AP(T, base) ((__global T *)(arena + (base)))
+/* Buffer addressing. A buffer's 32-bit `base` is EITHER an arena byte offset
+ * (intermediates, consts) OR — with bit 31 set — an I/O PORT: the low bits index
+ * `iop[]`, a small array of input/output buffers passed straight to the kernel
+ * so the VM reads inputs and writes outputs in place, with no arena copy (the
+ * copies dominated memory-bound ops — profiled ~70% of `a+b` time). Every tile
+ * fn takes `arena` and `iop` in scope, so VMO_BASE resolves either kind. */
+#define VMO_IO_BIT 0x80000000u
+#define VMO_BASE(base) \
+    (((base) & VMO_IO_BIT) ? iop[(base) & 0x7Fu] : (arena + (base)))
+#define AP(T, base) ((__global T *)VMO_BASE(base))
+#define VMO_N_IO 8   /* # of I/O buffers passed direct to the kernel as ports */
+/* The kernel entry points take VMO_N_IO buffer args and pack them into `iop`;
+ * unused ports get a dummy buffer from the host. */
+#define VMO_IO_PARAMS                                                    \
+    __global uchar *io0, __global uchar *io1, __global uchar *io2,        \
+    __global uchar *io3, __global uchar *io4, __global uchar *io5,        \
+    __global uchar *io6, __global uchar *io7
+#define VMO_IO_ARRAY                                                     \
+    __global uchar *iop[VMO_N_IO] =                                       \
+        {io0, io1, io2, io3, io4, io5, io6, io7}
 
 /* dtype enum (matches python DT_* / runtime.h). */
 enum { DT_F32 = 0, DT_I32 = 1, DT_U32 = 2, DT_BOOL = 3,
@@ -34,8 +52,8 @@ enum { DT_F32 = 0, DT_I32 = 1, DT_U32 = 2, DT_BOOL = 3,
 /* f16 and bf16 are 2-byte storage + f32 compute (portable, no cl_khr_fp16):
  * f16 via core vload_half/vstore_half; bf16 via bit shift (top 16 bits of the
  * f32) with round-to-nearest-even. */
-#define LDH(base, i) vload_half((i), (const __global half *)(arena + (base)))
-#define STH(base, i, v) vstore_half((v), (i), (__global half *)(arena + (base)))
+#define LDH(base, i) vload_half((i), (const __global half *)VMO_BASE(base))
+#define STH(base, i, v) vstore_half((v), (i), (__global half *)VMO_BASE(base))
 static float vmo_bf16_to_f32(ushort b) { return as_float(((uint)b) << 16); }
 static ushort vmo_f32_to_bf16(float f)
 {
@@ -62,7 +80,11 @@ enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        /* bitwise int32/bool — dedicated dispatch in vmo_ew_tile_i32/vmo_ew_tile_bool */
        SUB_AND, SUB_OR, SUB_XOR, SUB_NOT,
        /* mixed-dtype: float operand -> bool result (own dispatch in vmo_ew_tile) */
-       SUB_ISFINITE };
+       SUB_ISFINITE,
+       /* fused affine: d = a*s + t, s=as_float(p2), t=as_float(p3). Folds a
+        * scalar-const scale/bias (and composed chains) into one in-place pass;
+        * see python lowering _fold_scalar / _compose_affines. */
+       SUB_AFFINE };
 
 #define ENT_NOP     0xFFFFFFFFu
 #define ENT_BARRIER 0xFFFFFFFEu
@@ -110,6 +132,9 @@ typedef union { float f; int i; uint u; } slot_t;
 #ifdef VMO_NO_DEVICE_FENCE
 #define VMO_FENCE_DEV_REL()
 #define VMO_FENCE_DEV_ACQ()
+/* strict-1.2 fallback: the spin-barrier is unsafe here anyway (host-dispatch is
+ * forced), so the phase read only needs to compile — a volatile load suffices. */
+#define VMO_LOAD_PHASE(p) (*(volatile __global uint *)(p))
 #else
 #define VMO_FENCE_DEV_REL() \
     atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, \
@@ -117,6 +142,18 @@ typedef union { float f; int i; uint u; } slot_t;
 #define VMO_FENCE_DEV_ACQ() \
     atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, \
                            memory_scope_device)
+/* Coherent LOAD (not an atomic RMW) of the phase word. The old spin used
+ * atomic_add(&bar[1],0) — a read-modify-write — which forces every spinning
+ * group to acquire the cache line EXCLUSIVE, so the line ping-pongs among all
+ * groups and each spin costs an L2 round-trip under full contention (~38us per
+ * barrier across ~hundreds of workgroups; the small-N `while` floor). An
+ * acquire LOAD keeps the line in Shared state across all readers — it is only
+ * invalidated once, when the last arriver flips the phase — so the spin is
+ * near-free until release. Ordering of the payload is still the ACQ fence
+ * below; this load is device-scoped so it observes the L2-coherent flip. */
+#define VMO_LOAD_PHASE(p) atomic_load_explicit( \
+    (volatile __global atomic_uint *)(p), memory_order_relaxed, \
+    memory_scope_device)
 #endif
 
 static void vmo_barrier(volatile __global uint *bar, const uint ngroups)
@@ -124,12 +161,12 @@ static void vmo_barrier(volatile __global uint *bar, const uint ngroups)
     barrier(CLK_GLOBAL_MEM_FENCE);
     if (get_local_id(0) == 0) {
         VMO_FENCE_DEV_REL();
-        const uint phase = atomic_add(&bar[1], 0);
+        const uint phase = VMO_LOAD_PHASE(&bar[1]);
         if (atomic_inc(&bar[0]) == ngroups - 1) {
             bar[0] = 0;
             atomic_inc(&bar[1]);
         } else {
-            while (atomic_add(&bar[1], 0) == phase)
+            while (VMO_LOAD_PHASE(&bar[1]) == phase)
                 ;
         }
         VMO_FENCE_DEV_ACQ();

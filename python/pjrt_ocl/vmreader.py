@@ -29,8 +29,8 @@ import numpy as np
 
 from .lowering import (
     ARENA_ALIGN, BUFENT_STRUCT, CONSTHDR_STRUCT, DT_F32, DTYPE_NUMPY,
-    HEADER_STRUCT, INSTR_STRUCT, MAGIC, OP_ADD_F32, OP_FILL_F32, OP_IOTA_F32,
-    OP_LTS_F32, OP_MUL_F32, OP_NAMES, OP_NOP, OP_SUB_F32, OP_WHILE,
+    HEADER_STRUCT, INSTR_STRUCT, MAGIC, OP_ADD_F32, OP_AFFINE_F32, OP_FILL_F32,
+    OP_IOTA_F32, OP_LTS_F32, OP_MUL_F32, OP_NAMES, OP_NOP, OP_SUB_F32, OP_WHILE,
     SECTION_ALIGN, VERSION,
 )
 from . import scheduler as S
@@ -84,6 +84,7 @@ class Instr:
     n: int
     imm: int
     aux: int = 0
+    imm2: int = 0       # OP_AFFINE_F32's t bits (8th instr word); 0 otherwise
 
 
 @dataclasses.dataclass
@@ -236,11 +237,13 @@ def parse(data: bytes) -> Program:
     check_aligned("instructions")
     instrs: list[Instr] = []
     for i in range(n_instrs):
-        op, dst, a, b, n, imm, aux_off, pad1 = INSTR_STRUCT.unpack_from(data, pos)
+        op, dst, a, b, n, imm, aux_off, imm2 = INSTR_STRUCT.unpack_from(data, pos)
         pos += INSTR_STRUCT.size
         if op not in OP_NAMES:
             raise FormatError(f"instr[{i}] unknown opcode {op}")
-        if pad1 != 0:
+        # the 8th word is a second immediate for OP_AFFINE_F32 (t bits); it must
+        # stay a zero padding word for every other opcode.
+        if imm2 != 0 and op != OP_AFFINE_F32:
             raise FormatError(f"instr[{i}] nonzero padding")
         if aux_off > n_aux:
             raise FormatError(f"instr[{i}] aux offset {aux_off} > n_aux {n_aux}")
@@ -256,7 +259,7 @@ def parse(data: bytes) -> Program:
                 if buf_id >= n_buffers and not (op == OP_NOP and buf_id == 0):
                     raise FormatError(
                         f"instr[{i}] {name}={buf_id} out of range")
-        instrs.append(Instr(op, dst, a, b, n, imm, aux_off))
+        instrs.append(Instr(op, dst, a, b, n, imm, aux_off, imm2))
 
     # schedule sections (v3, 8B-aligned). Present in real files; a tensor-only
     # file (schedule=None at serialize time) simply has no trailing bytes.

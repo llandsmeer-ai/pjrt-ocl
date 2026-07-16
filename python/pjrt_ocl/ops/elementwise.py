@@ -228,6 +228,41 @@ for _name, _opcode, _subop, _npfn in _UNOPS:
     _register_unop(_name, _opcode, _subop, _npfn)
 
 
+# --- fused scalar affine: d = a*s + t (lowering emits it; no stablehlo op) ----
+# s/t ride in Instr.imm/aux as f32 bit patterns; the device reads them from the
+# task's p2/p3 (SUB_AFFINE in ops/ew.cl). One tensor operand (a), so reads={a}
+# and b self-aliases a (unary convention; keeps sim/validation in-bounds).
+SUB_AFFINE = 40
+
+
+def _affine_to_task(ins) -> Task:
+    return Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.a,
+                p0=SUB_AFFINE, p1=ins.n, p2=ins.imm, p3=ins.imm2)
+
+
+def _affine_interp(ins, rt) -> None:
+    a = rt.view(ins.a, ins.n)
+    s = rt.f32_from_bits(ins.imm)
+    t = rt.f32_from_bits(ins.imm2)
+    rt.view(ins.dst, ins.n)[:] = (a * np.float32(s) + np.float32(t)).astype(
+        np.float32)
+
+
+def _affine_reads(ins) -> set:
+    return {ins.a}
+
+
+def _affine_ew_sim(a, b, task, rt, lo, hi):
+    s = np.float32(rt.f32_from_bits(task.p2))
+    t = np.float32(rt.f32_from_bits(task.p3))
+    return (a * s + t).astype(np.float32)
+
+
+opsem.register(L.OP_AFFINE_F32, to_task=_affine_to_task, interp=_affine_interp,
+               reads=_affine_reads)
+opsem.register_ew_sim(SUB_AFFINE, _affine_ew_sim)
+
+
 # --- compare -----------------------------------------------------------
 
 @L.handles("stablehlo.compare")

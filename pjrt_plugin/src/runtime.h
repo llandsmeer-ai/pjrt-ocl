@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #define CL_TARGET_OPENCL_VERSION 300
@@ -111,9 +112,29 @@ class OclRuntime {
   const DeviceInfo& info() const { return info_; }
 
   cl_context ctx() const { return ctx_; }
+  cl_device_id dev() const { return dev_; }
   cl_command_queue queue() const { return queue_; }
   cl_kernel vm_kernel() const { return vm_kernel_; }
   cl_kernel vm_seg_kernel() const { return vm_seg_kernel_; }
+  cl_kernel vm_one_kernel() const { return vm_one_kernel_; }
+  cl_kernel mm_kernel() const { return mm_kernel_; }
+  // Execution trace (PJRT_OCL_VM_TRACE=<path>): host-dispatch is forced and
+  // every schedule entry runs as its own single-workgroup launch on a per-lane
+  // profiling queue; per-entry device timestamps are appended to <path> as one
+  // JSON line per Execute. For engineering timeline plots (tools/
+  // plot_schedule.py) — per-entry launches add overhead, don't benchmark it.
+  const std::string& trace_path() const { return trace_path_; }
+  // True while the first-run cost calibration executes its µbenchmark
+  // programs: they must run on the UNTRACED path (per-entry trace launches
+  // would distort the measured per-tile costs and pollute the trace file).
+  bool trace_suppressed() const { return trace_suppressed_; }
+  // Measured per-tile-op cost model (docs/decisions.md #1): Create() runs a
+  // first-run µbenchmark per tile-op family (slope over two tile counts, so
+  // launch overhead cancels) and caches the result as JSON keyed by
+  // (platform, device, driver). Empty when calibration is disabled
+  // (PJRT_OCL_CALIBRATE=0), superseded by a user PJRT_OCL_COST_TABLE, or
+  // failed. PJRT_OCL_CALIBRATE=1 forces re-measurement past the cache.
+  const std::string& cost_table_path() const { return cost_table_path_; }
   cl_uint ngroups() const { return ngroups_; }
   size_t local_size() const { return local_size_; }
   // Host-dispatch engine: the host drives control flow and enforces the
@@ -132,13 +153,31 @@ class OclRuntime {
                      std::string* err);
   bool ReadFromDevice(cl_mem src, void* host, size_t bytes, std::string* err);
 
+  // Size-keyed cl_mem pool. Fresh device allocations of >=2 MB hit a slow
+  // driver path (measured: ~0.1 ms on NVIDIA, done lazily on first kernel
+  // write) — costly when a fresh output buffer is allocated every execute.
+  // PoolAlloc reuses a same-size buffer if one was recently freed (PoolFree),
+  // else allocates. Thread-safe (own mutex, independent of the execute mutex).
+  cl_mem PoolAlloc(size_t bytes, std::string* err);
+  void PoolFree(cl_mem m, size_t bytes);
+
+  // 1-byte placeholder bound to unused kernel I/O ports (never dereferenced).
+  cl_mem dummy_buf() const { return dummy_buf_; }
+
  private:
   OclRuntime() = default;
   // Launches vm2 in probe mode (nlanes=0 sentinel) with an oversized grid and
   // returns the measured co-resident workgroup count for the REAL vm2 kernel
   // (poc/08 discovery protocol — deadlock-free for any launch size). 0 on any
-  // CL error (caller falls back to the heuristic).
+  // CL error (caller falls back to the heuristic). Runs before
+  // CalibrateCosts so lane sizing is final before any program executes
+  // (calibration programs are n_lanes=1 today, but keep the invariant).
   cl_uint ProbeResidency();
+  // First-run µbenchmark: measure per-tile costs for the tile-op families the
+  // scheduler's cost model keys on, write/reuse the cached JSON, set
+  // cost_table_path_. Never fails the client — on any error the path stays
+  // empty (scheduler falls back to unit costs).
+  void CalibrateCosts();
   DeviceInfo info_;
   cl_device_id dev_ = nullptr;
   cl_context ctx_ = nullptr;
@@ -146,10 +185,19 @@ class OclRuntime {
   cl_program program_ = nullptr;
   cl_kernel vm_kernel_ = nullptr;
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
+  cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
+  cl_kernel mm_kernel_ = nullptr;      // standalone SGEMM (pure-matmul fast path)
+  std::string trace_path_;             // empty = tracing off
+  bool trace_suppressed_ = false;      // true during cost calibration
+  std::string cost_table_path_;        // measured cost JSON ("" = unit costs)
+  cl_mem dummy_buf_ = nullptr;         // placeholder for unused I/O ports
   cl_uint ngroups_ = 0;    // co-resident workgroups (GPUs: measured, poc/08)
   size_t local_size_ = 64;
   bool host_dispatch_ = false;
   std::mutex mu_;  // serializes execute (single in-order queue)
+  std::mutex pool_mu_;
+  std::unordered_map<size_t, std::vector<cl_mem>> buf_pool_;
+  static constexpr size_t kPoolPerSize = 4;  // cap per size (bounds memory)
 };
 
 // ---- Loaded program (one per PJRT executable) ------------------------------
@@ -185,6 +233,12 @@ class LoadedProgram {
   // them. Reads while-cond scalars from the arena between phases. Caller holds
   // the runtime mutex; blocks until the program completes.
   bool LaunchHostDispatch(cl_command_queue q, std::string* err);
+  // Pure-matmul fast path: launch the standalone mm2 SGEMM (one workgroup per
+  // 128x128 output tile) instead of the megakernel. Only taken when mm_ok_.
+  bool LaunchMatmul(cl_command_queue q, std::string* err);
+  // Trace mode: lazily creates the per-lane profiling queues (one per lane so
+  // lanes run concurrently, like workgroups of one launch do).
+  bool EnsureTraceQueues(std::string* err);
   OclRuntime* rt_ = nullptr;  // borrowed; client outlives executables
   VmProgram prog_;
   cl_mem arena_ = nullptr;
@@ -195,6 +249,25 @@ class LoadedProgram {
   cl_mem bar_buf_ = nullptr;
   cl_mem stats_buf_ = nullptr;
   cl_mem seg_tab_buf_ = nullptr;   // host-dispatch: per-lane {off,count} u2
+  std::vector<cl_command_queue> trace_queues_;  // trace mode, one per lane
+
+  // Zero-copy I/O ports (docs/decisions.md): up to kNIoPorts input/output
+  // buffers are passed straight to the kernel instead of copied through the
+  // arena. input_port_[i] / output_port_[o] = the port for that I/O buffer, or
+  // -1 to fall back to an arena copy. io_bufs_ is the per-execute cl_mem bound
+  // to each port (dummy for unused), filled by ExecuteDevice and read by the
+  // Launch* helpers.
+  static constexpr int kNIoPorts = 8;   // must match VMO_N_IO in vm_common.cl
+  std::vector<int> input_port_;
+  std::vector<int> output_port_;
+  std::vector<cl_mem> io_bufs_;         // size kNIoPorts
+
+  // Pure-matmul fast path (docs/decisions.md #9b): the program is a single
+  // TILE_MMA task, no barriers/control, so ExecuteDevice dispatches the
+  // standalone mm2 kernel. mm_{dst,a,b}_ are the offset/port-patched handles.
+  bool mm_ok_ = false;
+  uint32_t mm_M_ = 0, mm_N_ = 0, mm_K_ = 0;
+  uint32_t mm_dst_ = 0, mm_a_ = 0, mm_b_ = 0;
 };
 
 // ---- Lowering subprocess ----------------------------------------------------

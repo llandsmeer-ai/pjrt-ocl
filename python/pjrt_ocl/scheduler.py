@@ -288,68 +288,41 @@ def _instr_to_task(ins: L.Instr, buffers) -> Task:
 
 # --- lane packing within a level (LPT by cost) ------------------------------
 
-def _allocate_lanes(costs: list[float], tiles: list[int],
-                    n_lanes: int) -> list[int]:
-    """Lanes-per-task, proportional to cost share via LPT top-up: seed 1 lane
-    each, then repeatedly hand a lane to the task with the highest per-lane
-    cost that can still absorb one (lanes < tiles). Each task gets >=1 and
-    <= tiles lanes; total <= n_lanes. Precondition: len(costs) <= n_lanes."""
-    n = len(costs)
-    lanes = [1] * n                     # tiles >= 1 always, so 1 lane min is valid
-    remaining = n_lanes - sum(lanes)
-    while remaining > 0:
-        best, best_val = -1, -1.0
-        for i in range(n):
-            if lanes[i] < tiles[i]:
-                v = costs[i] / lanes[i]
-                if v > best_val:
-                    best, best_val = i, v
-        if best < 0:
-            break                       # every task capped at its tile count
-        lanes[best] += 1
-        remaining -= 1
-    return lanes
-
-
 def _pack_level(level_tasks: list[tuple[int, Task]], n_lanes: int,
                 config: DeviceConfig) -> list[tuple[int, Entry]]:
     """Return [(lane, Entry)] for one dataflow level.
 
-    Primary regime (n_tasks <= n_lanes): each task owns a disjoint contiguous
-    block of lanes (count proportional to cost); its tiles split evenly and
-    contiguously across those lanes; one entry per (task, lane).
-
-    Overflow regime (n_tasks > n_lanes, not reachable from current lowering):
-    LPT bin-pack whole tasks onto lanes (each task one entry covering all its
-    tiles on the least-loaded lane) — keeps "one entry per (task, lane-range)"
-    valid and every task on >=1 lane. Recorded in NOTES.md."""
+    Chunk + LPT packing (one regime for any task count): each task is split
+    into k = min(tiles, ceil(n_lanes * cost_share)) contiguous tile chunks —
+    an expensive task fans out over many (up to all) lanes, a cheap one stays
+    a single entry — then every chunk is list-scheduled (LPT, cost-descending)
+    onto the least-loaded lane. A lane may carry SEVERAL entries in one level:
+    that is what lets the scheduler sequentialize cheap tasks behind chunks of
+    an expensive one instead of dedicating whole lanes to them (with measured
+    costs the diamond example packs the matmul on all lanes and stacks the two
+    elementwise ops behind it — docs/decisions.md #1 trace-mode findings).
+    Ties break deterministically (task id, then chunk index / lane index)."""
     infos = []                          # (task_id, tiles, cost)
     for tid, task in level_tasks:
         tiles = task.n_tiles()
         infos.append((tid, tiles, tiles * config.unit_cost(task.tile_op)))
-    n = len(infos)
     result: list[tuple[int, Entry]] = []
-    if n == 0:
+    if not infos:
         return result
-    if n <= n_lanes:
-        lanes_for = _allocate_lanes([c for _, _, c in infos],
-                                    [t for _, t, _ in infos], n_lanes)
-        cursor = 0
-        for (tid, tiles, _), k in zip(infos, lanes_for):
-            for j in range(k):
-                lo = tiles * j // k
-                hi = tiles * (j + 1) // k
-                result.append((cursor + j, Entry(tid, lo, hi)))
-            cursor += k
-        return result
-    # overflow: LPT bin-pack (cost desc onto least-loaded lane)
-    order = sorted(range(n), key=lambda i: -infos[i][2])
+    total = sum(c for _, _, c in infos) or 1.0
+    chunks = []                         # (chunk_cost, task_id, tile_lo, tile_hi)
+    for tid, tiles, cost in infos:
+        k = min(tiles, max(1, math.ceil(n_lanes * cost / total)))
+        for j in range(k):
+            lo = tiles * j // k
+            hi = tiles * (j + 1) // k
+            chunks.append((cost * (hi - lo) / tiles, tid, lo, hi))
+    chunks.sort(key=lambda c: (-c[0], c[1], c[2]))
     loads = [0.0] * n_lanes
-    for i in order:
-        tid, tiles, cost = infos[i]
+    for chunk_cost, tid, lo, hi in chunks:
         lane = min(range(n_lanes), key=lambda l: loads[l])
-        result.append((lane, Entry(tid, 0, tiles)))
-        loads[lane] += cost
+        result.append((lane, Entry(tid, lo, hi)))
+        loads[lane] += chunk_cost
     return result
 
 
