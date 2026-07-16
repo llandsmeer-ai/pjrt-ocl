@@ -130,9 +130,12 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
                         uint tile, uint dt, __local float *As, uint lid, uint lsz)
 {
     const uint n_out = t.p0, seg = t.p1, kind = t.p2;
-    const uint o = tile;
-    if (o >= n_out) return;                 /* uniform: scheduler never over-assigns */
+    const uint o = tile;                    /* scheduler never assigns o >= n_out */
     const uint base = o * seg;
+    /* NOTE: no early `return` here — a conditional return before the workgroup
+     * barriers below makes PoCL's parallel-region analysis assert
+     * (region_entry_barrier != NULL). All work-items in a workgroup share `tile`,
+     * so the barriers are reached uniformly. */
     if (dt == DT_I32 || dt == DT_U32) {
         __global const int *a = AP(const int, t.a);
         __local int *Ai = (__local int *)As;
@@ -153,7 +156,6 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         if (lid == 0) AP(int, t.dst)[o] = Ai[0];
-        barrier(CLK_LOCAL_MEM_FENCE);        /* free As before the next segment */
         return;
     }
     __global const float *a = AP(const float, t.a);
@@ -175,7 +177,6 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     if (lid == 0) AP(float, t.dst)[o] = As[0];
-    barrier(CLK_LOCAL_MEM_FENCE);
 }
 
 static void vmo_reduce_comb_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint dt,
