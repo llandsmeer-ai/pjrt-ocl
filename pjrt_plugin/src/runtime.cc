@@ -466,17 +466,19 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   cl_uint cu = rt->info_.compute_units ? rt->info_.compute_units : 1;
   rt->local_size_ = 256;
   rt->ngroups_ = rt->info_.is_gpu ? 2 * cu : cu;
+  cl_uint measured_res = 0;
   if (rt->info_.is_gpu)
-    if (cl_uint measured = rt->ProbeResidency())
-      rt->ngroups_ = std::min(rt->ngroups_, measured);
+    if ((measured_res = rt->ProbeResidency()))
+      rt->ngroups_ = std::min(rt->ngroups_, measured_res);
   if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
   if (const char* v = std::getenv("PJRT_OCL_INFO"); v && v[0])
     std::fprintf(stderr,
-                 "[pjrt-ocl] engine=%s in-program-matmul=%s lanes=%u\n",
+                 "[pjrt-ocl] engine=%s in-program-matmul=%s lanes=%u "
+                 "measured-residency=%u\n",
                  rt->host_dispatch_ ? "host" : "mega",
                  rt->vm_tc_kernel_ ? "TF32-tensor-core" : "portable-fp32",
-                 rt->ngroups_);
+                 rt->ngroups_, measured_res);
   // Calibration executes µbenchmark programs through the normal engine, so
   // lane sizing must be final first. (Today's calibration programs are all
   // n_lanes=1 and immune to oversubscription; the ordering keeps that from
