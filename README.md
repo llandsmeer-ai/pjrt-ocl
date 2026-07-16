@@ -128,7 +128,7 @@ Anything unsupported raises a clear `LoweringError` naming the op.
 ## Hardware tested & benchmarks
 
 Correctness comes first; performance is early. Every device below runs the full
-test suite (198 tests: op families x the dtype matrix + e2e); benchmarks are
+test suite (240 tests: op families x the dtype matrix + e2e); benchmarks are
 per-op wall-clock vs problem size N so you can judge whether the library is
 worth it for *your* sizes and hardware. New devices go through
 [`docs/hardware-bringup.md`](docs/hardware-bringup.md).
@@ -161,13 +161,17 @@ Takeaways (higher = slower; both axes log):
 - **`matrix × vector`** ~3.7x — memory-bound but routed through the tiled MMA
   kernel, which wastes most of a tile on a width-1 RHS; a dedicated GEMV kernel
   would close most of this.
-- **`dot_general`** ~5.5x off cuBLAS at 2048³. Large matmul now runs a
-  **standalone SGEMM** (`mm2`, launched outside the megakernel so an 8×4 register
-  tile doesn't inflate the shared register budget) — 17→21 TFLOP/s at 2048.
-  But cuBLAS hits **134 TFLOP/s at 4096, above Blackwell's f32 peak**, i.e. it is
-  TF32 **tensor-core** bound; a portable f32 kernel can't reach that. Closing the
-  rest needs an NVIDIA-only TF32 tensor-core tile (inline-PTX WMMA behind the
-  kernel-table override — the `mm2` dispatch path is built to host it).
+- **`dot_general`.** Large matmul runs a **standalone SGEMM** (`mm2`, launched
+  outside the megakernel so an 8×4 register tile doesn't inflate the shared
+  register budget). cuBLAS hits **134 TFLOP/s at 4096, above Blackwell's f32
+  peak** — i.e. it is TF32 **tensor-core** bound, which a portable f32 kernel
+  can't reach. So there's now an **NVIDIA-only TF32 tensor-core path** (inline-PTX
+  `wmma` behind the `VMO_NV_PTX` build, portable f32 fallback intact), with a
+  bank-conflict-free staging tile — ~18–20 TFLOP/s in the megakernel. It stays
+  short of cuBLAS because the in-kernel tile is **arithmetic-intensity-capped**:
+  the tile can't grow without dropping below the co-residency the persistent
+  megakernel's cross-workgroup barrier requires. See the end-to-end transformer
+  numbers below for where this lands on a real workload.
 - **`while` loops** went from **~28x to ~4x** at 16M elements. Three fixes:
   (1) an **affine op** `d = a·s + t` that folds scalar-constant scale/bias
   (`x*1.5+1` was materializing two full-length broadcast buffers per iteration →
@@ -179,6 +183,34 @@ Takeaways (higher = slower; both axes log):
 
 The remaining end-to-end gap on the closest ops is largely fixed jax→PJRT
 per-dispatch overhead, which amortizes in real fused programs.
+
+#### End-to-end: a GPT-style transformer (`tools/bench_transformer.py`)
+
+A realistic forward pass — batched multi-head attention, layernorm, GELU FFN,
+residuals (random weights) — run through the full plugin and checked against a
+JAX-CPU reference (`--check`, f32-exact on the portable path). This is the
+apples-to-apples "does a real workload work, and how close are we?" test.
+NVIDIA (TF32 tensor cores on), vs native JAX CUDA on the same GPU:
+
+| config (D, ff, layers) | ours | native CUDA | gap | ours throughput |
+|------------------------|------|-------------|-----|-----------------|
+| base (512, 2048, 6)    | 9.7 ms | 0.45 ms | 22× | 2.2 TFLOP/s |
+| large (1024, 4096, 6)  | 33.5 ms | 3.6 ms | **9.2×** | **10.0 TFLOP/s** |
+
+The gap **more than halves as the model gets compute-bound** (and holds at full
+depth): `base`'s 22× is small-op/overhead-bound, not a matmul deficit — on
+compute-heavy work we sustain **~10 TFLOP/s within ~9× of cuBLAS**. Getting here
+took a campaign of general mechanisms, each of which helps any workload:
+segmented (workgroup-collaborative) reductions for softmax/layernorm; an
+**access-map fusion** pass that folds transposes/reshapes/broadcasts into the
+consuming operand's strided read (no materialization, no barrier); **arena
+liveness-reuse** (bounds device memory by peak live set, not the sum of all
+temporaries — cut the `base` arena 716→105 MiB and unblocked `large` entirely,
+which otherwise overflowed the address space); and TF32 tensor-core matmul with
+a bank-conflict-free staging tile. The residual gap is matmul: the in-megakernel
+tile is arithmetic-intensity-capped by the persistent-kernel co-residency the
+cross-workgroup barrier needs, so closing it further needs a hybrid
+megakernel-plus-standalone-launch split (the documented next lever).
 
 ### Intel Arc 140V (Xe2, Lunar Lake iGPU) — vs JAX CPU
 
