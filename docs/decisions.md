@@ -583,3 +583,17 @@ built to host it.
 - 🧭 Remaining known gaps, deliberately deferred: CPU matmul cache blocking (~8x to Eigen),
   reduce 2x, PoCL launch floor (~17-52 µs, PoCL-internal), i32/f16 EW tiles still scalar on CPU
   (extend vmo_ew_bin8 pattern when a workload cares).
+- ✅ **Low-N + matmul follow-up (2026-07-17, poc/10 + phase batching):**
+  - Low-N root cause MEASURED (PJRT_OCL_PHASES): every host-dispatch phase paid a blocking
+    seg_tab write + clFinish (~66 µs on PoCL); a small dynamic_slice is 3 phases, a while
+    iteration ~3. FIX: 256-slot seg_tab ring + staged phases flushed as ONE non-blocking write
+    + k kernel enqueues per drain group; drains only at while-cond reads (implicit), ring wrap,
+    program end. A/B at 262K: gather −33%, while −36%, single-phase ops unchanged. Remaining
+    while floor = the per-iteration cond read; the structural fix is §10a's barrier elision
+    (designed, still not built) or scheduler-side cond+body phase fusion.
+  - CPU SGEMM cache-blocking ladder (poc/10, each step verified): packed B panels 1.6x,
+    6x16 register block 1.45x, KC=512 sweeps 1.27x → in-VM 2048: 268 → **110 ms
+    (156 GFLOP/s, 2.6x off Eigen; 88x at the start of the CPU work)**. Default CPU matmul;
+    `PJRT_OCL_MM_CPU=reg` keeps the register kernel (per-hardware choice + ragged-N fallback).
+    Stop point recorded: packed A / prefetch / per-core-type tiles not worth it for a debug
+    backend.
