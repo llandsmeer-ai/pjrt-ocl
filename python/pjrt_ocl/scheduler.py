@@ -157,8 +157,8 @@ class Task:
             return max(1, math.ceil(self.p0 / self.p1)) if self.p1 else 1
         if self.tile_op == TILE_REDUCE_COMB:
             return 1
-        if self.tile_op == TILE_RED_SEG:      # tiled over the n_out outputs (p0)
-            return max(1, math.ceil(self.p0 / TILE_SIZE))
+        if self.tile_op == TILE_RED_SEG:      # ONE segment per tile (p0 = n_out)
+            return max(1, self.p0)
         raise ScheduleError(f"n_tiles: unknown tile_op {self.tile_op}")
 
 

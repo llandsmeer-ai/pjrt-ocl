@@ -121,37 +121,61 @@ static void vmo_reduce_part_tile(__global uchar *arena, __global uchar **iop, co
  * (p0=n_out, p1=seg, p2=kind). One work-item per output element (grid-stride);
  * the per-segment reduce is serial (softmax/layernorm segments are small). This
  * is the partial-axis reduction the two-phase flat model can't express. */
+/* TOP_RED_SEG: ONE segment per tile, reduced COLLABORATIVELY by the whole
+ * workgroup via a local-memory tree — so n_out tiles spread over all lanes and
+ * every workgroup is busy (thread-per-output starved on layernorm's n_out=512:
+ * one workgroup). tile = segment index o; the reduction runs over the seg
+ * contiguous inputs at [o*seg, (o+1)*seg). `As` is the workgroup's local tree. */
 static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const task_t t,
-                        uint tile, uint dt, uint lid, uint lsz)
+                        uint tile, uint dt, __local float *As, uint lid, uint lsz)
 {
     const uint n_out = t.p0, seg = t.p1, kind = t.p2;
-    const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n_out);
+    const uint o = tile;
+    if (o >= n_out) return;                 /* uniform: scheduler never over-assigns */
+    const uint base = o * seg;
     if (dt == DT_I32 || dt == DT_U32) {
         __global const int *a = AP(const int, t.a);
-        __global int *d = AP(int, t.dst);
-        for (uint o = lo + lid; o < hi; o += lsz) {
-            int acc = kind == 0 ? 0 : kind == 1 ? INT_MIN : kind == 2 ? INT_MAX : 1;
-            for (uint j = o * seg; j < o * seg + seg; ++j) {
-                const int v = a[j];
-                acc = kind == 0 ? acc + v : kind == 1 ? max(acc, v)
-                    : kind == 2 ? min(acc, v) : acc * v;
-            }
-            d[o] = acc;
+        __local int *Ai = (__local int *)As;
+        int acc = kind == 0 ? 0 : kind == 1 ? INT_MIN : kind == 2 ? INT_MAX : 1;
+        for (uint j = lid; j < seg; j += lsz) {
+            const int v = a[base + j];
+            acc = kind == 0 ? acc + v : kind == 1 ? max(acc, v)
+                : kind == 2 ? min(acc, v) : acc * v;
         }
+        Ai[lid] = acc;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint s = lsz / 2; s > 0; s >>= 1) {
+            if (lid < s) {
+                const int x = Ai[lid], y = Ai[lid + s];
+                Ai[lid] = kind == 0 ? x + y : kind == 1 ? max(x, y)
+                        : kind == 2 ? min(x, y) : x * y;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) AP(int, t.dst)[o] = Ai[0];
+        barrier(CLK_LOCAL_MEM_FENCE);        /* free As before the next segment */
         return;
     }
     __global const float *a = AP(const float, t.a);
-    __global float *d = AP(float, t.dst);
-    for (uint o = lo + lid; o < hi; o += lsz) {
-        float acc = kind == 0 ? 0.0f : kind == 1 ? -INFINITY
-                  : kind == 2 ? INFINITY : 1.0f;
-        for (uint j = o * seg; j < o * seg + seg; ++j) {
-            const float v = a[j];
-            acc = kind == 0 ? acc + v : kind == 1 ? fmax(acc, v)
-                : kind == 2 ? fmin(acc, v) : acc * v;
-        }
-        d[o] = acc;
+    float acc = kind == 0 ? 0.0f : kind == 1 ? -INFINITY
+              : kind == 2 ? INFINITY : 1.0f;
+    for (uint j = lid; j < seg; j += lsz) {
+        const float v = a[base + j];
+        acc = kind == 0 ? acc + v : kind == 1 ? fmax(acc, v)
+            : kind == 2 ? fmin(acc, v) : acc * v;
     }
+    As[lid] = acc;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint s = lsz / 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            const float x = As[lid], y = As[lid + s];
+            As[lid] = kind == 0 ? x + y : kind == 1 ? fmax(x, y)
+                    : kind == 2 ? fmin(x, y) : x * y;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) AP(float, t.dst)[o] = As[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
 }
 
 static void vmo_reduce_comb_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint dt,
