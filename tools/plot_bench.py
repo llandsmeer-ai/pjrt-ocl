@@ -250,10 +250,30 @@ def main():
     ap.add_argument("--out", default=str(REPO / "tools" / "bench_plot.png"))
     ap.add_argument("--replot", metavar="CSV",
                     help="skip benchmarking; re-render the plot from a CSV")
+    ap.add_argument("--compare", nargs=2, metavar=("CSV_A", "CSV_B"),
+                    help="skip benchmarking; plot CSV_A's ours_ms against "
+                         "CSV_B's ours_ms (e.g. GPU vs CPU through the "
+                         "plugin). --labels names the two sides.")
+    ap.add_argument("--labels", nargs=2, default=["A", "B"],
+                    help="with --compare: device labels for CSV_A / CSV_B")
     args = ap.parse_args()
 
     if args.worker:
         raise SystemExit(run_worker(args.worker))
+
+    if args.compare:
+        def ours_col(path):
+            d: dict = {}
+            with open(path) as f:
+                next(f)
+                for line in f:
+                    op, n, om, _rm = line.rstrip("\n").rsplit(",", 3)
+                    d.setdefault(op, {})[int(n)] = float(om)
+            return d
+        a, b = (ours_col(p) for p in args.compare)
+        plot(a, b, f"ours (OpenCL/{args.labels[1]})", args.labels[0],
+             pathlib.Path(args.out))
+        return
 
     if args.replot:
         ours, refd, ref_label = {}, {}, "JAX CUDA (native)"
