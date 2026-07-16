@@ -186,15 +186,22 @@ def test_golden_layout_jax_lowered_add():
     assert (n_buffers, n_instrs, n_consts, main_len) == (3, 1, 0, 1)
     assert (n_inputs, n_outputs) == (2, 1)
     assert (n_aux, hpad) == (0, 0)
-    assert arena_bytes == 3 * 64  # three f32[8] buffers, 64B-aligned slots
+    # three f32[8] buffers, all live in the single phase (inputs pinned from the
+    # start, output to the end) => three distinct 64B-aligned slots. The
+    # liveness allocator (§16) assigns offsets by interval, not buffer-id order,
+    # so assert the SET of offsets rather than off == i*64.
+    assert arena_bytes == 3 * 64
     pos = 48
 
+    offsets = []
     for i in range(n_buffers):
         off, size, dtype, pad = struct.unpack_from("<QQII", blob, pos)
-        assert off == i * 64 and off % 64 == 0
+        assert off % 64 == 0 and off + size <= arena_bytes
         assert size == 8 * 4
         assert dtype == 0 and pad == 0
+        offsets.append(off)
         pos += 24
+    assert sorted(offsets) == [0, 64, 128]        # a permutation of the 3 slots
 
     assert pos % 8 == 0
     assert struct.unpack_from("<II", blob, pos) == (0, 1)     # inputs map

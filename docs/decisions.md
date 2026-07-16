@@ -915,15 +915,66 @@ deferred and never done (the only reuse today is the narrow in-place while-carry
 **Not** a resource limit (device max-alloc 23.7 GB, biggest single tensor 33.6 MB) and **not**
 the megakernel/barrier (individual large matmuls, softmax, layernorm all run fine; L=1 runs).
 
-**Fix (delegated 2026-07-16)**: a post-emission **liveness-reuse pass** that reassigns arena
-offsets by live interval (linear-scan / register-allocation style), keeping the arena bounded by
-peak concurrent liveness. Bounds the `large` arena to ~one layer's peak (weights are inputs/ports;
-activations reused across layers) — well under 2^31. Also cuts memory + improves cache for **every**
-config. Correctness-critical (early free = silent corruption): must keep outputs live to end,
-constants pinned (uploaded once at load), I/O ports out of the arena, WHILE/IF region operands
-live across the whole region, in-place aliasing, and viewfold gather sources live for their
-viewers. Verify: arena size drops, 215 pytest pass, transformer correct on both devices/both mm
-variants, and `large` lowers < 2^31 and matches JAX-CPU.
+**SHIPPED 2026-07-16 (`lowering._reuse_arena`, runs in `lower_module` after
+`_compose_affines`/`_fuse_matmul_views`/`_fuse_views`/`_dce_nops`, before the 2^31 cap backstop).**
+Buffer IDs are UNCHANGED — only `Buffer.arena_byte_offset` moves; everything downstream keys on IDs
+(scheduler patches offsets from the buffer table, runtime/validators read the table). No C++ change.
+
+- **KEY CORRECTNESS INSIGHT — liveness is measured in scheduler PHASE time, NOT program-instruction
+  order.** The scheduler runs independent ops in PARALLEL across lanes and inserts a global barrier
+  only BETWEEN phases (`_build_levels`/`_phases`). It assumes SSA (each buffer written once) and by
+  design adds **no WAR edge** (`_depends` omits WAR). Aliasing two buffer IDs onto one offset
+  introduces exactly a WAR hazard the scheduler can't see — so instruction-order liveness would be
+  *silently wrong*: an independent producer/consumer pair that lands in the SAME phase runs
+  concurrently on different lanes, and the recycled slot's write races the still-live read. The fix
+  is to alias only when a **barrier is guaranteed** between the last use of one buffer and the first
+  def of the other, i.e. their PHASE intervals are disjoint. The pass recomputes the phase partition
+  from the SAME instrs + `PJRT_OCL_FUSE` flag the real scheduler uses (offsets don't affect it, so it
+  matches the schedule that will execute) by instantiating a throwaway `_Scheduler` and calling
+  `_build_levels(range(main_len))`. First cut used instruction index — caught immediately by
+  reasoning about `_cross_lane_dep`; phase time is the corrected model.
+- **Algorithm**: per-buffer live interval `[lo,hi]` in phase time (a phase = one entry of
+  `_build_levels`; each WHILE/FOR is its own "while" phase). Then offline greedy placement: biggest
+  buffer first, lowest 64B-aligned offset whose `[off,off+size)` misses every already-placed buffer
+  with an *overlapping* phase interval (inclusive overlap ⇒ two buffers sharing a phase never share a
+  slot). O(n²) over a few hundred–thousand buffers — negligible.
+- **Regions**: a WHILE/FOR's ENTIRE sub-list (every iteration, nested regions included — expanded
+  transitively via the instr's cond/body ranges) and its carries collapse to the region op's single
+  phase. So nothing a region touches is reused *within or across* the region. Conservative but safe;
+  while/for arenas are tiny anyway. Carry init-copies (root, before the region) + result-aliases
+  (root, after) naturally extend the carry interval across the whole region span.
+- **Pins**: inputs `lo=0` (non-port inputs are bulk-copied into the arena BEFORE phase 0, so a
+  reused slot could otherwise be clobbered by the initial copy-in — this pin is load-bearing);
+  outputs `hi=end` (D2H after the program); consts `[0,end]` (uploaded once at load). Zero-copy I/O
+  PORTS (bit 31, assigned by the runtime for the first 8 in-XOR-out buffers) ignore the arena offset
+  entirely, so pinning + not-relocating them is automatic — but note only 8 ports exist, so the
+  `large` transformer's ~53 remaining weight tensors ARE non-port arena inputs (all live from phase
+  0), which is the arena's floor.
+- **Views**: a folded gather source (§13/§14a) is read by its viewer through the operand's `a`/`b`
+  field after the fold, so `_reads_of` already counts it as a read of the SOURCE — its interval
+  extends to its last viewer with no special-casing. Verified by the `q @ q.T` viewfold test.
+- **Before/after arena (PJRT_OCL_ARENA_DEBUG=1, this machine):** tiny 8.4→2.3 MiB (3.6×),
+  base **715.8→105.0 MiB (6.8×)**, `large` (6 layers) **6204→584 MiB (10.6×)** — was a hard
+  LoweringError at 2.17 GB @ L=2; now the full 6-layer `large` fits well under the 2 GiB cap.
+- **A bug the tests caught**: the golden byte-layout test (`test_golden_layout_jax_lowered_add`)
+  asserted `off == i*64` — a bump-allocator artifact. Reuse assigns offsets by interval (the output,
+  with the longest span, is placed first), so buffer 0 no longer sits at offset 0. The buffer-ID
+  fields (`ADD dst=2 a=0 b=1`) are unchanged and still correct; relaxed the assertion to "offsets are
+  a permutation of {0,64,128}, 64B-aligned, in range". This is exactly the right failure — it proved
+  offsets moved while IDs stayed stable.
+- **Verification matrix (all PASS):** 239 pytest (+5 new `tests/test_arena_reuse.py`: offset reuse,
+  peak-vs-sum bound, while-region safety, viewfold-source liveness, offset-in-range — each checked by
+  the dual vmreader validators) + 1 skip; runtime_test PoCL+NVIDIA. Transformer `--check` vs JAX-CPU:
+  NVIDIA TF32 tiny/small/base/large_l1/**large** all PASS (large max_abs 1.3e-2 = TF32 noise);
+  NVIDIA portable megakernel `MEGA_TC=0` base/large **f32-exact** (max_abs 1.2e-5/2.2e-6 — the
+  strongest no-corruption signal: an early free gives rel-err ≈ 1.0, §14a); NVIDIA `ENGINE=host`
+  small/base f32-exact; PoCL host-dispatch tiny/base f32-exact (2e-7/2e-6). `large` timing: **35.0
+  ms/iter (9.6 TFLOP/s)** OpenCL-NVIDIA vs 3.5 ms native CUDA (~10×) — it runs and is correct.
+- **Kept conservative** (correct-but-larger beats corruption): whole-region collapse (no reuse
+  inside a while/for body); inclusive phase-overlap (a producer/consumer handoff within one phase
+  doesn't share a slot); dead (DCE'd, never-referenced) buffers parked at offset 0. None of these
+  matter for the `large` arena (weights dominate its floor). A `PJRT_OCL_ARENA_DEBUG=1` stderr line
+  reports bump-vs-reuse sizes (env-gated, zero-cost otherwise) — kept as a permanent diagnostic.
 
 ## 17. Matmul launch geometry must key on `is_gpu`, not `host_dispatch` (found 2026-07-16)
 
