@@ -542,3 +542,38 @@ guard (poc first, per hard rules), via inline PTX `wmma.load.*.shared`/`wmma.mma
 (hgemmtest passes `__local` ptrs as `"l"` into `.shared` WMMA ops; CUTLASS
 `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`). The `mm2` dispatch path is already
 built to host it.
+
+## 11. Scheduler: fuse lane-local elementwise chains (2026-07-16)
+
+The scheduler split the dataflow into LEVELS (maximal antichains) with a global barrier
+between every level, so a dependency chain paid a barrier per step even when it was pure
+elementwise. But an elementwise dependency is **lane-local**: output element i reads only
+input element i, so a lane that owns tile T produces everything tile T needs. Chaining such
+ops on one lane per tile is strictly better than "parallel level + barrier + next level" —
+same compute wall-clock (two independent equal ops on half the lanes each = the two ops
+sequentially on all lanes), minus the barrier.
+
+**Algorithm (not a hack — a graph coarsening).** A barrier is emitted only on a CROSS-LANE
+edge: one where the producer or consumer is a *shaped* op (matmul/reduce/gather/broadcast/…,
+whose output tiling differs), or the element count changes. Same-index elementwise
+dependencies do NOT start a new phase. Within a phase, connected components of elementwise
+ops (under data deps) become fused **chains**; each chain is a *unit* fed to the existing
+chunk+LPT packer, which splits its tiles across lanes and emits the whole chain over each
+tile range. Independent units still fan out across lanes in parallel; a shaped op is just a
+singleton chain, so the matmul-∥-elementwise packing (docs §1 diamond) is unchanged.
+
+**No engine change, no fence.** Consecutive entries of a chain run over the *same* tile range
+on a lane, and each tile op's grid-stride loop is `for i=lo+lid; i<hi; i+=lsz` — so work-item
+`lid` writes then re-reads the *same* elements across ops (thread-local program order). The
+megakernel and host-dispatch both just run the extra entries; correctness needs neither a
+cross-workgroup barrier nor a work-group fence.
+
+Validator (vmreader) updated: a phase is no longer fully order-independent — entries within a
+lane are ordered (the chain). It now runs each lane's entries in sequence and only permutes
+LANE order (forward vs reverse) to assert no cross-lane write/read landed in one phase.
+
+**Measured** (deep 7-op elementwise chain, `PJRT_OCL_FUSE=0` reverts to per-level barriers):
+NVIDIA megakernel 1.06–1.19× (cheap in-kernel barriers); **PoCL host-dispatch 2.0–2.9×**
+(each phase there is a kernel launch + clFinish, 7→1). Correct vs JAX CPU on both. 199 pytest
++ runtime_test green. Does NOT reduce memory traffic (ops still each read/write their buffers)
+— that is elementwise *op* fusion (the affine folding, §10a), orthogonal to chaining.

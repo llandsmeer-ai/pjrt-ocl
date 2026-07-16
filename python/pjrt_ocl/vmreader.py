@@ -540,25 +540,41 @@ def execute_schedule(prog: Program, args: list[np.ndarray],
                 f"schedule simulator: tile_op {task.tile_op} not supported")
         sim(task, e, sim_rt)
 
-    def run_order(entries: list[tuple[int, ParsedEntry]], snapshot: np.ndarray):
+    def run_order(lane_ids, by_lane, snapshot: np.ndarray):
+        # Each lane runs its OWN entries in sequence (a lane's chain of
+        # elementwise ops is ordered); only the interleaving BETWEEN lanes is
+        # varied. Running lane-by-lane in `lane_ids` order is one valid
+        # interleaving that respects every lane's internal order.
         arena[:] = snapshot
-        for _lane, e in entries:
-            run_entry(e)
+        for lane in lane_ids:
+            for e in by_lane[lane]:
+                run_entry(e)
         return arena.copy()
 
     def run_batch(batch: list[tuple[int, ParsedEntry]]) -> None:
-        """Execute a barrier phase's entries; assert order-independence
-        (forward vs reverse must agree) and adopt the result."""
+        """Execute a barrier phase. Entries within a lane are ordered (a lane may
+        now carry a dependent elementwise CHAIN — same-index deps chain on one
+        lane, no barrier); entries ACROSS lanes must be independent. Assert that
+        by running the lanes in two opposite orders (each preserving intra-lane
+        order) and requiring agreement — a mismatch means a genuine cross-lane
+        write/read landed in one phase (a scheduler bug)."""
         if not batch:
             return
+        by_lane: dict[int, list[ParsedEntry]] = {}
+        order: list[int] = []
+        for lane, e in batch:
+            if lane not in by_lane:
+                by_lane[lane] = []
+                order.append(lane)
+            by_lane[lane].append(e)
         base = arena.copy()
-        forward = run_order(batch, base)
-        reverse = run_order(list(reversed(batch)), base)
+        forward = run_order(order, by_lane, base)
+        reverse = run_order(list(reversed(order)), by_lane, base)
         if not np.array_equal(forward, reverse):
             raise AssertionError(
                 "schedule phase is order-dependent: lanes conflict within a "
                 "barrier phase")
-        arena[:] = forward   # both orders agree; adopt the result
+        arena[:] = forward   # both lane orders agree; adopt the result
 
     if has_control:
         _run_control(sched, arena, view, run_batch)
