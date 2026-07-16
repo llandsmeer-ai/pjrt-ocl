@@ -867,15 +867,33 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     for (auto& t : tevs) clReleaseEvent(t.ev);
   };
 
+  // Phase seg-tabs are written into a ring of kSegSlots slots so phases can be
+  // ENQUEUED back-to-back without a clFinish each: the in-order queue already
+  // serializes phase k+1 after phase k — the per-phase clFinish (and blocking
+  // seg_tab write) only existed so the host could reuse ONE slot, and cost
+  // ~66 µs per phase on PoCL (measured: a small dynamic_slice is 3 phases, a
+  // while iteration ~3 — that per-phase sync was the whole small-N gap vs XLA
+  // CPU). The queue now drains only at while/if cond reads (the blocking read
+  // itself drains an in-order queue), at ring wrap, and once at the end.
+  constexpr uint32_t kSegSlots = 256;
   if (!seg_tab_buf_) {
     cl_int cerr;
     seg_tab_buf_ = clCreateBuffer(rt_->ctx(), CL_MEM_READ_ONLY,
-                                  sizeof(cl_uint) * 2 * n, nullptr, &cerr);
+                                  sizeof(cl_uint) * 2 * n * kSegSlots, nullptr,
+                                  &cerr);
     if (cerr != CL_SUCCESS) {
       *err = "host-dispatch: seg_tab alloc failed";
       return false;
     }
   }
+  // Host staging for in-flight (non-blocking) seg_tab writes: one slot per
+  // pending phase; must stay untouched until the next drain. Staged phases
+  // are flushed as ONE write + k kernel enqueues per drain group (PoCL
+  // charges ~17 us per enqueued command, so command count matters as much
+  // as sync count).
+  std::vector<cl_uint> seg_stream(size_t{2} * n * kSegSlots);
+  uint32_t ring = 0;    // first slot of the currently staged group
+  uint32_t staged = 0;  // phases staged since the last flush
 
   struct Frame { uint32_t pc, end, widx; int phase; };
   std::vector<std::vector<Frame>> st(n);
@@ -953,12 +971,16 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         }
       return true;
     }
-    if (clEnqueueWriteBuffer(q, seg_tab_buf_, CL_TRUE, 0,
-                             sizeof(cl_uint) * 2 * n, seg.data(), 0, nullptr,
-                             nullptr) != CL_SUCCESS) {
-      *err = "host-dispatch: seg_tab upload failed";
-      return false;
-    }
+    // Stage only; CL commands happen in flush_group (one write per group).
+    std::memcpy(seg_stream.data() + size_t{2} * n * (ring + staged),
+                seg.data(), sizeof(cl_uint) * 2 * n);
+    staged++;
+    return true;
+  };
+
+  // vm2_seg args 0..12 are invariant across phases; set them once. The
+  // runtime mutex (held by our caller) guards the shared kernel object.
+  {
     cl_kernel k = rt_->vm_seg_kernel();
     clSetKernelArg(k, 0, sizeof(arena_), &arena_);
     clSetKernelArg(k, 1, sizeof(aux_buf_), &aux_buf_);
@@ -969,15 +991,41 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
       clSetKernelArg(k, 5 + pt, sizeof(cl_mem), &b);
     }
-    size_t lsz = 256, gsz = size_t{n} * lsz;
-    if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
-                               nullptr) != CL_SUCCESS) {
-      *err = "host-dispatch: segment launch failed";
-      return false;
+  }
+
+  // Enqueue the staged group: ONE seg_tab write + one kernel per phase, no
+  // sync. `drain` additionally clFinishes and rewinds the ring (used at ring
+  // wrap and program end; the while-cond blocking read drains implicitly).
+  auto flush_group = [&](bool drain) -> bool {
+    if (staged) {
+      if (clEnqueueWriteBuffer(q, seg_tab_buf_, CL_FALSE,
+                               sizeof(cl_uint) * 2 * n * ring,
+                               sizeof(cl_uint) * 2 * n * staged,
+                               seg_stream.data() + size_t{2} * n * ring, 0,
+                               nullptr, nullptr) != CL_SUCCESS) {
+        *err = "host-dispatch: seg_tab upload failed";
+        return false;
+      }
+      cl_kernel k = rt_->vm_seg_kernel();
+      size_t lsz = 256, gsz = size_t{n} * lsz;
+      for (uint32_t i = 0; i < staged; ++i) {
+        const cl_uint seg_base = (ring + i) * n;  // uint2 index of the slot
+        clSetKernelArg(k, 5 + kNIoPorts, sizeof(seg_base), &seg_base);
+        if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                                   nullptr) != CL_SUCCESS) {
+          *err = "host-dispatch: segment launch failed";
+          return false;
+        }
+      }
+      ring += staged;
+      staged = 0;
     }
-    if (clFinish(q) != CL_SUCCESS) {  // <-- this clFinish IS the phase barrier
-      *err = "host-dispatch: clFinish (phase barrier) failed";
-      return false;
+    if (drain) {
+      if (clFinish(q) != CL_SUCCESS) {
+        *err = "host-dispatch: clFinish (drain) failed";
+        return false;
+      }
+      ring = 0;
     }
     return true;
   };
@@ -998,13 +1046,26 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       }
       if (seg[2 * L + 1] > 0) any = true;
     }
-    if (any && !launch_seg()) {
-      release_tevs();
-      return false;
+    if (any) {
+      if (ring + staged == kSegSlots && !flush_group(true)) {  // ring wrap
+        release_tevs();
+        return false;
+      }
+      if (!launch_seg()) {
+        release_tevs();
+        return false;
+      }
     }
     phase_i++;
 
-    if (ev == EV_DONE) break;
+    if (ev == EV_DONE) {
+      // Flush + drain: callers assume a completed program.
+      if (!flush_group(true)) {
+        release_tevs();
+        return false;
+      }
+      break;
+    }
     if (ev == EV_BARRIER) {
       for (uint32_t L = 0; L < n; ++L) st[L].back().pc++;  // step past barrier
     } else if (ev == EV_COND_DONE) {
@@ -1014,12 +1075,17 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       const VmEntry& w0 = lane_entry(0, st[0].back().widx);
       uint32_t cbits = 0;
       const uint64_t off = p.buffers[w0.signal_flag].arena_byte_offset;
+      if (!flush_group(false)) {  // enqueue pending phases before the read
+        release_tevs();
+        return false;
+      }
       if (clEnqueueReadBuffer(q, arena_, CL_TRUE, off, 4, &cbits, 0, nullptr,
                               nullptr) != CL_SUCCESS) {
         *err = "host-dispatch: cond read failed";
         release_tevs();
         return false;
       }
+      ring = 0;  // the blocking read drained the in-order queue: ring is free
       for (uint32_t L = 0; L < n; ++L) {
         Frame& f = st[L].back();
         const VmEntry& w = lane_entry(L, f.widx);

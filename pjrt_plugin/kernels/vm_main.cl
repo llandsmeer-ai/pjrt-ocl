@@ -165,14 +165,16 @@ __kernel void vm2_seg(__global uchar *arena,
                       __global const int *aux,
                       __global const task_t *tasks,
                       __global const entry_t *entries,
-                      __global const uint2 *seg_tab,   /* per-lane {off, count} */
-                      VMO_IO_PARAMS)                    /* direct I/O buffers */
+                      __global const uint2 *seg_tab,   /* per-lane {off, count},
+                                                          ring of phase slots */
+                      VMO_IO_PARAMS,                    /* direct I/O buffers */
+                      const uint seg_base)  /* this phase's slot: uint2 index */
 {
     VMO_IO_ARRAY;
     const uint lane = get_group_id(0);
     __local float As[MMA_ASZ];
     __local float Bs[MMA_BSZ];
-    const uint2 seg = seg_tab[lane];
+    const uint2 seg = seg_tab[seg_base + lane];
     for (uint i = 0; i < seg.y; ++i) {
         const entry_t en = entries[seg.x + i];
         if (en.task != ENT_NOP)
