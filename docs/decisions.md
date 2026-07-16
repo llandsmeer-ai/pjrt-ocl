@@ -1064,3 +1064,21 @@ independent of the EW engine (`mm_ok_ ? LaunchMatmul : …`), so this is safe. *
 234→235 pytest (added `test_e2e_matmul_host_dispatch`, which forces the host engine and would have
 caught this on any GPU CI). This was latent for real fence-less-GPU vendors — exactly the AMD/Intel
 portability targets — so it is a genuine correctness fix, not just a debug-path curiosity.
+
+## 18. PoCL barrier-placement portability rule (2026-07-17, merge fallout)
+
+- ❌ The merged collaborative segmented reduce (§14, front 2) crashed PoCL 5.0 at LAZY kernel compile —
+  `pocl::Kernel::createParallelRegionBefore: Assertion 'region_entry_barrier != NULL'` — killing
+  runtime_test and the e2e subprocess tests (main-process pytest stayed green because the
+  crashing kernel was never launched there; NVIDIA/Intel compile the same source fine, and
+  upstream's PoCL evidently tolerates it).
+- 🔬 Bisected by stubbing tile bodies: the trigger is a **barrier() as the LAST statement of a
+  switch case inside vmo_exec_tiles' tile loop** (i.e. immediately before the loop backedge).
+  Removed — provably safe here (after the tree's final barrier only lid 0 reads As[0]; every
+  tile op re-barriers before reading shared local slots). Early `return`s on paths that precede
+  barriers (even workgroup-uniform, spec-legal ones) were restructured to if/else at the same
+  time as defense in depth.
+- ✅ **Kernel-library rule going forward: in any function inlined into the tile dispatch,
+  (a) no `return` on a path that precedes a barrier, (b) no barrier as the final statement
+  before the dispatch loop's backedge.** Validate on PoCL (the strictest region-former) before
+  merging barrier-bearing kernels; a laptop-green NVIDIA/Intel run does not cover this.
