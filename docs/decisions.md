@@ -602,6 +602,66 @@ batch-aware. Since in-program matmuls at these sizes are already overhead-bound 
 2 TFLOP/s), pulling them into separate launches adds more overhead than the higher intensity
 saves. Only worth revisiting if approach (1) had hurt occupancy, which it did not.
 
+### 10d. TF32 megakernel tile micro-tuning campaign (2026-07-16, transformer `large`)
+
+Front: the transformer `large` gap to native CUDA is 9.6× and 96% of its FLOPs are matmul
+(measured), so it IS matmul-bound — the one lever left (§14b/transformer-perf memory). Attacked
+the in-megakernel TF32 `vmo_mma_tile` (§10c) measure-first. **Baselines** (RTX PRO 6000 Blackwell):
+in-megakernel TF32 matmul (`PJRT_OCL_MM_KERNEL=0` keeps a pure matmul in the megakernel) N=2048
+18.0 / N=4096 16.1 TFLOP/s; standalone FP32 `mm2` 21.6 / 25.1; cuBLAS 72.9 / 146.6; transformer
+`large` 35.08 ms / 9.55 TFLOP/s, `base` 9.82 ms / 2.13 TFLOP/s.
+
+**Root cause established (the ceiling is real).** The 64×64 tile has arithmetic intensity ≈
+`64·64·K·2 / ((64·K+K·64)·4)` = **16 FLOP/byte** (reuse == tile width 64), far below Blackwell's
+~83 FLOP/byte balance. Two consequences, both measured: (a) at large K where B exceeds L2 (square
+N=K≥4096, B=64 MiB) the tile is **global-bandwidth bound** — N=4096 (16.1) is SLOWER than N=2048
+(18.0) despite more parallelism; (b) the only intensity fix is a bigger output tile, which the
+megakernel's co-residency cap forbids (a bigger register/acc tile drops residency below the 2·CU=376
+lanes the cross-workgroup barrier needs — §10c, re-confirmed here). So the standalone `mm2` beats the
+in-megakernel TF32 at N≥2048 (25 vs 16) purely on its larger 128×64 tile + double buffering, NOT
+tensor cores (it's FP32).
+
+**What was tried (register/occupancy-neutral knobs only — the tile can't grow):**
+- **Smem leading-dim padding — SHIPPED (+4.5% on `large`).** The wmma m16n16k8 A/B fragment loads
+  read 16 rows at stride `MMA_BK`==16, colliding on the same 32 smem banks (8-way conflict). Pad
+  the TF32 staging leading dim to 20 (`gcd(20,32)=4` → 8 distinct bank offsets). Costs 25% more
+  staging smem (still ~16 KiB/wg, nowhere near the limiter), zero accumulator registers. Measured:
+  in-megakernel N=2048 18.0→19.6, N=4096 16.1→16.9; transformer `large` 9550→9984 GFLOP/s (+4.5%),
+  `base` 2133→2174 (+1.9%). TF32-only (`VMO_NV_PTX`); portable path byte-identical.
+- **Group-M L2 swizzle — SHIPPED (+7.6% on huge squares; WASH on the transformer).** Remap
+  tile→(tr,tc) into GROUP_M=8-tall column strips so co-resident workgroups reuse the same B panel
+  from L2 (CUTLASS/Triton "grouped" order). Pure bit-exact index remap. Measured: in-megakernel
+  N=4096 16.9→18.1 (+7.6%), N≤2048 unchanged. **Wash on the transformer** — its FFN/projection
+  B-panels (≤16 MiB) fit L2, so those matmuls are tile-compute bound not BW bound. Kept anyway: free,
+  bit-exact, and the megakernel is the only path for view-folded / in-program large matmuls that the
+  `mm2` fast path (pure single-matmul programs, contiguous operands) can't take.
+- **Double-buffered K-loop staging — WASH, reverted.** Two smem panels, prefetch next K-block while
+  computing (one barrier/iter). N=2048 18.0→17.9, N=4096 16.1→16.4 — no move. The tile is not
+  global-latency bound (padding/swizzle addressing bank-conflict throughput and L2 reuse are what
+  matter), so hiding global latency buys nothing. Added smem for no gain → dropped.
+- **BK 16→32 — REGRESSION, reverted.** Deeper K-block (fewer barriers/mma) N=2048 18.0→13.6,
+  N=4096 16.1→14.0. More staging smem drops occupancy; the tile is not barrier-bound. Dropped.
+
+**Direction 2 (route hot matmuls to the standalone kernel) re-evaluated and still REJECTED for the
+transformer.** The enabler would be host-dispatch (per-phase `vm2_seg` launches, where a matmul
+phase could launch `mm2` instead). Measured NVIDIA host-dispatch baseline (`PJRT_OCL_ENGINE=host`):
+`base` 9.7→14.3 ms, `large` 33.5→46.0 ms — the per-phase launch overhead (+12.5 ms on `large`)
+*exceeds* the entire matmul time the megakernel spends, so even a 2× matmul kernel nets a wash. The
+only routing that could win is a **hybrid**: keep the single-launch megakernel for non-matmul phases
+and split out only the big projection/FFN matmuls into separate `mm2`(-TF32) launches. That needs a
+standalone TF32 128×128 kernel (independent register budget → the intensity the megakernel can't
+have) AND splitting the persistent megakernel into per-segment relaunches at matmul boundaries
+(arena state persists across launches, so feasible, but ~30 relaunches/iter and mm2 is not
+batch-aware). This is the genuine remaining lever for `large` (potential ~1.5–1.8× if the segment
+relaunch overhead stays ~1 ms) but is a large architectural change deferred as future work.
+
+**Net shipped:** transformer `large` 35.08→33.51 ms, **9.55→10.0 TFLOP/s (+4.7%)**, gap to native
+CUDA (91.9 TFLOP/s) 9.63×→9.19×; `base` 9.82→9.70 ms, 2.13→2.16 TFLOP/s, gap 21.9×→21.6×. All 5
+`--check` configs PASS (TF32 atol 5e-2); portable `MEGA_TC=0` f32-exact (max_abs 2.2e-6); PoCL
+portable f32-exact (2.4e-7); 240 pytest pass / 1 skipped. Honest bottom line: the in-megakernel TF32
+tile is at its architectural ceiling (~16–20 TFLOP/s, intensity-capped by the co-residency-locked
+64×64 tile); micro-tuning bought a clean +4.7% but matmul PARITY needs the hybrid split above.
+
 ## 11. Scheduler: fuse lane-local elementwise chains (2026-07-16)
 
 The scheduler split the dataflow into LEVELS (maximal antichains) with a global barrier
