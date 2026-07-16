@@ -147,12 +147,21 @@ Takeaways (higher = slower; both axes log):
 - **`matrix × vector`** ~3.7x — memory-bound but routed through the tiled MMA
   kernel, which wastes most of a tile on a width-1 RHS; a dedicated GEMV kernel
   would close most of this.
-- **`dot_general`** ~6.8x off cuBLAS at 2048³ — expected: cuBLAS uses TF32
-  tensor cores, which OpenCL cannot reach. A tuned OpenCL f32 kernel (kernel-
-  table override) can narrow it, but tensor-core parity isn't attainable here.
-- **`while` loops** are the biggest gap (~28x): every iteration pays a
-  cross-workgroup barrier + host/device control round-trip. Loop-body fusion and
-  cheaper per-iteration sync are the open wins.
+- **`dot_general`** ~5.5x off cuBLAS at 2048³. Large matmul now runs a
+  **standalone SGEMM** (`mm2`, launched outside the megakernel so an 8×4 register
+  tile doesn't inflate the shared register budget) — 17→21 TFLOP/s at 2048.
+  But cuBLAS hits **134 TFLOP/s at 4096, above Blackwell's f32 peak**, i.e. it is
+  TF32 **tensor-core** bound; a portable f32 kernel can't reach that. Closing the
+  rest needs an NVIDIA-only TF32 tensor-core tile (inline-PTX WMMA behind the
+  kernel-table override — the `mm2` dispatch path is built to host it).
+- **`while` loops** went from **~28x to ~4x** at 16M elements. Three fixes:
+  (1) an **affine op** `d = a·s + t` that folds scalar-constant scale/bias
+  (`x*1.5+1` was materializing two full-length broadcast buffers per iteration →
+  now one fused pass); (2) **in-place carry updates** so a loop-carried buffer
+  stays L2-resident across iterations instead of being copied twice per step; and
+  (3) a **contention-free barrier spin** (coherent `atomic_load` instead of an
+  atomic RMW that ping-ponged the phase cache line across ~376 workgroups). The
+  affine folding is a general win for any `x*c`/`x+c`/affine chain.
 
 The remaining end-to-end gap on the closest ops is largely fixed jax→PJRT
 per-dispatch overhead, which amortizes in real fused programs.
@@ -277,9 +286,10 @@ core path, and it never assumes fp64. Design decisions and their rationale live 
   launch per phase. This is required on CPU — an in-kernel spin-barrier deadlocks on a
   non-preemptive CPU runtime (imbalance-starvation; it's why OpenCL mandates kernel
   boundaries for cross-group sync). Override with `PJRT_OCL_ENGINE=host|mega|auto`.
-- Performance is improving but not yet tuned: matmul runs a register-blocked tile kernel;
-  memory-bound ops are currently limited by arena-copy traffic (see
-  [`docs/perf-findings.md`](docs/perf-findings.md)).
+- Performance is improving but not yet tuned. Elementwise/gather are near CUDA;
+  large matmul uses a standalone SGEMM but full parity needs TF32 tensor cores
+  (inline-PTX WMMA behind the kernel-table override — not yet built); `while` is
+  down to ~4x via affine folding + in-place carries (see `docs/decisions.md` §9).
 
 ## License
 

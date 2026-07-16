@@ -149,7 +149,7 @@ def worker_env(backend: str, device: str, engine: str | None) -> dict:
         env["JAX_PLATFORMS"] = "opencl"
         env["PJRT_OCL_DEVICE"] = device
         env.setdefault("PJRT_OCL_PLUGIN_PATH",
-                       str(REPO / "build" / "pjrt_plugin" / "libpjrt_ocl.so"))
+                       str(REPO / "pjrt_plugin" / "build" / "libpjrt_ocl.so"))
         if engine:
             env["PJRT_OCL_ENGINE"] = engine
     else:
