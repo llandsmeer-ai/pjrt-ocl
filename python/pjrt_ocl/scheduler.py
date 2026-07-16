@@ -46,6 +46,7 @@ TILE_SCATTER = 6      # strided scatter: dst[out_off + affine(i)] = a[i]
 TILE_DYN_GATHER = 7   # dynamic_slice: gather with a runtime base offset
 TILE_DYN_SCATTER = 8  # dynamic_update_slice: scatter with a runtime base offset
 TILE_RED_WINDOW = 9   # windowed reduction (pooling)
+TILE_RED_SEG = 10     # segmented reduce: out[o] = reduce(in[o*seg : (o+1)*seg])
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -103,6 +104,7 @@ _COST_KEYS = {
 class DeviceConfig:
     nlanes: int = 8
     costs: dict = dataclasses.field(default_factory=dict)   # key -> µs/tile
+    fuse: bool = True     # fuse lane-local elementwise chains (no barrier)
 
     @classmethod
     def from_env(cls, environ=None) -> "DeviceConfig":
@@ -110,6 +112,7 @@ class DeviceConfig:
         nlanes = int(environ.get("PJRT_OCL_NLANES", "8") or "8")
         if nlanes < 1:
             nlanes = 1
+        fuse = environ.get("PJRT_OCL_FUSE", "1") != "0"
         costs: dict = {}
         path = environ.get("PJRT_OCL_COST_TABLE", "")
         if path:
@@ -122,7 +125,7 @@ class DeviceConfig:
                         costs[k] = float(raw[k])
             except (OSError, ValueError):
                 costs = {}   # missing file / bad JSON -> all 1.0 (below)
-        return cls(nlanes=nlanes, costs=costs)
+        return cls(nlanes=nlanes, costs=costs, fuse=fuse)
 
     def unit_cost(self, tile_op: int) -> float:
         return self.costs.get(_COST_KEYS.get(tile_op, "ew_tile_us"), 1.0)
@@ -148,11 +151,14 @@ class Task:
                              TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW):
             return max(1, math.ceil(self.p1 / TILE_SIZE))
         if self.tile_op == TILE_MMA:
-            return math.ceil(self.p0 / MMA_T) * math.ceil(self.p1 / MMA_T)
+            return (math.ceil(self.p0 / MMA_T) * math.ceil(self.p1 / MMA_T)
+                    * max(1, self.p3))          # p3 = batch count
         if self.tile_op == TILE_REDUCE_PART:
             return max(1, math.ceil(self.p0 / self.p1)) if self.p1 else 1
         if self.tile_op == TILE_REDUCE_COMB:
             return 1
+        if self.tile_op == TILE_RED_SEG:      # tiled over the n_out outputs (p0)
+            return max(1, math.ceil(self.p0 / TILE_SIZE))
         raise ScheduleError(f"n_tiles: unknown tile_op {self.tile_op}")
 
 
@@ -242,21 +248,46 @@ def _depends(instrs, j: int, i: int) -> bool:
     return bool((_reads(b) & aw) or (_writes(b) & aw))
 
 
-def _levels(instrs, indices: list[int]) -> list[list[int]]:
-    """Greedy maximal levels over `indices` (SSA order): an instr joins the
-    current level iff it depends on no instr already in it, else starts a new
-    level."""
-    levels: list[list[int]] = []
+def _cross_lane_dep(instrs, j: int, i: int, is_map) -> bool:
+    """Does j depend on i via an edge that CROSSES lanes — i.e. one that a
+    barrier must publish? A dependency is lane-LOCAL (no barrier) iff both ops
+    are elementwise (map-type) with the same element count: then output tile T
+    reads only input tile T, so a lane that owns tile T produces everything it
+    needs and the two ops chain on that lane. Every other real dependency is
+    cross-lane: a shaped producer (matmul/reduce/gather — its output tiling
+    differs) or a shaped consumer (reads all tiles), or a change of element
+    count (reshape/broadcast). WAW is treated cross-lane to be safe."""
+    if not _depends(instrs, j, i):
+        return False
+    return not (is_map(i) and is_map(j) and instrs[i].n == instrs[j].n
+                and _writes(instrs[i]).isdisjoint(_writes(instrs[j])))
+
+
+def _phases(instrs, indices: list[int], is_map, fuse: bool = True
+            ) -> list[list[int]]:
+    """Group `indices` (SSA order) into PHASES separated by barriers. A new phase
+    starts only when an instr has a CROSS-LANE dependency on a phase member;
+    same-index elementwise deps stay in the phase and chain per-lane (no
+    barrier). This coarsens the dataflow graph: a whole elementwise fork/join
+    (a+b, a-b, then their product) is ONE phase, while a matmul or reduction
+    forces a phase boundary because its consumers read across lanes.
+
+    `fuse=False` (PJRT_OCL_FUSE=0) reverts to one phase per dataflow level — every
+    dependency is a barrier — for A/B comparison and debugging."""
+    def boundary(j, i):
+        return (_depends(instrs, j, i) if not fuse
+                else _cross_lane_dep(instrs, j, i, is_map))
+    phases: list[list[int]] = []
     cur: list[int] = []
     for j in indices:
-        if cur and any(_depends(instrs, j, i) for i in cur):
-            levels.append(cur)
+        if cur and any(boundary(j, i) for i in cur):
+            phases.append(cur)
             cur = [j]
         else:
             cur.append(j)
     if cur:
-        levels.append(cur)
-    return levels
+        phases.append(cur)
+    return phases
 
 
 # --- instruction -> task mapping --------------------------------------------
@@ -288,40 +319,40 @@ def _instr_to_task(ins: L.Instr, buffers) -> Task:
 
 # --- lane packing within a level (LPT by cost) ------------------------------
 
-def _pack_level(level_tasks: list[tuple[int, Task]], n_lanes: int,
-                config: DeviceConfig) -> list[tuple[int, Entry]]:
-    """Return [(lane, Entry)] for one dataflow level.
+def _pack_units(units: list[tuple[list[int], int, float]], n_lanes: int
+                ) -> list[tuple[int, Entry]]:
+    """Return [(lane, Entry)] for one dataflow phase. A UNIT is a chain of task
+    ids that must run together on one lane over a shared tile range: a shaped op
+    is a singleton chain `[tid]`; a fused elementwise chain is `[tid0, tid1, …]`
+    in topological order (its tile T of every op stays on the same lane, so the
+    chain runs with no barrier and no fence).
 
-    Chunk + LPT packing (one regime for any task count): each task is split
-    into k = min(tiles, ceil(n_lanes * cost_share)) contiguous tile chunks —
-    an expensive task fans out over many (up to all) lanes, a cheap one stays
-    a single entry — then every chunk is list-scheduled (LPT, cost-descending)
-    onto the least-loaded lane. A lane may carry SEVERAL entries in one level:
-    that is what lets the scheduler sequentialize cheap tasks behind chunks of
-    an expensive one instead of dedicating whole lanes to them (with measured
-    costs the diamond example packs the matmul on all lanes and stacks the two
-    elementwise ops behind it — docs/decisions.md #1 trace-mode findings).
-    Ties break deterministically (task id, then chunk index / lane index)."""
-    infos = []                          # (task_id, tiles, cost)
-    for tid, task in level_tasks:
-        tiles = task.n_tiles()
-        infos.append((tid, tiles, tiles * config.unit_cost(task.tile_op)))
+    Chunk + LPT packing (one regime): each unit's `tiles` are split into
+    k = min(tiles, ceil(n_lanes * cost_share)) contiguous chunks — an expensive
+    unit fans out over many (up to all) lanes, a cheap one stays a single chunk —
+    then every chunk is list-scheduled (LPT, cost-descending) onto the
+    least-loaded lane, emitting the unit's WHOLE chain over that chunk's tile
+    range. A lane may carry several units: that lets the scheduler sequentialize
+    cheap units behind chunks of an expensive one instead of dedicating whole
+    lanes to them (with measured costs the diamond packs the matmul on all lanes
+    and stacks the elementwise chain behind it — docs/decisions.md #1)."""
     result: list[tuple[int, Entry]] = []
-    if not infos:
+    if not units:
         return result
-    total = sum(c for _, _, c in infos) or 1.0
-    chunks = []                         # (chunk_cost, task_id, tile_lo, tile_hi)
-    for tid, tiles, cost in infos:
+    total = sum(c for _, _, c in units) or 1.0
+    chunks = []                         # (chunk_cost, tids, tile_lo, tile_hi)
+    for uid, (tids, tiles, cost) in enumerate(units):
         k = min(tiles, max(1, math.ceil(n_lanes * cost / total)))
         for j in range(k):
             lo = tiles * j // k
             hi = tiles * (j + 1) // k
-            chunks.append((cost * (hi - lo) / tiles, tid, lo, hi))
-    chunks.sort(key=lambda c: (-c[0], c[1], c[2]))
+            chunks.append((cost * (hi - lo) / tiles, uid, tids, lo, hi))
+    chunks.sort(key=lambda c: (-c[0], c[1], c[3]))
     loads = [0.0] * n_lanes
-    for chunk_cost, tid, lo, hi in chunks:
+    for chunk_cost, _uid, tids, lo, hi in chunks:
         lane = min(range(n_lanes), key=lambda l: loads[l])
-        result.append((lane, Entry(tid, lo, hi)))
+        for tid in tids:                # the whole chain over this tile range
+            result.append((lane, Entry(tid, lo, hi)))
         loads[lane] += chunk_cost
     return result
 
@@ -367,18 +398,25 @@ class _Scheduler:
         for lane in range(self.n_lanes):
             self.lanes[lane].append(_barrier_entry())
 
+    def _is_map(self, i: int) -> bool:
+        """Elementwise (map-type): output tile T reads only input tile T, so it
+        chains on a lane. Everything that reshuffles tiles across lanes
+        (matmul/reduce/gather/scatter/broadcast/…) is a non-map TILE op."""
+        return self.tasks[self._task_for(i)].tile_op == TILE_EW
+
     def _build_levels(self, indices: list[int]):
-        """Ordered levels over `indices` (SSA order). Compute runs are split
-        into maximal dataflow levels; each WHILE is its own singleton level (a
-        natural all-lanes sync point). Yields ("compute", [idx...]) or
-        ("while", idx). NOPs are dropped (no task/entry)."""
+        """Ordered phases over `indices` (SSA order): a compute run splits into
+        barrier-separated PHASES (lane-local elementwise deps stay together, see
+        _phases); each WHILE is its own phase (an all-lanes sync point). Yields
+        ("compute", [idx...]) or ("while", idx). NOPs are dropped."""
         levels: list = []
         seg: list[int] = []
 
         def flush():
             if seg:
-                for lvl in _levels(self.prog.instrs, seg):
-                    levels.append(("compute", lvl))
+                for ph in _phases(self.prog.instrs, seg, self._is_map,
+                                  self.config.fuse):
+                    levels.append(("compute", ph))
                 seg.clear()
 
         for i in indices:
@@ -393,20 +431,73 @@ class _Scheduler:
         flush()
         return levels
 
+    def _map_chains(self, map_indices: list[int]) -> list[list[int]]:
+        """Connected components of map (elementwise) ops under data dependencies
+        = fused chains. Independent ops (no dep) stay in separate chains so they
+        can run on different lanes in parallel; a dependent fork/join collapses
+        into one chain that runs on a shared lane per tile. Within a phase every
+        buffer has a unique writer (WAW is cross-lane ⇒ a phase boundary)."""
+        parent = {i: i for i in map_indices}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        idxset = set(map_indices)
+        writer: dict[int, int] = {}
+        for i in map_indices:
+            for b in _writes(self.prog.instrs[i]):
+                writer[b] = i
+        for j in map_indices:
+            for b in _reads(self.prog.instrs[j]):
+                w = writer.get(b)
+                if w is not None and w != j:
+                    parent[find(w)] = find(j)
+        comps: dict[int, list[int]] = {}
+        for i in map_indices:
+            comps.setdefault(find(i), []).append(i)
+        return [sorted(v) for v in comps.values()]
+
+    def _emit_phase(self, indices: list[int]) -> None:
+        """Emit one compute phase. Build UNITS — each shaped op is a singleton
+        chain; each connected component of elementwise ops is a fused chain (topo
+        = SSA order) — then chunk+LPT them onto lanes (_pack_units). Dependent
+        elementwise ops thus chain on one lane per tile (no barrier, no fence:
+        thread `lid` writes then re-reads the same elements across ops), while
+        independent units fan out across lanes in parallel."""
+        shaped: list[int] = []
+        map_indices: list[int] = []
+        for i in sorted(indices):                 # SSA order == topological
+            (map_indices if self._is_map(i) else shaped).append(i)
+
+        units: list[tuple[list[int], int, float]] = []
+        for i in shaped:
+            t = self.tasks[self._task_for(i)]
+            tiles = t.n_tiles()
+            units.append(([self._task_for(i)], tiles,
+                          tiles * self.config.unit_cost(t.tile_op)))
+        ew_cost = self.config.unit_cost(TILE_EW)
+        for comp in self._map_chains(map_indices):
+            comp.sort()                            # topological (SSA order)
+            tids = [self._task_for(i) for i in comp]
+            tiles = self.tasks[tids[0]].n_tiles()  # all same element count
+            units.append((tids, tiles, len(tids) * tiles * ew_cost))
+
+        for lane, entry in _pack_units(units, self.n_lanes):
+            self.lanes[lane].append(entry)
+
     def schedule_range(self, indices: list[int], trailing_barrier: bool) -> None:
         """Append entries for a linear instruction sub-list to every lane, with
-        a global BARRIER after each level. `trailing_barrier` controls the last
-        level's barrier: True for the root (barrier after every level); False
+        a global BARRIER between phases. `trailing_barrier` controls the last
+        phase's barrier: True for the root (barrier after every phase); False
         for cond/body sub-lists, whose closing barrier the WHILE machinery in
         the kernel supplies (after the cond scalar read / after the body)."""
         levels = self._build_levels(indices)
         for li, (kind, payload) in enumerate(levels):
             if kind == "compute":
-                level_tasks = [(self._task_for(i), self.tasks[self._task_for(i)])
-                               for i in payload]
-                for lane, entry in _pack_level(level_tasks, self.n_lanes,
-                                               self.config):
-                    self.lanes[lane].append(entry)
+                self._emit_phase(payload)
             else:
                 self._emit_while(payload)
             if trailing_barrier or li != len(levels) - 1:

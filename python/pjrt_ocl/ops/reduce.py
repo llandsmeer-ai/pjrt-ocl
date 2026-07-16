@@ -45,7 +45,8 @@ import math
 
 from .. import lowering as L
 from .. import opsem
-from ..scheduler import Task, TILE_REDUCE_PART, TILE_REDUCE_COMB, TILE_SIZE
+from ..scheduler import (Task, TILE_REDUCE_PART, TILE_REDUCE_COMB, TILE_RED_SEG,
+                         TILE_SIZE)
 
 # reduction kinds (docs/vmprogram.md v2.1 REDUCE table)
 SUM, MAX, MIN, PROD = 0, 1, 2, 3
@@ -141,13 +142,6 @@ def _reduce(ctx, op):
     in_rank = len(in_shape)
     dims = sorted(int(x) for x in ir.DenseI64ArrayAttr(op.attributes["dimensions"]))
 
-    # v1 coverage: FULL reductions only (every axis reduced -> scalar result).
-    if dims != list(range(in_rank)):
-        raise L.LoweringError(
-            f"reduce: only full reductions (all axes) are supported; got "
-            f"dimensions={dims} of a rank-{in_rank} input. Partial-axis "
-            "reductions need a permuting gather first (not yet implemented).")
-
     # classify the reduction kind from the single compute op in the region body
     rblk = op.regions[0].blocks[0]
     body_ops = [x.operation for x in rblk.operations]
@@ -163,6 +157,29 @@ def _reduce(ctx, op):
     _assert_identity(kind, _read_scalar_const(op.operands[1], in_dt), in_dt)
 
     in_buf = ctx.buf_for(op.operands[0])
+
+    # Partial reduction over a CONTIGUOUS INNERMOST suffix of axes (softmax /
+    # layernorm reduce the last axis): output element o = reduce of the seg
+    # contiguous inputs at [o*seg, (o+1)*seg). One TILE_RED_SEG task, tiled over
+    # the n_out outputs. Non-suffix axis sets still need a permuting transpose
+    # first (deferred).
+    if dims != list(range(in_rank)):
+        if dims != list(range(in_rank - len(dims), in_rank)):
+            raise L.LoweringError(
+                f"reduce: only full or innermost-suffix reductions are "
+                f"supported; got dimensions={dims} of rank-{in_rank} (a "
+                "non-suffix axis set needs a transpose first — not yet done).")
+        seg = 1
+        for d in dims:
+            seg *= in_shape[d]
+        n_out = n_in // seg
+        out = ctx.new_buffer(n_out, in_dt)
+        ctx.emit(L.Instr(L.OP_REDUCE_SEG, dst=out, a=in_buf, b=in_buf,
+                         n=n_out, imm=(kind << 28) | seg))
+        ctx.value_to_buf[op.results[0]] = out
+        return
+
+    n_parts = _n_parts(n_in)
     n_parts = _n_parts(n_in)
 
     # PART: input -> n_parts partials (one per chunk). Partials + output carry
@@ -253,3 +270,48 @@ opsem.register(L.OP_REDUCE, to_task=_reduce_to_task, interp=_reduce_interp,
                reads=_reduce_reads)
 opsem.register_tile_sim(TILE_REDUCE_PART, _reduce_part_sim)
 opsem.register_tile_sim(TILE_REDUCE_COMB, _reduce_comb_sim)
+
+
+# --- segmented reduce (partial innermost-suffix reduction) -------------------
+
+def _redseg_decode(imm: int) -> tuple[int, int]:
+    return imm >> 28, imm & 0x0FFFFFFF          # kind, seg
+
+
+def _redseg_to_task(ins) -> Task:
+    kind, seg = _redseg_decode(ins.imm)
+    # p0 = n_out (tiling), p1 = seg, p2 = kind
+    return Task(TILE_RED_SEG, dst=ins.dst, a=ins.a, b=0,
+                p0=ins.n, p1=seg, p2=kind, p3=0)
+
+
+def _redseg_interp(ins, rt) -> None:
+    kind, seg = _redseg_decode(ins.imm)
+    n_out = ins.n
+    src = rt.view(ins.a, n_out * seg).reshape(n_out, seg)
+    rt.view(ins.dst, n_out)[:] = _reduce_np_axis(src, kind)
+
+
+def _reduce_np_axis(arr, kind):
+    if kind == SUM:
+        return arr.sum(-1)
+    if kind == MAX:
+        return arr.max(-1)
+    if kind == MIN:
+        return arr.min(-1)
+    return arr.prod(-1)
+
+
+def _redseg_sim(task, entry, rt):
+    n_out, seg, kind = task.p0, task.p1, task.p2
+    src = rt.view(task.a)
+    out = rt.view(task.dst)
+    lo = entry.tile_lo * TILE_SIZE
+    hi = min(entry.tile_hi * TILE_SIZE, n_out)
+    for o in range(lo, hi):
+        out[o] = _reduce_np(src[o * seg:(o + 1) * seg], kind)
+
+
+opsem.register(L.OP_REDUCE_SEG, to_task=_redseg_to_task, interp=_redseg_interp,
+               reads=_reduce_reads)
+opsem.register_tile_sim(TILE_RED_SEG, _redseg_sim)

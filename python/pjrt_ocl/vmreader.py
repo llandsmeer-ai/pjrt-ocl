@@ -29,9 +29,9 @@ import numpy as np
 
 from .lowering import (
     ARENA_ALIGN, BUFENT_STRUCT, CONSTHDR_STRUCT, DT_F32, DTYPE_NUMPY,
-    HEADER_STRUCT, INSTR_STRUCT, MAGIC, OP_ADD_F32, OP_AFFINE_F32, OP_FILL_F32,
-    OP_IOTA_F32, OP_LTS_F32, OP_MUL_F32, OP_NAMES, OP_NOP, OP_SUB_F32, OP_WHILE,
-    SECTION_ALIGN, VERSION,
+    HEADER_STRUCT, INSTR_STRUCT, MAGIC, OP_ADD_F32, OP_AFFINE_F32, OP_DOT,
+    OP_FILL_F32, OP_IOTA_F32, OP_LTS_F32, OP_MUL_F32, OP_NAMES, OP_NOP,
+    OP_SUB_F32, OP_WHILE, SECTION_ALIGN, VERSION,
 )
 from . import scheduler as S
 from . import opsem
@@ -241,9 +241,9 @@ def parse(data: bytes) -> Program:
         pos += INSTR_STRUCT.size
         if op not in OP_NAMES:
             raise FormatError(f"instr[{i}] unknown opcode {op}")
-        # the 8th word is a second immediate for OP_AFFINE_F32 (t bits); it must
-        # stay a zero padding word for every other opcode.
-        if imm2 != 0 and op != OP_AFFINE_F32:
+        # the 8th word is a second immediate: OP_AFFINE_F32's t bits, or OP_DOT's
+        # batch count. It must stay a zero padding word for every other opcode.
+        if imm2 != 0 and op not in (OP_AFFINE_F32, OP_DOT):
             raise FormatError(f"instr[{i}] nonzero padding")
         if aux_off > n_aux:
             raise FormatError(f"instr[{i}] aux offset {aux_off} > n_aux {n_aux}")
@@ -540,25 +540,41 @@ def execute_schedule(prog: Program, args: list[np.ndarray],
                 f"schedule simulator: tile_op {task.tile_op} not supported")
         sim(task, e, sim_rt)
 
-    def run_order(entries: list[tuple[int, ParsedEntry]], snapshot: np.ndarray):
+    def run_order(lane_ids, by_lane, snapshot: np.ndarray):
+        # Each lane runs its OWN entries in sequence (a lane's chain of
+        # elementwise ops is ordered); only the interleaving BETWEEN lanes is
+        # varied. Running lane-by-lane in `lane_ids` order is one valid
+        # interleaving that respects every lane's internal order.
         arena[:] = snapshot
-        for _lane, e in entries:
-            run_entry(e)
+        for lane in lane_ids:
+            for e in by_lane[lane]:
+                run_entry(e)
         return arena.copy()
 
     def run_batch(batch: list[tuple[int, ParsedEntry]]) -> None:
-        """Execute a barrier phase's entries; assert order-independence
-        (forward vs reverse must agree) and adopt the result."""
+        """Execute a barrier phase. Entries within a lane are ordered (a lane may
+        now carry a dependent elementwise CHAIN — same-index deps chain on one
+        lane, no barrier); entries ACROSS lanes must be independent. Assert that
+        by running the lanes in two opposite orders (each preserving intra-lane
+        order) and requiring agreement — a mismatch means a genuine cross-lane
+        write/read landed in one phase (a scheduler bug)."""
         if not batch:
             return
+        by_lane: dict[int, list[ParsedEntry]] = {}
+        order: list[int] = []
+        for lane, e in batch:
+            if lane not in by_lane:
+                by_lane[lane] = []
+                order.append(lane)
+            by_lane[lane].append(e)
         base = arena.copy()
-        forward = run_order(batch, base)
-        reverse = run_order(list(reversed(batch)), base)
+        forward = run_order(order, by_lane, base)
+        reverse = run_order(list(reversed(order)), by_lane, base)
         if not np.array_equal(forward, reverse):
             raise AssertionError(
                 "schedule phase is order-dependent: lanes conflict within a "
                 "barrier phase")
-        arena[:] = forward   # both orders agree; adopt the result
+        arena[:] = forward   # both lane orders agree; adopt the result
 
     if has_control:
         _run_control(sched, arena, view, run_batch)

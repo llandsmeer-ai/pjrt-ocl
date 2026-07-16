@@ -117,10 +117,24 @@ def _lower(f, *args):
 
 
 @pytest.mark.parametrize("f", [
-    lambda x: jnp.sum(x, axis=0),
-    lambda x: jnp.sum(x, axis=1),
+    lambda x: jnp.sum(x, axis=0),       # non-suffix (outer axis): needs transpose
     lambda x: jnp.max(x, axis=0),
+    lambda x: jnp.sum(x, axis=1),       # middle axis of rank-3, not a suffix
 ])
 def test_partial_axis_rejected(f):
+    # non-suffix axis sets still need a permuting transpose first (not yet done)
     with pytest.raises(LoweringError):
-        _lower(f, arr(3, 4))
+        _lower(f, arr(3, 4, 5))
+
+
+@pytest.mark.parametrize("shape,axis", [
+    ((3, 4), 1),                         # last axis of rank-2
+    ((2, 3, 4), 2),                      # last axis of rank-3
+    ((2, 3, 4), (1, 2)),                 # innermost two axes (suffix)
+])
+@pytest.mark.parametrize("red", ["sum", "max", "min"])
+def test_suffix_reduction_matches_numpy(shape, axis, red):
+    """Innermost-suffix partial reductions (softmax/layernorm) now lower to the
+    segmented-reduce tile op; both validators must match jax."""
+    fn = {"sum": jnp.sum, "max": jnp.max, "min": jnp.min}[red]
+    check(lambda x: fn(x, axis=axis), arr(*shape))

@@ -137,6 +137,7 @@ OP_DYNAMIC_SLICE = 48    # gather with a runtime base offset (aux carries start-
 OP_DYNAMIC_UPDATE_SLICE = 49  # scatter with a runtime base offset
 OP_REDUCE_WINDOW = 50    # windowed reduction (pooling); aux = kind,rank,out/win/stride/pad/in dims+strides
 OP_AFFINE_F32 = 51       # fused scalar affine d = a*s + t; imm = f32(s) bits, aux = f32(t) bits
+OP_REDUCE_SEG = 52       # segmented reduce over the innermost `seg` elems; imm = (kind<<28)|seg
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -161,6 +162,7 @@ OP_NAMES = {
     OP_DYNAMIC_UPDATE_SLICE: "dynamic_update_slice",
     OP_REDUCE_WINDOW: "reduce_window",
     OP_AFFINE_F32: "affine_f32",
+    OP_REDUCE_SEG: "reduce_seg",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
