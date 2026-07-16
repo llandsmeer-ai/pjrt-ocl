@@ -119,6 +119,9 @@ class OclRuntime {
   cl_kernel vm_one_kernel() const { return vm_one_kernel_; }
   cl_kernel mm_kernel() const { return mm_kernel_; }
   cl_kernel gemv_kernel() const { return gemv_kernel_; }
+  // CPU-only (VMO_CPU_TILES builds; null on GPU): packed+blocked SGEMM.
+  cl_kernel mm_pack_kernel() const { return mm_pack_kernel_; }
+  cl_kernel mm_packed_kernel() const { return mm_packed_kernel_; }
   // Execution trace (PJRT_OCL_VM_TRACE=<path>): host-dispatch is forced and
   // every schedule entry runs as its own single-workgroup launch on a per-lane
   // profiling queue; per-entry device timestamps are appended to <path> as one
@@ -189,6 +192,8 @@ class OclRuntime {
   cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
   cl_kernel mm_kernel_ = nullptr;      // standalone SGEMM (pure-matmul fast path)
   cl_kernel gemv_kernel_ = nullptr;    // width-1 matmul (both device classes)
+  cl_kernel mm_pack_kernel_ = nullptr;    // CPU only: B panel packing
+  cl_kernel mm_packed_kernel_ = nullptr;  // CPU only: packed 6x16 KC-swept
   std::string trace_path_;             // empty = tracing off
   bool trace_suppressed_ = false;      // true during cost calibration
   std::string cost_table_path_;        // measured cost JSON ("" = unit costs)
@@ -251,6 +256,8 @@ class LoadedProgram {
   cl_mem bar_buf_ = nullptr;
   cl_mem stats_buf_ = nullptr;
   cl_mem seg_tab_buf_ = nullptr;   // host-dispatch: per-lane {off,count} u2
+  cl_mem mm_bp_ = nullptr;         // CPU packed matmul: B-panel scratch (pool)
+  size_t mm_bp_bytes_ = 0;
   std::vector<cl_command_queue> trace_queues_;  // trace mode, one per lane
 
   // Zero-copy I/O ports (docs/decisions.md): up to kNIoPorts input/output

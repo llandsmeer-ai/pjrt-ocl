@@ -373,6 +373,14 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->gemv_kernel_ = clCreateKernel(rt->program_, "gemv", &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateKernel gemv: " + std::to_string(cerr));
+  if (!rt->info_.is_gpu) {  // packed CPU SGEMM only exists under VMO_CPU_TILES
+    rt->mm_pack_kernel_ = clCreateKernel(rt->program_, "mm2_pack", &cerr);
+    if (cerr != CL_SUCCESS)
+      return fail("clCreateKernel mm2_pack: " + std::to_string(cerr));
+    rt->mm_packed_kernel_ = clCreateKernel(rt->program_, "mm2p", &cerr);
+    if (cerr != CL_SUCCESS)
+      return fail("clCreateKernel mm2p: " + std::to_string(cerr));
+  }
   rt->dummy_buf_ = clCreateBuffer(rt->ctx_, CL_MEM_READ_WRITE, 4, nullptr, &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateBuffer dummy: " + std::to_string(cerr));
@@ -485,6 +493,8 @@ OclRuntime::~OclRuntime() {
   if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
   if (mm_kernel_) clReleaseKernel(mm_kernel_);
   if (gemv_kernel_) clReleaseKernel(gemv_kernel_);
+  if (mm_pack_kernel_) clReleaseKernel(mm_pack_kernel_);
+  if (mm_packed_kernel_) clReleaseKernel(mm_packed_kernel_);
   if (dummy_buf_) clReleaseMemObject(dummy_buf_);
   for (auto& [sz, v] : buf_pool_)
     for (cl_mem m : v) clReleaseMemObject(m);
@@ -616,6 +626,17 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
       lp->mm_dst_ = tasks[0].dst;
       lp->mm_a_ = tasks[0].a;
       lp->mm_b_ = tasks[0].b;
+      // CPU packed+blocked SGEMM (poc/10: pack 1.6x, 6x16 1.45x, KC 1.27x
+      // over the register kernel at 2048). Needs N%16==0 and a B-panel
+      // scratch; PJRT_OCL_MM_CPU=reg keeps the register kernel (fallback for
+      // hardware that prefers it, and for ragged N).
+      const char* mmc = std::getenv("PJRT_OCL_MM_CPU");
+      if (rt->host_dispatch() && N > 1 && N % 16 == 0 &&
+          !(mmc && !std::strcmp(mmc, "reg"))) {
+        lp->mm_bp_bytes_ = size_t{Kd} * N * 4;
+        lp->mm_bp_ = rt->PoolAlloc(lp->mm_bp_bytes_, err);
+        if (!lp->mm_bp_) return nullptr;
+      }
     }
   }
   // Patch control-entry cond buffer ids.
@@ -656,6 +677,7 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
 }
 
 LoadedProgram::~LoadedProgram() {
+  if (mm_bp_) rt_->PoolFree(mm_bp_, mm_bp_bytes_);
   for (cl_mem m : {arena_, aux_buf_, tasks_buf_, entries_buf_, lane_tab_buf_,
                    bar_buf_, stats_buf_, seg_tab_buf_})
     if (m) clReleaseMemObject(m);
@@ -798,6 +820,50 @@ bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
   if (is_gemv) {
     lsz = 256;
     gsz = (mm_M_ + lsz - 1) / lsz * lsz;
+  } else if (rt_->host_dispatch() && mm_bp_) {
+    // Packed path: pack B panels, then KC sweeps of the 6x16 kernel, all
+    // enqueued back-to-back on the in-order queue (caller drains).
+    cl_kernel kp = rt_->mm_pack_kernel();
+    clSetKernelArg(kp, 0, sizeof(arena_), &arena_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(kp, 1 + pt, sizeof(cl_mem), &b);
+    }
+    clSetKernelArg(kp, 9, sizeof(uint32_t), &mm_N_);
+    clSetKernelArg(kp, 10, sizeof(uint32_t), &mm_K_);
+    clSetKernelArg(kp, 11, sizeof(uint32_t), &mm_b_);
+    clSetKernelArg(kp, 12, sizeof(mm_bp_), &mm_bp_);
+    size_t pg = size_t{mm_N_ / 16} * mm_K_;
+    if (clEnqueueNDRangeKernel(q, kp, 1, nullptr, &pg, nullptr, 0, nullptr,
+                               nullptr) != CL_SUCCESS) {
+      *err = "Execute: mm2_pack launch failed";
+      return false;
+    }
+    cl_kernel km = rt_->mm_packed_kernel();
+    clSetKernelArg(km, 0, sizeof(arena_), &arena_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(km, 1 + pt, sizeof(cl_mem), &b);
+    }
+    clSetKernelArg(km, 9, sizeof(uint32_t), &mm_M_);
+    clSetKernelArg(km, 10, sizeof(uint32_t), &mm_N_);
+    clSetKernelArg(km, 11, sizeof(uint32_t), &mm_K_);
+    clSetKernelArg(km, 12, sizeof(uint32_t), &mm_dst_);
+    clSetKernelArg(km, 13, sizeof(uint32_t), &mm_a_);
+    clSetKernelArg(km, 14, sizeof(mm_bp_), &mm_bp_);
+    constexpr uint32_t kKC = 512;
+    size_t mg = (mm_M_ + 5) / 6, ml = 1;
+    for (uint32_t kc = 0; kc < mm_K_; kc += kKC) {
+      const uint32_t kc1 = std::min(kc + kKC, mm_K_);
+      clSetKernelArg(km, 15, sizeof(uint32_t), &kc);
+      clSetKernelArg(km, 16, sizeof(uint32_t), &kc1);
+      if (clEnqueueNDRangeKernel(q, km, 1, nullptr, &mg, &ml, 0, nullptr,
+                                 nullptr) != CL_SUCCESS) {
+        *err = "Execute: mm2p launch failed";
+        return false;
+      }
+    }
+    return true;
   } else if (rt_->host_dispatch()) {
     lsz = 1;
     gsz = (mm_M_ + 3) / 4;

@@ -12,3 +12,4 @@ poc/06-fast-mma/bench
 *.egg-info/
 poc/08-occupancy-discovery/poc08
 poc/09-cpu-kernels/poc09
+poc/10-cpu-sgemm/poc10

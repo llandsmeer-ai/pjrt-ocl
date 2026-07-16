@@ -267,6 +267,81 @@ __kernel void mm2(__global uchar *arena, VMO_IO_PARAMS,
             gd[(r0 + i) * N + c0] = s;
         }
 }
+/* Packed+blocked CPU SGEMM (poc/10, the default; PJRT_OCL_MM_CPU=reg selects
+ * the register kernel above instead). mm2_pack reorders B into 16-column
+ * panels (Bp[p*K*16 + k*16 + j]) so mm2p's k-loop reads sequentially — the
+ * stride-N B read was the dominant cost (poc/10 v1: 1.6x). mm2p is a 6x16
+ * float8 register block (12 accs + 2 B + 1 A broadcast = 15/16 ymm) run over
+ * [kc0,kc1) K-sweeps; kc0>0 accumulates into C from memory. The host enqueues
+ * pack + all sweeps back-to-back (in-order queue; no syncs). Requires
+ * N % 16 == 0 — the host falls back to mm2 otherwise. */
+__kernel void mm2_pack(__global uchar *arena, VMO_IO_PARAMS,
+                       const uint N, const uint K,
+                       const uint bh, __global float *Bp)
+{
+    VMO_IO_ARRAY;
+    __global const float *B = AP(const float, bh);
+    const uint gid = get_global_id(0);
+    const uint p = gid / K, k = gid % K;
+    if (p >= N / 16u) return;
+    vstore8(vload8(0, B + k * N + p * 16u), 0,
+            Bp + (ulong)p * K * 16u + k * 16u);
+    vstore8(vload8(0, B + k * N + p * 16u + 8u), 0,
+            Bp + (ulong)p * K * 16u + k * 16u + 8u);
+}
+
+__kernel void mm2p(__global uchar *arena, VMO_IO_PARAMS,
+                   const uint M, const uint N, const uint K,
+                   const uint dsth, const uint ah,
+                   __global const float *gbp,
+                   const uint kc0, const uint kc1)
+{
+    VMO_IO_ARRAY;
+    __global const float *ga = AP(const float, ah);
+    __global float *gd = AP(float, dsth);
+    const uint r0 = get_group_id(0) * 6u;
+    if (r0 >= M) return;
+    const uint nr = min(6u, M - r0);
+    if (nr == 6u) {
+        for (uint p = 0; p < N / 16u; ++p) {
+            __global const float *panel = gbp + (ulong)p * K * 16u;
+            float8 a0[6], a1[6];
+            if (kc0 == 0u) {
+                for (int i = 0; i < 6; ++i) {
+                    a0[i] = (float8)(0.0f); a1[i] = (float8)(0.0f);
+                }
+            } else {
+                for (int i = 0; i < 6; ++i) {
+                    a0[i] = vload8(0, gd + (r0 + i) * N + p * 16u);
+                    a1[i] = vload8(0, gd + (r0 + i) * N + p * 16u + 8u);
+                }
+            }
+            for (uint k = kc0; k < kc1; ++k) {
+                const float8 b0 = vload8(0, panel + k * 16u);
+                const float8 b1 = vload8(0, panel + k * 16u + 8u);
+                for (int i = 0; i < 6; ++i) {
+                    const float8 av = (float8)(ga[(r0 + i) * K + k]);
+                    a0[i] = mad(av, b0, a0[i]);
+                    a1[i] = mad(av, b1, a1[i]);
+                }
+            }
+            for (int i = 0; i < 6; ++i) {
+                vstore8(a0[i], 0, gd + (r0 + i) * N + p * 16u);
+                vstore8(a1[i], 0, gd + (r0 + i) * N + p * 16u + 8u);
+            }
+        }
+    } else if (kc0 == 0u) {   /* edge rows: one full-K scalar pass */
+        for (uint c0 = 0; c0 < N; ++c0)
+            for (uint i = 0; i < nr; ++i) {
+                float s = 0.0f;
+                for (uint k = 0; k < K; ++k)
+                    s = mad(ga[(r0 + i) * K + k],
+                            gbp[(ulong)(c0 / 16u) * K * 16u + k * 16u +
+                                (c0 % 16u)], s);
+                gd[(r0 + i) * N + c0] = s;
+            }
+    }
+}
 #else
 #define MM2_TM 128
 #define MM2_TN 64
