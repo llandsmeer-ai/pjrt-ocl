@@ -71,7 +71,22 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
     const uint tiles_m = (M + MMA_TM - 1) / MMA_TM;
     const uint per = tiles_m * tiles_n;
     const uint g = tile / per, loc = tile % per;
-    const uint tr = loc / tiles_n, tc = loc % tiles_n;
+    /* L2-friendly threadblock swizzle (CUTLASS/Triton "group-M"): instead of
+     * row-major (tr=loc/tiles_n), walk GROUP_M row-blocks per column strip so a
+     * wave of co-resident workgroups reuses the same B column panel (and A row
+     * panels) from L2 before moving on. The 64x64 tile has only ~16 FLOP/byte
+     * arithmetic intensity, so at large K it is GLOBAL-BANDWIDTH bound; raising
+     * the L2 hit rate on the re-streamed B is the only knob left without growing
+     * the register tile (which the megakernel occupancy cap forbids, §10c).
+     * Pure index remap — every (tr,tc) still covered exactly once, bit-exact. */
+    const uint GROUP_M = 8u;
+    const uint in_grp = GROUP_M * tiles_n;
+    const uint gid = loc / in_grp;
+    const uint first_m = gid * GROUP_M;
+    const uint gsz_m = min(tiles_m - first_m, GROUP_M);
+    const uint locg = loc % in_grp;
+    const uint tr = first_m + locg % gsz_m;
+    const uint tc = locg / gsz_m;
     const uint row0 = tr * MMA_TM, col0 = tc * MMA_TN;
     const uint lid = get_local_id(0);
     const uint warp = lid >> 5, lane = lid & 31;
