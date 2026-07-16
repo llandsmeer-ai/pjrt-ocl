@@ -123,6 +123,12 @@ static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop, const t
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = vmo_ew_bin(sub, a[i], b[i]);
     else if (vmo_ew_is_un(sub))
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = vmo_ew_un(sub, a[i]);
+    else if (sub == SUB_AFFINE) {
+        /* d[i] = a[i]*s + t. a may alias d (in-place carry update): each work
+         * item reads then writes the same element, so aliasing is safe. */
+        const float s = as_float(t.p2), tt = as_float(t.p3);
+        for (uint i = lo + lid; i < hi; i += lsz) d[i] = mad(a[i], s, tt);
+    }
     else if (sub == SUB_FILL)
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = as_float(t.p2);
     else if (sub == SUB_IOTA_FLAT)

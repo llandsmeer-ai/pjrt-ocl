@@ -424,3 +424,73 @@ Legend: ✅ chosen · ❌ tried & rejected (keep the evidence!) · 🔬 open, ne
   `libnvidia-opencl.so.1` (was missing; clinfo now lists the RTX PRO 6000 Blackwell).
 - ✅ PoCL installed 2026-07-14 (`pocl-opencl-icd`): platform "Portable Computing Language",
   device cpu-haswell (AMD Ryzen 9 3900X).
+
+## 9. Perf: while + matmul (2026-07-16)
+
+Focus session on the two biggest gaps vs native CUDA (see docs/bench_plot.png): `while`
+(was 28x at 16M elems) and `matmul` (6.8x). Two background research agents mined
+HazyResearch/Megakernels (sync/scheduling) and the tensor-core GEMM refs
+(ihavnoid/hgemmtest inline-PTX WMMA from OpenCL, CUTLASS m16n8k8 TF32 string).
+
+### 9a. `while` — SOLVED (28x → ~4x at 16M, and the small-N floor halved)
+
+Profiled the benchmark `fori_loop(0,32, v: v*1.5+1, x)`. Three independent costs, none of
+them the barrier at large N:
+
+1. **Scalar-const broadcasts materialized.** `v*1.5+1` lowered to `gather_strided`
+   (broadcast 1.5 → full N-vector) + `mul` + `gather_strided`(1.0) + `add` — two full
+   N-length const buffers written and read every iteration. FIX: **OP_AFFINE_F32**
+   (`d = a*s + t`, s/t scalar immediates) + a lowering peephole that folds
+   `mul(x, bcast_const)` / `add(x, bcast_const)` into it, **composes affine∘affine chains**
+   (`(x*s1+t1)*s2+t2`), and DCEs the dead broadcasts (index-stable NOP substitution so
+   WHILE cond/body ranges stay valid). `v*1.5+1` → ONE affine op, ZERO broadcast buffers.
+2. **Redundant copy-back.** The while lowering snapshotted body returns into temps then
+   copied temps→carries (2 full-length passes/iter, for swap/passthrough safety). FIX:
+   **in-place carry update** — when a carry's new value is produced by a single
+   elementwise (index-aligned) op that is the only body reader of that carry, retarget the
+   producer to write the carry directly and drop both copies. Guarded off for bodies with
+   nested WHILE/IF (a nested region's carry-init copy would otherwise be mistaken for the
+   producer — caught by test_nested_while). Net: body of the benchmark = `c_x = c_x*1.5+1`
+   IN PLACE, so the 64 MB carry stays **L2-resident** across all 32 iterations (Blackwell
+   has 96 MB L2), matching CUDA's fused-loop traffic. 16M: 22.5 ms → **3.2 ms** (bit-exact
+   vs JAX CPU).
+3. **Barrier contention (small-N floor).** The spin-barrier used `atomic_add(&bar[1],0)` as
+   a *read* — an atomic RMW forces every one of the (up to 376) spinning workgroups to take
+   the phase cache line EXCLUSIVE, so it ping-pongs (~38 µs/barrier). FIX: coherent
+   `atomic_load_explicit(..., relaxed, memory_scope_device)` — the line stays Shared, only
+   invalidated once at the phase flip. 4K while: 2.47 → 1.8 ms. (The true small-N fix is
+   barrier ELISION for lane-diagonal loops — each lane runs the whole loop with per-lane
+   control, zero grid barriers — designed but not built; the megakernel research confirms
+   it's the right model. Deferred.)
+
+Encoding note: OP_AFFINE_F32 needs TWO f32 immediates but `imm` is the only free-form
+serialized instr word (`dst/a/b` are range-checked, `aux` must be ≤ n_aux, `p3` is the
+SELECT pred). Repurposed the 8th instr word (was a zero pad `pad1`) as `imm2` (the `t`
+bits); parse allows it nonzero only for OP_AFFINE_F32. Device reads s/t from task p2/p3
+(unvalidated for EW-affine). `mad(a,s,t)` matches JAX CPU's fma bit-for-bit.
+
+These are GENERAL wins, not while-specific: scalar scale/bias folding helps any program
+with `x*c`/`x+c`/affine chains (bias, normalization, scaling).
+
+### 9b. `matmul` — megakernel register ceiling (open)
+
+Baseline 17 TFLOP/s @ N=2048 vs cuBLAS 117 TFLOP/s (6.8x). Key facts established:
+- cuBLAS at N=2048 gets only 117 TFLOP/s — well under TF32 tensor-core peak (~400+), so it
+  is NOT tensor-core-bound at these sizes; Blackwell FP32 peak is ~125 TFLOP/s. So a
+  well-tuned **portable** SGEMM could in principle approach cuBLAS here WITHOUT tensor cores.
+- The kernel is **local-memory-bandwidth bound**: the 4×4 register microtile does only
+  2 FMA per local load (global reuse is already high, so float4 *global* loads won't help).
+  Raising arithmetic intensity needs a bigger register microtile.
+- **8×8 (128×128 tile) HANGS the matmul at runtime** (not compile — runtime_test's EW/while
+  pass at 128×128). 64 live accumulator registers in the SHARED megakernel almost certainly
+  spill catastrophically (the megakernel's register budget is the max over ALL op paths).
+  Rolling the K-loop didn't help. This is the fundamental tension the CLAUDE.md notes:
+  aggressive matmul tiling is incompatible with one-kernel-does-everything.
+
+Path forward (not yet built): (a) lift matmul into its OWN program/kernel (high register
+budget, high occupancy, free to use 8×8 tiles + float4 vectorized *local* loads + double
+buffering) — this is the portable route to ~cuBLAS at these sizes; or (b) an NVIDIA-only
+TF32 tensor-core tile via inline PTX `wmma.load.*.shared`/`wmma.mma.sync` behind the
+kernel-table override (refs captured: hgemmtest passes `__local` ptrs as `"l"` into
+`.shared` WMMA ops; CUTLASS `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`). Kept the
+stable 64×64/4×4 tile for now.

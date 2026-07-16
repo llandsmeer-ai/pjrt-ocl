@@ -136,6 +136,7 @@ OP_SCATTER = 47          # strided scatter (concatenate/pad); aux = rank,in_dims
 OP_DYNAMIC_SLICE = 48    # gather with a runtime base offset (aux carries start-scalar byte offsets)
 OP_DYNAMIC_UPDATE_SLICE = 49  # scatter with a runtime base offset
 OP_REDUCE_WINDOW = 50    # windowed reduction (pooling); aux = kind,rank,out/win/stride/pad/in dims+strides
+OP_AFFINE_F32 = 51       # fused scalar affine d = a*s + t; imm = f32(s) bits, aux = f32(t) bits
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -159,6 +160,7 @@ OP_NAMES = {
     OP_DYNAMIC_SLICE: "dynamic_slice",
     OP_DYNAMIC_UPDATE_SLICE: "dynamic_update_slice",
     OP_REDUCE_WINDOW: "reduce_window",
+    OP_AFFINE_F32: "affine_f32",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
@@ -195,6 +197,8 @@ class Instr:
     n: int = 0
     imm: int = 0
     aux: int = 0        # v2: aux-pool word offset (pad0 renamed); 0 for EW ops
+    imm2: int = 0       # second immediate (was pad1): OP_AFFINE_F32's t bits;
+                        # 0 for every other op (kept a padding word there)
     # Extra buffer ids read besides a/b (e.g. dynamic_slice start-index scalars,
     # whose ids ride in the aux pool the scheduler can't inspect). Consumed by
     # the scheduler's dependency analysis only — NOT serialized.
@@ -259,7 +263,7 @@ class VMProgram:
         # instructions
         for ins in self.instrs:
             out += INSTR_STRUCT.pack(ins.op, ins.dst, ins.a, ins.b, ins.n,
-                                     ins.imm, ins.aux, 0)
+                                     ins.imm, ins.aux, ins.imm2)
         # schedule sections (8B-aligned; instructions are 32B each => aligned)
         if schedule is not None:
             out += schedule.serialize_sections()
@@ -302,6 +306,13 @@ class _Ctx:
         # AFTER the root list so all region instrs live at indices >= main_len
         # (docs/vmprogram.md root_len rule). Each item is a _WhileJob.
         self.region_queue: list = []
+        # scalar-const folding (perf): a rank-0 f32 constant records its value
+        # here; a broadcast_in_dim of it records the *result* value in
+        # scalar_bcast. _elementwise_binop then folds `x * s` / `x + t` into a
+        # single OP_AFFINE_F32 instead of materializing the broadcast + a full
+        # binary op (see _compose_affines / _dce_nops post-passes).
+        self.const_scalar: dict = {}       # ir.Value (rank-0 f32 const) -> float
+        self.scalar_bcast: dict = {}       # ir.Value (broadcast result) -> float
         self._arena = 0
 
     def emit(self, instr: Instr) -> None:
@@ -393,6 +404,29 @@ handles = _handles
 tensor_info = _tensor_info
 
 
+def _f32_bits(x: float) -> int:
+    return int(np.float32(x).view(np.uint32))
+
+
+def emit_affine(ctx: _Ctx, dst: int, x_buf: int, s: float, t: float,
+                n: int) -> None:
+    """Emit d = x*s + t (scalar immediates). b self-aliases a (unary convention:
+    the scheduler's read-set + schedule simulator stay in-bounds); s/t ride in
+    imm/imm2 as f32 bit patterns (OP_AFFINE_F32 to_task forwards them to p2/p3)."""
+    ctx.emit(Instr(OP_AFFINE_F32, dst=dst, a=x_buf, b=x_buf, n=n,
+                   imm=_f32_bits(s), imm2=_f32_bits(t)))
+
+
+# multiply/add/subtract by a folded scalar constant -> (s, t) for `other`.
+def _affine_st(opcode: int, other_is_rhs: bool, c: float):
+    if opcode == OP_MUL_F32:
+        return (c, 0.0)                       # x*c  (commutes)
+    if opcode == OP_ADD_F32:
+        return (1.0, c)                       # x+c  (commutes)
+    # subtract does NOT commute: rhs scalar -> x - c ; lhs scalar -> c - x
+    return (1.0, -c) if other_is_rhs else (-1.0, c)
+
+
 def _elementwise_binop(opcode):
     def handler(ctx: _Ctx, op):
         _, n_elems, dtype = _tensor_info(op.results[0].type)
@@ -401,9 +435,28 @@ def _elementwise_binop(opcode):
                 raise LoweringError(
                     f"{op.name}: operand/result shape mismatch "
                     f"(implicit broadcast?)")
+        lhs, rhs = op.operands[0], op.operands[1]
+        # Fold `tensor (op) scalar_const` into a single affine pass (f32 only).
+        # Requires exactly one operand to be a folded scalar broadcast and the
+        # other to be a genuine tensor (not itself a scalar const).
+        if dtype == DT_F32:
+            r_s = ctx.scalar_bcast.get(rhs)
+            l_s = ctx.scalar_bcast.get(lhs)
+            if r_s is not None and l_s is None:
+                s, t = _affine_st(opcode, True, r_s)
+                dst = ctx.new_buffer(n_elems, dtype)
+                emit_affine(ctx, dst, ctx.buf_for(lhs), s, t, n_elems)
+                ctx.value_to_buf[op.results[0]] = dst
+                return
+            if l_s is not None and r_s is None:
+                s, t = _affine_st(opcode, False, l_s)
+                dst = ctx.new_buffer(n_elems, dtype)
+                emit_affine(ctx, dst, ctx.buf_for(rhs), s, t, n_elems)
+                ctx.value_to_buf[op.results[0]] = dst
+                return
         dst = ctx.new_buffer(n_elems, dtype)
-        ctx.emit(Instr(opcode, dst=dst, a=ctx.buf_for(op.operands[0]),
-                       b=ctx.buf_for(op.operands[1]), n=n_elems))
+        ctx.emit(Instr(opcode, dst=dst, a=ctx.buf_for(lhs),
+                       b=ctx.buf_for(rhs), n=n_elems))
         ctx.value_to_buf[op.results[0]] = dst
     return handler
 
@@ -446,6 +499,8 @@ def _lower_constant(ctx: _Ctx, op):
     buf = ctx.new_buffer(n_elems, dtype)
     ctx.consts.append((buf, arr.astype(DTYPE_NUMPY[dtype]).tobytes()))
     ctx.value_to_buf[op.results[0]] = buf
+    if n_elems == 1 and dtype == DT_F32:          # rank-0 f32 scalar: foldable
+        ctx.const_scalar[op.results[0]] = float(np.asarray(arr).reshape(-1)[0])
 
 
 @_handles("func.return")
@@ -503,6 +558,20 @@ class _WhileJob:
     cond_block: object
     body_block: object
     carry: list
+
+
+# Opcodes whose result element i is a pure function of operand element i (same
+# flat index) — safe to compute in place into a loop carry. Excludes cross-index
+# ops (gather/reduce/dot/scatter/dynamic_slice/reduce_window/iota_dim).
+_EW_INPLACE_SAFE = frozenset({
+    OP_ADD_F32, OP_MUL_F32, OP_SUB_F32, OP_DIV_F32, OP_MAX_F32, OP_MIN_F32,
+    OP_POW_F32, OP_ATAN2_F32, OP_REMAINDER_F32, OP_NEG_F32, OP_EXP_F32,
+    OP_LOG_F32, OP_SQRT_F32, OP_RSQRT_F32, OP_TANH_F32, OP_ABS_F32, OP_FLOOR_F32,
+    OP_CEIL_F32, OP_SIGN_F32, OP_LOG1P_F32, OP_EXPM1_F32, OP_CBRT_F32, OP_SIN_F32,
+    OP_COS_F32, OP_TAN_F32, OP_ROUND_NEAREST_EVEN_F32, OP_ROUND_NEAREST_AFZ_F32,
+    OP_COPY_F32, OP_CONVERT, OP_BITCAST, OP_CMP_F32, OP_SELECT_F32, OP_AND,
+    OP_OR, OP_XOR, OP_NOT, OP_IS_FINITE, OP_AFFINE_F32,
+})
 
 
 @_handles("stablehlo.while")
@@ -577,17 +646,69 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
             _lower_op(ctx, io)
     if ret_bufs is None or len(ret_bufs) != n:
         raise LoweringError("stablehlo.while body region return arity mismatch")
-    # Snapshot returns into temps, then commit temps into carries. The two
-    # phases (with a scheduler barrier between) make the carry writes strictly
-    # later than every body read of a carry, so no WAR/aliasing hazard survives
-    # even for swap/passthrough bodies (the carries are not SSA).
-    temps = []
+    # Commit body results into the carries. Default: snapshot returns into temps,
+    # then commit temps into carries — two phases (with a scheduler barrier
+    # between) make the carry writes strictly later than every body read, so no
+    # WAR/aliasing hazard survives even for swap/passthrough bodies (carries are
+    # not SSA). PERF: when a carry's new value is produced by a single
+    # elementwise (index-aligned) op that is the ONLY body reader of that carry
+    # buffer, retarget the producer to write the carry IN PLACE and drop both
+    # copies — this is the dominant while cost at large N (2 full-length
+    # passes/iteration) and enables the carry to stay L2-resident across
+    # iterations. Carries that don't qualify keep the safe two-phase snapshot.
+    # collapse this body's affine chains first, so a scale/bias recurrence is a
+    # single producer reading the carry directly (else the in-place test below
+    # sees the pre-composition intermediate and bails).
+    _compose_affines(ctx)
+    body_end0 = len(ctx.instrs)
+    producer: dict[int, int] = {}
+    dup: set[int] = set()
+    body_reads: dict[int, int] = {}
+    for i in range(body_start, body_end0):
+        bi = ctx.instrs[i]
+        if bi.op == OP_NOP:
+            continue
+        if bi.dst in producer:
+            dup.add(bi.dst)
+        producer[bi.dst] = i
+        for rbuf in _reads_of(bi):
+            body_reads[rbuf] = body_reads.get(rbuf, 0) + 1
+    carry_ids = {carry[k][0] for k in range(n)}
+    # nested control (a WHILE/IF in this body) can make a carry's "producer" be a
+    # nested region's init-copy; in-placing that corrupts the nested loop. Only
+    # in-place flat elementwise bodies (the common fori/scan recurrence).
+    has_nested = any(ctx.instrs[i].op in (OP_WHILE, OP_IF)
+                     for i in range(body_start, body_end0))
+    inplace = [False] * n
+    for k in ([] if has_nested else range(n)):
+        cbuf = carry[k][0]
+        rb = ret_bufs[k]
+        pidx = producer.get(rb)
+        if pidx is None or rb in dup or rb in carry_ids:
+            continue                      # passthrough / reused / not body-produced
+        prod = ctx.instrs[pidx]
+        if prod.op not in _EW_INPLACE_SAFE:
+            continue
+        if body_reads.get(rb, 0) != 0:    # rb reused inside body (not terminal)
+            continue
+        # no body instr OTHER than the producer may read cbuf (else writing it in
+        # place would clobber a sibling producer's operand).
+        others = body_reads.get(cbuf, 0) - (1 if cbuf in _reads_of(prod) else 0)
+        if others != 0:
+            continue
+        ctx.instrs[pidx] = dataclasses.replace(prod, dst=cbuf)
+        inplace[k] = True
+    temps: dict[int, int] = {}
     for k in range(n):
+        if inplace[k]:
+            continue
         _, n_elems, dtype = carry[k]
         t = ctx.new_buffer(n_elems, dtype)
         ctx.emit(Instr(OP_COPY_F32, dst=t, a=ret_bufs[k], n=n_elems))
-        temps.append(t)
+        temps[k] = t
     for k in range(n):
+        if inplace[k]:
+            continue
         cbuf, n_elems, _ = carry[k]
         ctx.emit(Instr(OP_COPY_F32, dst=cbuf, a=temps[k], n=n_elems))
     body_len = len(ctx.instrs) - body_start
@@ -605,6 +726,116 @@ def _lower_op(ctx: _Ctx, o) -> None:
         raise LoweringError(f"unsupported op: {o.name} "
                             f"(known: {sorted(OP_HANDLERS)})")
     handler(ctx, o)
+
+
+def _reads_of(ins: Instr) -> set[int]:
+    """Over-approximate the buffer ids an instruction reads (safe for both DCE
+    liveness and the compose single-use test: never under-counts). Uses the
+    opsem read registry for shaped ops; defaults to {a, b} (+ select pred +
+    reads_hint scalars) otherwise."""
+    from . import opsem
+    op = ins.op
+    if op == OP_NOP:
+        return set()
+    base = set(ins.reads_hint)
+    if op in (OP_WHILE, OP_IF):
+        return base                      # region instrs are separately live
+    if op in opsem.READS:
+        return base | opsem.reads_of(ins)
+    base |= {ins.a, ins.b}
+    if op == OP_SELECT_F32:
+        base |= {ins.imm}                # select predicate rides in imm
+    return base
+
+
+def _compose_affines(ctx: _Ctx) -> None:
+    """Fuse affine∘affine into one op: (x*s1+t1)*s2+t2 = x*(s1 s2) + (t1 s2+t2).
+    Only when the inner result is written once and read once (by the outer), so
+    NOP'ing the inner is safe. Index-stable (dead inner -> OP_NOP). Iterates to a
+    fixpoint to collapse whole scale/bias chains into a single in-place pass."""
+    instrs = ctx.instrs
+    # buffers written exactly once -> the writer index (multi-write carries excl.)
+    once: dict[int, int] = {}
+    multi: set[int] = set()
+    for idx, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        d = ins.dst
+        if d in once or d in multi:
+            once.pop(d, None)
+            multi.add(d)
+        else:
+            once[d] = idx
+    # read counts (over-approx) for the single-use test
+    reads_count: dict[int, int] = {}
+    for ins in instrs:
+        for b in _reads_of(ins):
+            reads_count[b] = reads_count.get(b, 0) + 1
+    outs = set(ctx.outputs)
+
+    changed = True
+    while changed:
+        changed = False
+        for idx, ins in enumerate(instrs):
+            if ins.op != OP_AFFINE_F32:
+                continue
+            inner_idx = once.get(ins.a)
+            if inner_idx is None:
+                continue
+            inner = instrs[inner_idx]
+            if inner.op != OP_AFFINE_F32:
+                continue
+            if reads_count.get(ins.a, 0) != 1 or ins.a in outs:
+                continue                 # inner result reused / is an output
+            s1 = np.float32(np.array(inner.imm, np.uint32).view(np.float32))
+            t1 = np.float32(np.array(inner.imm2, np.uint32).view(np.float32))
+            s2 = np.float32(np.array(ins.imm, np.uint32).view(np.float32))
+            t2 = np.float32(np.array(ins.imm2, np.uint32).view(np.float32))
+            instrs[idx] = Instr(OP_AFFINE_F32, dst=ins.dst, a=inner.a,
+                                b=inner.a, n=ins.n,
+                                imm=_f32_bits(float(s1 * s2)),
+                                imm2=_f32_bits(float(t1 * s2 + t2)))
+            instrs[inner_idx] = Instr(OP_NOP)
+            # bookkeeping: outer now reads inner.a instead of the old inner dst
+            reads_count[ins.a] = reads_count.get(ins.a, 1) - 1
+            reads_count[inner.a] = reads_count.get(inner.a, 0) + 1
+            once.pop(ins.dst, None)
+            once[ins.dst] = idx
+            changed = True
+
+
+def _dce_nops(ctx: _Ctx) -> None:
+    """Dead-code eliminate to OP_NOP (index-stable): drop instructions whose
+    result is never read by a live instruction and is not an output. Control ops
+    (WHILE/IF) are always live and pin their cond_flag; liveness then propagates
+    through the loop-carry chain, so region sub-lists survive while folded-away
+    scalar broadcasts / intermediates do not."""
+    instrs = ctx.instrs
+    live_buf = set(ctx.outputs) | set(ctx.inputs)
+    live_instr = [False] * len(instrs)
+    # seed: control ops are always live (side effects / device-read cond_flag)
+    for idx, ins in enumerate(instrs):
+        if ins.op in (OP_WHILE, OP_IF):
+            live_instr[idx] = True
+            if ins.dst:
+                live_buf.add(ins.dst)
+    changed = True
+    while changed:
+        changed = False
+        for idx, ins in enumerate(instrs):
+            if ins.op == OP_NOP or live_instr[idx]:
+                if live_instr[idx]:
+                    for b in _reads_of(ins):
+                        if b not in live_buf:
+                            live_buf.add(b)
+                            changed = True
+                continue
+            if ins.dst in live_buf:
+                live_instr[idx] = True
+                changed = True
+    for idx, ins in enumerate(instrs):
+        if ins.op != OP_NOP and not live_instr[idx]:
+            instrs[idx] = Instr(OP_NOP)
 
 
 def lower_module(module) -> VMProgram:
@@ -642,6 +873,11 @@ def lower_module(module) -> VMProgram:
     main_len = len(ctx.instrs)
     while ctx.region_queue:
         _lower_while_regions(ctx, ctx.region_queue.pop(0))
+
+    # perf peepholes (index-stable, NOP-substituting): collapse scale/bias chains
+    # into one in-place affine pass, then drop the now-dead scalar broadcasts.
+    _compose_affines(ctx)
+    _dce_nops(ctx)
 
     return VMProgram(
         arena_bytes=ctx._arena,
