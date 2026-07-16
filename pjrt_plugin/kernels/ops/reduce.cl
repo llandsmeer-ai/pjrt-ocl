@@ -58,8 +58,9 @@ static void vmo_reduce_part_tile(__global uchar *arena, __global uchar **iop, co
 {
     if (dt == DT_I32 || dt == DT_U32) {
         vmo_reduce_part_tile_i32(arena, iop, t, tile, As, lid, lsz);
-        return;
-    }
+    } else {
+    /* no return above: a return preceding the barriers below breaks
+     * PoCL 5.0 parallel-region formation (see vmo_redseg_tile note). */
     const uint n = t.p0, chunk = t.p1, kind = t.p2;
     const uint lo = tile * chunk, hi = min(lo + chunk, n);
     __global const float *a = AP(const float, t.a);
@@ -114,6 +115,7 @@ static void vmo_reduce_part_tile(__global uchar *arena, __global uchar **iop, co
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     if (lid == 0) AP(float, t.dst)[tile] = As[0];
+    }
 }
 
 /* TOP_RED_SEG: segmented reduce over the innermost `seg` elements —
@@ -129,19 +131,26 @@ static void vmo_reduce_part_tile(__global uchar *arena, __global uchar **iop, co
 static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const task_t t,
                         uint tile, uint dt, __local float *As, uint lid, uint lsz)
 {
+    /* NO early returns in here: a `return` on a path that precedes a
+     * barrier() — even a workgroup-UNIFORM one (spec-legal) — crashes PoCL
+     * 5.0's parallel-region formation at lazy kernel compile
+     * ("region_entry_barrier != NULL", llvmopencl/Kernel.cc). Over-assigned
+     * tiles (o >= n_out; the scheduler never emits them, this is defensive)
+     * run the tree on init values and skip the store instead. */
     const uint n_out = t.p0, seg = t.p1, kind = t.p2;
     const uint o = tile;
-    if (o >= n_out) return;                 /* uniform: scheduler never over-assigns */
+    const int valid = o < n_out;
     const uint base = o * seg;
     if (dt == DT_I32 || dt == DT_U32) {
         __global const int *a = AP(const int, t.a);
         __local int *Ai = (__local int *)As;
         int acc = kind == 0 ? 0 : kind == 1 ? INT_MIN : kind == 2 ? INT_MAX : 1;
-        for (uint j = lid; j < seg; j += lsz) {
-            const int v = a[base + j];
-            acc = kind == 0 ? acc + v : kind == 1 ? max(acc, v)
-                : kind == 2 ? min(acc, v) : acc * v;
-        }
+        if (valid)
+            for (uint j = lid; j < seg; j += lsz) {
+                const int v = a[base + j];
+                acc = kind == 0 ? acc + v : kind == 1 ? max(acc, v)
+                    : kind == 2 ? min(acc, v) : acc * v;
+            }
         Ai[lid] = acc;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint s = lsz / 2; s > 0; s >>= 1) {
@@ -152,30 +161,34 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
             }
             barrier(CLK_LOCAL_MEM_FENCE);
         }
-        if (lid == 0) AP(int, t.dst)[o] = Ai[0];
-        barrier(CLK_LOCAL_MEM_FENCE);        /* free As before the next segment */
-        return;
-    }
-    __global const float *a = AP(const float, t.a);
-    float acc = kind == 0 ? 0.0f : kind == 1 ? -INFINITY
-              : kind == 2 ? INFINITY : 1.0f;
-    for (uint j = lid; j < seg; j += lsz) {
-        const float v = a[base + j];
-        acc = kind == 0 ? acc + v : kind == 1 ? fmax(acc, v)
-            : kind == 2 ? fmin(acc, v) : acc * v;
-    }
-    As[lid] = acc;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (uint s = lsz / 2; s > 0; s >>= 1) {
-        if (lid < s) {
-            const float x = As[lid], y = As[lid + s];
-            As[lid] = kind == 0 ? x + y : kind == 1 ? fmax(x, y)
-                    : kind == 2 ? fmin(x, y) : x * y;
-        }
+        /* No trailing barrier: after the tree's final barrier only lid 0
+         * reads As[0], and the next tile's As[lid] writes conflict with no
+         * post-barrier read. (Also: a barrier as the last statement of this
+         * switch case — right before vmo_exec_tiles' loop backedge — is what
+         * crashed PoCL 5.0 region formation.) */
+        if (lid == 0 && valid) AP(int, t.dst)[o] = Ai[0];
+    } else {
+        __global const float *a = AP(const float, t.a);
+        float acc = kind == 0 ? 0.0f : kind == 1 ? -INFINITY
+                  : kind == 2 ? INFINITY : 1.0f;
+        if (valid)
+            for (uint j = lid; j < seg; j += lsz) {
+                const float v = a[base + j];
+                acc = kind == 0 ? acc + v : kind == 1 ? fmax(acc, v)
+                    : kind == 2 ? fmin(acc, v) : acc * v;
+            }
+        As[lid] = acc;
         barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint s = lsz / 2; s > 0; s >>= 1) {
+            if (lid < s) {
+                const float x = As[lid], y = As[lid + s];
+                As[lid] = kind == 0 ? x + y : kind == 1 ? fmax(x, y)
+                        : kind == 2 ? fmin(x, y) : x * y;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0 && valid) AP(float, t.dst)[o] = As[0];
     }
-    if (lid == 0) AP(float, t.dst)[o] = As[0];
-    barrier(CLK_LOCAL_MEM_FENCE);
 }
 
 static void vmo_reduce_comb_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint dt,

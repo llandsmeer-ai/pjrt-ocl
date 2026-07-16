@@ -673,3 +673,21 @@ code; marginal on the *latency-bound* transformer (whose real cost was the reduc
 Remaining front: in-program matmul (attention/FFN) still runs the megakernel SGEMM at ~5
 TFLOP/s vs cuBLAS TF32 ~46 — being attacked by bringing the proven inline-PTX tensor-core
 kernel (poc/11-tensor-core-mma, per docs/matmul-tensorcore-brief.md; renumbered — poc/08 is occupancy discovery) back to the lane-bytecode path (guarded, portable fallback).
+
+## 14. PoCL barrier-placement portability rule (2026-07-17, merge fallout)
+
+- ❌ The merged collaborative segmented reduce (§13) crashed PoCL 5.0 at LAZY kernel compile —
+  `pocl::Kernel::createParallelRegionBefore: Assertion 'region_entry_barrier != NULL'` — killing
+  runtime_test and the e2e subprocess tests (main-process pytest stayed green because the
+  crashing kernel was never launched there; NVIDIA/Intel compile the same source fine, and
+  upstream's PoCL evidently tolerates it).
+- 🔬 Bisected by stubbing tile bodies: the trigger is a **barrier() as the LAST statement of a
+  switch case inside vmo_exec_tiles' tile loop** (i.e. immediately before the loop backedge).
+  Removed — provably safe here (after the tree's final barrier only lid 0 reads As[0]; every
+  tile op re-barriers before reading shared local slots). Early `return`s on paths that precede
+  barriers (even workgroup-uniform, spec-legal ones) were restructured to if/else at the same
+  time as defense in depth.
+- ✅ **Kernel-library rule going forward: in any function inlined into the tile dispatch,
+  (a) no `return` on a path that precedes a barrier, (b) no barrier as the final statement
+  before the dispatch loop's backedge.** Validate on PoCL (the strictest region-former) before
+  merging barrier-bearing kernels; a laptop-green NVIDIA/Intel run does not cover this.
