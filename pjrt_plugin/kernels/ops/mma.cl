@@ -19,12 +19,16 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, const task
 {
     const uint M = t.p0, N = t.p1, K = t.p2;
     const uint tiles_n = (N + MMA_TN - 1) / MMA_TN;
-    const uint tr = tile / tiles_n, tc = tile % tiles_n;
+    const uint tiles_m = (M + MMA_TM - 1) / MMA_TM;
+    const uint per = tiles_m * tiles_n;          /* tiles per batch slice */
+    const uint g = tile / per, loc = tile % per; /* g = batch index (p3) */
+    const uint tr = loc / tiles_n, tc = loc % tiles_n;
     const uint row0 = tr * MMA_TM, col0 = tc * MMA_TN;
     const uint lid = get_local_id(0);
     const uint ty = lid / MMA_TDIM, tx = lid % MMA_TDIM;
-    __global const float *ga = AP(const float, t.a);
-    __global const float *gb = AP(const float, t.b);
+    /* batched matmul: each slice g is a contiguous M×K / K×N / M×N sub-matrix */
+    __global const float *ga = AP(const float, t.a) + (size_t)g * M * K;
+    __global const float *gb = AP(const float, t.b) + (size_t)g * K * N;
 
     float acc[MMA_RM][MMA_RN];
     for (int i = 0; i < MMA_RM; i++)
@@ -57,7 +61,7 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, const task
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    __global float *gd = AP(float, t.dst);
+    __global float *gd = AP(float, t.dst) + (size_t)g * M * N;
     for (int i = 0; i < MMA_RM; i++) {
         const uint gr = row0 + ty * MMA_RM + i;
         if (gr >= M) continue;

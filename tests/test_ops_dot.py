@@ -72,16 +72,27 @@ def test_chained_matmul():
 
 # --- rejection: only the canonical plain-2D layout is supported -------------
 
-def test_batched_dot_rejected():
-    art = to_artifact(lambda a, b: jnp.matmul(a, b), arr(2, 3, 4), arr(2, 4, 5))
-    with pytest.raises(LoweringError, match="batching"):
-        scheduler.lower_and_schedule(art)
+def test_batched_matmul_supported():
+    # jnp.matmul on rank-3 = batched matmul over the leading dim (now supported).
+    check(lambda a, b: jnp.matmul(a, b), arr(2, 3, 4), arr(2, 4, 5))
 
 
-def test_rank3_vector_dot_rejected():
-    # tensordot contracting a single axis of rank-3 operands -> non-2D / batched
-    art = to_artifact(
-        lambda a, b: jnp.tensordot(a, b, axes=([2], [0])),
-        arr(2, 3, 4), arr(4, 5))
+def test_rank3_broadcast_dot_supported():
+    # contracting the last axis of a rank-3 lhs against a 2D rhs is now the
+    # broadcast-matmul case: (2,3,4)@(4,5) -> flatten to (6,4)@(4,5).
+    check(lambda a, b: jnp.tensordot(a, b, axes=([2], [0])), arr(2, 3, 4),
+          arr(4, 5))
+
+
+def test_batched_dot_supported():
+    # batched matmul (attention shape): batch dims [0] on both sides.
+    check(lambda a, b: jnp.einsum("bmk,bkn->bmn", a, b), arr(3, 4, 5),
+          arr(3, 5, 6))
+
+
+def test_noncanonical_contract_rejected():
+    # contracting a NON-last lhs axis needs an operand transpose first.
+    art = to_artifact(lambda a, b: jnp.tensordot(a, b, axes=([0], [0])),
+                      arr(4, 3), arr(4, 5))
     with pytest.raises(LoweringError):
         scheduler.lower_and_schedule(art)

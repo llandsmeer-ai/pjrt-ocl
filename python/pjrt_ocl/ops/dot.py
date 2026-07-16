@@ -53,91 +53,114 @@ from ..scheduler import Task, TILE_MMA, MMA_T
 
 
 def _decode(ins):
-    """(M, N, K) from the packed Instr fields (see module docstring)."""
-    return ins.n, ins.imm >> 16, ins.imm & 0xFFFF
+    """(M, N, K, G) from the packed Instr fields. G = batch count (imm2)."""
+    return ins.n, ins.imm >> 16, ins.imm & 0xFFFF, max(1, ins.imm2)
 
 
 @L.handles("stablehlo.dot_general")
 def _dot_general(ctx, op):
+    """General dot_general reduced to a (batched) row-major matmul
+    C[G,M,N] = A[G,M,K] @ B[G,K,N]:
+
+    - **Broadcast matmul** (`x @ W`, no batch dims): the lhs's leading free dims
+      flatten into M — e.g. (B,T,D)@(D,N) becomes (B*T, D)@(D, N).
+    - **Batched matmul** (attention QKᵀ / AV): equal leading batch dims on both
+      sides give G contiguous per-batch 2D matmuls.
+
+    Canonical layout only: lhs is [batch…, free…, K] (contract = last axis), rhs
+    is [batch…, K, free…] (contract = first non-batch axis) — exactly what
+    jax.numpy `@` / attention einsums emit. A non-canonical contract axis would
+    need an operand transpose first (raised, not silently wrong)."""
     from jaxlib.mlir.dialects import stablehlo
     lhs_shape, _, _ = L.tensor_info(op.operands[0].type)
     rhs_shape, _, _ = L.tensor_info(op.operands[1].type)
-    out_shape, _, _ = L.tensor_info(op.results[0].type)
 
     dn = stablehlo.DotDimensionNumbers(op.attributes["dot_dimension_numbers"])
     lc = list(dn.lhs_contracting_dimensions)
     rc = list(dn.rhs_contracting_dimensions)
     lb = list(dn.lhs_batching_dimensions)
     rb = list(dn.rhs_batching_dimensions)
+    lr, rr = len(lhs_shape), len(rhs_shape)
 
-    if lb or rb:
+    if len(lc) != 1 or len(rc) != 1:
         raise L.LoweringError(
-            f"dot_general: batching unsupported (lhs_batching={lb}, "
-            f"rhs_batching={rb}); only plain 2D matmul is covered")
-    if len(lhs_shape) != 2 or len(rhs_shape) != 2:
+            f"dot_general: only a single contracting dim (got lhs {lc}, rhs {rc})")
+    nb = len(lb)
+    if lb != list(range(nb)) or rb != list(range(nb)):
         raise L.LoweringError(
-            f"dot_general: only rank-2 @ rank-2 supported "
-            f"(got lhs {lhs_shape}, rhs {rhs_shape})")
-    if lc != [1] or rc != [0]:
+            f"dot_general: batch dims must be the leading axes on both sides "
+            f"(got lhs_batching={lb}, rhs_batching={rb})")
+    G = 1
+    for d in range(nb):
+        if lhs_shape[d] != rhs_shape[d]:
+            raise L.LoweringError("dot_general: batch dim size mismatch")
+        G *= lhs_shape[d]
+    if lc[0] != lr - 1:
         raise L.LoweringError(
-            f"dot_general: only canonical contracting dims [1] x [0] supported "
-            f"(got lhs_contracting={lc}, rhs_contracting={rc}); non-canonical "
-            f"layouts would need an operand transpose (GATHER family)")
+            f"dot_general: lhs contract dim must be last (got {lc[0]} of rank "
+            f"{lr}); a non-canonical layout needs a transpose first")
+    if rc[0] != nb:
+        raise L.LoweringError(
+            f"dot_general: rhs contract dim must be first after the batch dims "
+            f"(got {rc[0]}); a non-canonical layout needs a transpose first")
 
-    M, K = lhs_shape
-    K2, N = rhs_shape
-    if K != K2:
-        raise L.LoweringError(
-            f"dot_general: contracting dim mismatch (lhs K={K}, rhs K={K2})")
-    if out_shape != (M, N):
-        raise L.LoweringError(
-            f"dot_general: result shape {out_shape} != expected ({M}, {N})")
+    K = lhs_shape[lc[0]]
+    if rhs_shape[rc[0]] != K:
+        raise L.LoweringError("dot_general: contracting dim size mismatch")
+    M = 1
+    for d in range(nb, lr - 1):
+        M *= lhs_shape[d]
+    N = 1
+    for d in range(nb + 1, rr):
+        N *= rhs_shape[d]
     if N > 0xFFFF or K > 0xFFFF:
         raise L.LoweringError(
-            f"dot_general: N={N}, K={K} exceed the 16-bit packing limit "
-            f"(imm = (N<<16)|K); larger matmuls need a wider encoding")
+            f"dot_general: N={N}, K={K} exceed the 16-bit packing limit")
 
-    dst = ctx.new_buffer(M * N)
+    dst = ctx.new_buffer(G * M * N)
     ctx.emit(L.Instr(L.OP_DOT, dst=dst,
                      a=ctx.buf_for(op.operands[0]),
                      b=ctx.buf_for(op.operands[1]),
-                     n=M, imm=(N << 16) | K))
+                     n=M, imm=(N << 16) | K, imm2=G))
     ctx.value_to_buf[op.results[0]] = dst
 
 
 # --- tensor-opcode semantics for OP_DOT -------------------------------------
 
 def _dot_to_task(ins) -> Task:
-    M, N, K = _decode(ins)
+    M, N, K, G = _decode(ins)
     return Task(TILE_MMA, dst=ins.dst, a=ins.a, b=ins.b,
-                p0=M, p1=N, p2=K, p3=0)
+                p0=M, p1=N, p2=K, p3=G)
 
 
 def _dot_interp(ins, rt):
-    """Reference semantics (validator a): dense C[MxN] = A[MxK] @ B[KxN]."""
-    M, N, K = _decode(ins)
-    a = rt.view(ins.a, M * K).reshape(M, K)
-    b = rt.view(ins.b, K * N).reshape(K, N)
-    rt.view(ins.dst, M * N)[:] = (a @ b).reshape(-1)
+    """Reference semantics (validator a): C[G,M,N] = A[G,M,K] @ B[G,K,N]."""
+    M, N, K, G = _decode(ins)
+    a = rt.view(ins.a, G * M * K).reshape(G, M, K)
+    b = rt.view(ins.b, G * K * N).reshape(G, K, N)
+    rt.view(ins.dst, G * M * N)[:] = (a @ b).reshape(-1)
 
 
 def _dot_tile_sim(task, entry, rt):
-    """Schedule simulator (validator b): fill the 16x16 output tiles in
-    [entry.tile_lo, entry.tile_hi). Mirrors vm2.cl mma_tile tile indexing:
-    tiles_n = ceil(N/16); tr = tile // tiles_n; tc = tile % tiles_n; each tile
-    is C[tr*16:.., tc*16:..] (clipped to M,N) = A_rows @ B_cols."""
-    M, N, K = task.p0, task.p1, task.p2
-    a = rt.view(task.a).reshape(M, K)
-    b = rt.view(task.b).reshape(K, N)
-    c = rt.view(task.dst).reshape(M, N)
+    """Schedule simulator (validator b): fill the MMA_T×MMA_T output tiles in
+    [entry.tile_lo, entry.tile_hi). Tile index runs over batch × tiles_m ×
+    tiles_n; g = tile // (tiles_m*tiles_n) selects the batch slice, then tr/tc
+    within it (mirrors mma.cl's batched tile indexing)."""
+    M, N, K, G = task.p0, task.p1, task.p2, max(1, task.p3)
+    a = rt.view(task.a).reshape(G, M, K)
+    b = rt.view(task.b).reshape(G, K, N)
+    c = rt.view(task.dst).reshape(G, M, N)
     tiles_n = math.ceil(N / MMA_T) if N else 1
+    tiles_m = math.ceil(M / MMA_T) if M else 1
+    per = tiles_m * tiles_n
     for tile in range(entry.tile_lo, entry.tile_hi):
-        tr, tc = tile // tiles_n, tile % tiles_n
+        g, loc = tile // per, tile % per
+        tr, tc = loc // tiles_n, loc % tiles_n
         r0, r1 = tr * MMA_T, min(tr * MMA_T + MMA_T, M)
         c0, c1 = tc * MMA_T, min(tc * MMA_T + MMA_T, N)
         if r0 >= r1 or c0 >= c1:
             continue
-        c[r0:r1, c0:c1] = a[r0:r1, :] @ b[:, c0:c1]
+        c[g, r0:r1, c0:c1] = a[g, r0:r1, :] @ b[g, :, c0:c1]
 
 
 opsem.register(L.OP_DOT, to_task=_dot_to_task, interp=_dot_interp)

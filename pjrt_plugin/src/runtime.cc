@@ -593,7 +593,7 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
   // the megakernel (which caps matmul occupancy). Handles/dims come straight
   // from the (now offset-patched) task.
   if (tasks.size() == 1 && (tasks[0].tile_op & 0xFFu) == kTopMma &&
-      ((tasks[0].tile_op >> 8) & 0xFFu) == kDtF32) {
+      ((tasks[0].tile_op >> 8) & 0xFFu) == kDtF32 && tasks[0].p3 <= 1) {
     bool clean = true;
     for (const VmEntry& en : p.entries)
       if (en.task == kEntBarrier || en.task == kEntWhile || en.task == kEntIf)

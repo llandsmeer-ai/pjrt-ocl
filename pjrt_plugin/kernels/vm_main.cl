@@ -28,6 +28,7 @@ static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
         case TOP_DYN_GATHER:  vmo_dyn_gather_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
         case TOP_DYN_SCATTER: vmo_dyn_scatter_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
         case TOP_RED_WINDOW:  vmo_redwin_tile(arena, iop, aux, t, tile, dt, lid, lsz); break;
+        case TOP_RED_SEG:  vmo_redseg_tile(arena, iop, t, tile, dt, lid, lsz); break;
         default: break;
         }
     }

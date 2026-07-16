@@ -61,11 +61,11 @@ def build_example(name: str):
 
     if name == "diamond":
         def f(a, b, c):
-            m = a @ b        # heavy matmul            \  same dataflow level:
-            s = c + c        # cheap elementwise        } independent -> run
-            p = c * c        # cheap elementwise       /  in parallel (lanes)
-            q = s * p        # needs s,p  -> next level (after the barrier)
-            return q + m     # needs q,m  -> final level (the join)
+            m = a @ b        # heavy matmul (shaped)   \  runs in parallel with the
+            s = c + c        # elementwise              } elementwise chain s,p,q, which
+            p = c * c        # elementwise              } fuses onto lanes (no barrier:
+            q = s * p        # elementwise (needs s,p) /  same-index deps chain per tile)
+            return q + m     # needs m (shaped) -> the one barrier: the join
         return jax.jit(f), (m256(), m256(), m256())
     if name == "chain":
         def f(c):            # strictly sequential: one op per level

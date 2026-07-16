@@ -261,19 +261,23 @@ joined at the end:
 
 ```python
 def f(a, b, c):          # all 256x256 f32
-    m = a @ b            # heavy matmul            \  independent -> same dataflow
-    s = c + c            # cheap elementwise        } level, scheduled onto
-    p = c * c            # cheap elementwise       /  different lanes in parallel
-    q = s * p            # needs s and p  -> next level (after a global barrier)
-    return q + m         # needs q and m  -> final level (the join)
+    m = a @ b            # heavy matmul (shaped)    \  runs in parallel with the
+    s = c + c            # elementwise               } elementwise chain s,p,q, which
+    p = c * c            # elementwise               } fuses onto lanes with NO barrier
+    q = s * p            # elementwise (needs s,p)  /  (same-index deps chain per tile)
+    return q + m         # needs m (shaped) -> the one real barrier: the join
 ```
 
 The compile pipeline turns this into the per-lane schedule below. Lowering emits one
 **task** per op and splits each into **tiles** (16K elements for elementwise, 64×64
-output blocks for matmul). The scheduler then groups independent ops into **dataflow
-levels**, packs each level's tiles onto **lanes** (persistent workgroups) by cost
-(LPT), and separates levels with **global barriers** — that schedule *is* the bytecode
-the engines execute.
+output blocks for matmul). The scheduler groups ops into **phases**: independent ops and
+same-index elementwise **chains** share a phase — a chain runs on one lane per tile, so a
+dependency like `q = s * p` costs no barrier, only a cheap thread-local re-read. A **shaped**
+op (matmul/reduce/gather — its output reshuffles tiles across lanes) is the only thing that
+forces a phase boundary. It packs each phase's tiles onto **lanes** (persistent workgroups)
+by cost (LPT) and separates phases with **global barriers** — so `s, p, q` run barrier-free
+alongside the matmul and only the final join (which needs `m`) pays a barrier. That schedule
+*is* the bytecode the engines execute. (`PJRT_OCL_FUSE=0` reverts to one barrier per level.)
 
 A schedule is only as good as its cost model, so the plugin **measures** it rather than
 assuming one. On first use it runs a µbenchmark per tile-op family on the actual device

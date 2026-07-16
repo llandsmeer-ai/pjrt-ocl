@@ -487,15 +487,21 @@ def test_two_independent_ops_co_scheduled():
 
 
 def test_scheduler_dependent_chain_serializes():
-    """a*b - c : the subtract depends on the multiply, so they must be in
-    separate levels (two barrier phases)."""
+    """a*b - c : the subtract depends on the multiply, but both are elementwise
+    over the same shape, so the dependency is LANE-LOCAL (output element i reads
+    only input element i). The scheduler fuses them into one chain that runs on a
+    lane per tile — ONE barrier phase, no cross-workgroup barrier between the two
+    ops (that is the whole point: a same-index chain doesn't need a barrier)."""
     rng = np.random.default_rng(9)
     args = [rng.integers(-8, 8, size=(8,)).astype(np.float32) for _ in range(3)]
     prog = lower_via_service(_f_mul_sub, *args)
     phases = _tasks_in_phase(prog)
-    assert len(phases) == 2
-    assert phases[0] and phases[1]
-    assert phases[0].isdisjoint(phases[1])
+    assert len(phases) == 1
+    assert phases[0] == {0, 1}
+    # both tasks land on the SAME lane (the chain), in dependency order
+    lanes = {lane for lane, s in enumerate(prog.schedule.lane_streams)
+             for e in s if e.task in (0, 1)}
+    assert len(lanes) == 1
 
 
 def test_scheduler_nlanes_config_and_coverage():
