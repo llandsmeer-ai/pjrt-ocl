@@ -138,6 +138,8 @@ when a CUDA jaxlib is installed, else JAX CPU):
 
 ```bash
 . ./env.sh && python tools/plot_bench.py --device <platform substring>
+# end-to-end transformer sweep (one figure: latency + throughput vs model size):
+. ./env.sh && python tools/plot_transformer.py --device <platform substring>
 ```
 
 ### NVIDIA RTX PRO 6000 (Blackwell) — vs native CUDA
@@ -157,8 +159,8 @@ Takeaways (higher = slower; both axes log):
   **buffer pool** (reused output allocations, which removed a 3.5x step at 512K
   caused by NVIDIA's lazy ≥2MB allocation). The kernel itself was already
   bandwidth-competitive.
-- **`gather` (`dynamic_slice`)** ~2.2x at 16M, faster than CUDA below ~64K.
-- **`matrix × vector`** ~3.7x — memory-bound but routed through the tiled MMA
+- **`gather` (`dynamic_slice`)** ~1.7x at 16M, faster than CUDA below ~64K.
+- **`matrix × vector`** ~3.9x — memory-bound but routed through the tiled MMA
   kernel, which wastes most of a tile on a width-1 RHS; a dedicated GEMV kernel
   would close most of this.
 - **`dot_general`.** Large matmul runs a **standalone SGEMM** (`mm2`, launched
@@ -167,19 +169,22 @@ Takeaways (higher = slower; both axes log):
   peak** — i.e. it is TF32 **tensor-core** bound, which a portable f32 kernel
   can't reach. So there's now an **NVIDIA-only TF32 tensor-core path** (inline-PTX
   `wmma` behind the `VMO_NV_PTX` build, portable f32 fallback intact), with a
-  bank-conflict-free staging tile — ~18–20 TFLOP/s in the megakernel. It stays
-  short of cuBLAS because the in-kernel tile is **arithmetic-intensity-capped**:
-  the tile can't grow without dropping below the co-residency the persistent
-  megakernel's cross-workgroup barrier requires. See the end-to-end transformer
-  numbers below for where this lands on a real workload.
-- **`while` loops** went from **~28x to ~4x** at 16M elements. Three fixes:
+  bank-conflict-free staging tile — a pure matmul runs **~21 TFLOP/s at 2048³
+  (~5.0× off cuBLAS)**. It stays short of cuBLAS because the in-kernel tile is
+  **arithmetic-intensity-capped**: it can't grow without dropping below the
+  co-residency the persistent megakernel's cross-workgroup barrier requires. See
+  the end-to-end transformer numbers below for where this lands on a real workload.
+- **`while` loops** went from **~28x to ~1.8x** at 16M elements. Four fixes:
   (1) an **affine op** `d = a·s + t` that folds scalar-constant scale/bias
   (`x*1.5+1` was materializing two full-length broadcast buffers per iteration →
   now one fused pass); (2) **in-place carry updates** so a loop-carried buffer
-  stays L2-resident across iterations instead of being copied twice per step; and
+  stays L2-resident across iterations instead of being copied twice per step;
   (3) a **contention-free barrier spin** (coherent `atomic_load` instead of an
-  atomic RMW that ping-ponged the phase cache line across ~376 workgroups). The
-  affine folding is a general win for any `x*c`/`x+c`/affine chain.
+  atomic RMW that ping-ponged the phase cache line across ~376 workgroups); and
+  (4) **fixed-trip counted loops lowered to `OP_FOR`/bytecode-unroll** (the
+  common `fori_loop`/`scan` shape runs the body without a data-dependent
+  device-side condition check per step). The affine folding is a general win for
+  any `x*c`/`x+c`/affine chain.
 
 The remaining end-to-end gap on the closest ops is largely fixed jax→PJRT
 per-dispatch overhead, which amortizes in real fused programs.
@@ -190,12 +195,16 @@ A realistic forward pass — batched multi-head attention, layernorm, GELU FFN,
 residuals (random weights) — run through the full plugin and checked against a
 JAX-CPU reference (`--check`, f32-exact on the portable path). This is the
 apples-to-apples "does a real workload work, and how close are we?" test.
-NVIDIA (TF32 tensor cores on), vs native JAX CUDA on the same GPU:
+NVIDIA (TF32 tensor cores on), vs native JAX CUDA on the same GPU
+(`tools/plot_transformer.py`):
+
+![ours (OpenCL/NVIDIA) vs JAX CUDA, transformer forward pass](docs/bench_transformer.png)
 
 | config (D, ff, layers) | ours | native CUDA | gap | ours throughput |
 |------------------------|------|-------------|-----|-----------------|
-| base (512, 2048, 6)    | 9.7 ms | 0.45 ms | 22× | 2.2 TFLOP/s |
-| large (1024, 4096, 6)  | 33.5 ms | 3.6 ms | **9.2×** | **10.0 TFLOP/s** |
+| base (512, 2048, 6)    | 9.7 ms | 0.44 ms | 22.3× | 2.2 TFLOP/s |
+| large_l1 (1024, 4096, 1) | 5.5 ms | 0.57 ms | 9.8× | 10.1 TFLOP/s |
+| large (1024, 4096, 6)  | 33.5 ms | 3.7 ms | **9.1×** | **10.0 TFLOP/s** |
 
 The gap **more than halves as the model gets compute-bound** (and holds at full
 depth): `base`'s 22× is small-op/overhead-bound, not a matmul deficit — on
