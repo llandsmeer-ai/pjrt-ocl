@@ -217,6 +217,55 @@ __kernel void vm2_one(__global uchar *arena,
  * (e.g. 1024 vs 256 at N=2048) for far higher SM occupancy, while keeping the
  * 8x8 arithmetic intensity a standalone kernel can afford (no megakernel
  * register sharing). */
+#ifdef VMO_CPU_TILES
+/* CPU-shaped mm2 (poc/09 b2, decisions.md #11): one work-item per workgroup
+ * (ceil(M/4) groups — the host sets the geometry per engine), a 4-row x
+ * 16-column register block of float8 accumulators, no __local, no barriers.
+ * On a CPU OpenCL runtime __local staging is an extra memcpy and every WG
+ * barrier forces a loop-split; this shape measured 4x the MMA-tile GFLOP/s
+ * standalone and ~11x through the VM. Full 4-row blocks take the unrolled
+ * path; edge rows/columns fall to guarded scalar loops. */
+__kernel void mm2(__global uchar *arena, VMO_IO_PARAMS,
+                  const uint M, const uint N, const uint K,
+                  const uint dsth, const uint ah, const uint bh)
+{
+    VMO_IO_ARRAY;
+    __global const float *ga = AP(const float, ah);
+    __global const float *gb = AP(const float, bh);
+    __global float *gd = AP(float, dsth);
+    const uint r0 = get_group_id(0) * 4u;
+    const uint nr = min(4u, M - r0);
+    uint c0 = 0;
+    if (nr == 4u) {
+        for (; c0 + 16u <= N; c0 += 16u) {
+            float8 acc0[4], acc1[4];
+            for (int i = 0; i < 4; ++i) {
+                acc0[i] = (float8)(0.0f); acc1[i] = (float8)(0.0f);
+            }
+            for (uint k = 0; k < K; ++k) {
+                const float8 b0 = vload8(0, gb + k * N + c0);
+                const float8 b1 = vload8(0, gb + k * N + c0 + 8u);
+                for (int i = 0; i < 4; ++i) {
+                    const float8 av = (float8)(ga[(r0 + i) * K + k]);
+                    acc0[i] = mad(av, b0, acc0[i]);
+                    acc1[i] = mad(av, b1, acc1[i]);
+                }
+            }
+            for (int i = 0; i < 4; ++i) {
+                vstore8(acc0[i], 0, gd + (r0 + i) * N + c0);
+                vstore8(acc1[i], 0, gd + (r0 + i) * N + c0 + 8u);
+            }
+        }
+    }
+    for (; c0 < N; ++c0)               /* N tail (and nr<4 edge blocks) */
+        for (uint i = 0; i < nr; ++i) {
+            float s = 0.0f;
+            for (uint k = 0; k < K; ++k)
+                s = mad(ga[(r0 + i) * K + k], gb[k * N + c0], s);
+            gd[(r0 + i) * N + c0] = s;
+        }
+}
+#else
 #define MM2_TM 128
 #define MM2_TN 64
 #define MM2_BK 16
@@ -296,4 +345,28 @@ __kernel void mm2(__global uchar *arena, VMO_IO_PARAMS,
             if (gc < N) gd[gr * N + gc] = acc[i][j];
         }
     }
+}
+#endif  /* VMO_CPU_TILES */
+
+/* GEMV fast path: y[M] = A[MxK] . x[K] — a matmul task whose N is 1. The MMA
+ * tile wastes 63/64 of its work on a width-1 RHS (README flags this on
+ * NVIDIA); a one-row-per-WI float8 dot wins on BOTH device classes (poc/09
+ * c2: PoCL 12.7 vs ~0.6 GB/s in-VM; Xe2 73 vs 37). Same handle resolution as
+ * mm2 (VMO_BASE: arena offset or I/O port). */
+__kernel void gemv(__global uchar *arena, VMO_IO_PARAMS,
+                   const uint M, const uint K,
+                   const uint dsth, const uint ah, const uint bh)
+{
+    VMO_IO_ARRAY;
+    const uint r = get_global_id(0);
+    if (r >= M) return;
+    __global const float *ga = AP(const float, ah) + (ulong)r * K;
+    __global const float *gx = AP(const float, bh);
+    float8 s8 = (float8)(0.0f);
+    uint k = 0;
+    for (; k + 8u <= K; k += 8u)
+        s8 = mad(vload8(0, ga + k), vload8(0, gx + k), s8);
+    float s = s8.s0 + s8.s1 + s8.s2 + s8.s3 + s8.s4 + s8.s5 + s8.s6 + s8.s7;
+    for (; k < K; ++k) s = mad(ga[k], gx[k], s);
+    AP(float, dsth)[r] = s;
 }
