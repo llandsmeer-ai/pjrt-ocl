@@ -1208,6 +1208,16 @@ def lower_module(module) -> VMProgram:
     _fuse_views(ctx)
     _dce_nops(ctx)
 
+    # Arena offsets are patched into u32 task fields and bit 31 is the I/O-port
+    # flag (VMO_IO_BIT): an arena >= 2 GiB silently addresses the wrong memory
+    # (poc/12: a force-unrolled 512-trip loop over 1M-element carries returned
+    # inf). Fail the compile cleanly instead.
+    if ctx._arena >= 1 << 31:
+        raise LoweringError(
+            f"arena {ctx._arena} bytes exceeds the 31-bit offset space "
+            f"(u32 offsets, bit 31 = I/O-port flag); reduce the program's "
+            f"working set (e.g. PJRT_OCL_WHILE=for instead of unroll)")
+
     return VMProgram(
         arena_bytes=ctx._arena,
         buffers=ctx.buffers,
