@@ -732,3 +732,39 @@ code; marginal on the *latency-bound* transformer (whose real cost was the reduc
 Remaining front: in-program matmul (attention/FFN) still runs the megakernel SGEMM at ~5
 TFLOP/s vs cuBLAS TF32 ~46 — being attacked by bringing the proven inline-PTX tensor-core
 kernel (poc/11-tensor-core-mma, per docs/matmul-tensorcore-brief.md; renumbered — poc/08 is occupancy discovery) back to the lane-bytecode path (guarded, portable fallback).
+
+## 14. Transformer optimization campaign — profiling & remaining fronts (2026-07-16)
+
+Drove a realistic GPT-style forward pass (`tools/bench_transformer.py`, base = 4×128×512, 8
+heads, 6 layers, batch=4) OpenCL/NVIDIA vs native JAX CUDA. **14.5 ms → 7.6 ms (gap 32× →
+17×)**, all bit-close to JAX CPU / matching JAX CUDA's TF32. What each front bought:
+
+- **Segmented reductions + batched/broadcast dot_general** — enabling ops so it runs at all.
+- **Front 1 — access-map fusion (§13, viewed operands)**: general; marginal here (latency-bound).
+- **Front 2 — workgroup-per-segment reduce**: layernorm 2×, softmax 3.8×; **14.5 → 8.5 ms**.
+- **Front 3 — TF32 tensor cores in the megakernel (§10c)**: in-program matmul 1.5–1.6× but only
+  **8.5 → 7.6 ms** — because the matmuls are small (M=512, attention K=64) and latency-bound.
+
+**Profiled breakdown (base, PJRT_OCL_PROFILE + schedule inspection):**
+- 100% kernel time (in_copy 0.36 ms, out_copy 0.01 ms — H2D/D2H are NOT the issue).
+- **209 barriers / phases** (~34/layer); lane-count sweep 32→376 is FLAT, so barriers (whose cost
+  scales with lanes) are NOT dominant (~1.7 µs each, measured earlier ≈ 0.35 ms total).
+- Task mix: **210 EW, 48 MMA, 66 GATHER, 36 RSEG**. Matmul ≈ 2.5 ms (35%, TF32 saved 0.85 ms of
+  it — near its ceiling); **non-matmul ≈ 5 ms (65%)**.
+
+**The remaining gap is NOT one lever — it's distributed, and every piece is a large change:**
+- **Transposes into matmul (8 of the 66 gathers/layer → dot):** the attention head reshapes
+  (`(B,T,H,hd)→(B,H,T,hd)`) materialize full tensors + are phases. The fix is the access-map
+  principle applied to matmul: **strided/batched matmul operands** so the dot reads the
+  pre-transpose buffer via per-dim strides (batch may decompose into multiple strided sub-dims).
+  Highest single value (~1 ms) but a substantial mma-kernel + dot-lowering change. 🔬 delegated.
+- **Gather chains (gather→gather→EW):** the inner gather can't fold because the outer already
+  viewed the operand — needs strided-view *composition* (compose two access maps into one).
+  Low value here (broadcasts are tiny) — deferred.
+- **Small / batched matmul efficiency** (attention's 32× tiny 128×64×128): cuBLAS batched-GEMM
+  territory; hard.
+- **Flash-attention-style fusion** (QKᵀ→softmax→AV in fewer kernels): the biggest conceptual win,
+  the biggest effort.
+
+Conclusion: the general mechanisms (access-map fusion, collaborative reduce, TF32) are in and
+correct; closing the last ~17× is a set of large, mostly-independent efforts, not a single fix.
