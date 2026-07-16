@@ -100,7 +100,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="small", choices=list(CONFIGS))
     ap.add_argument("--check", action="store_true",
-                    help="compare against numpy/JAX-CPU reference and exit")
+                    help="compare against a JAX-CPU reference and exit nonzero on mismatch")
+    ap.add_argument("--dump-ref", metavar="PATH",
+                    help="(internal) run the model on the current JAX backend and "
+                         ".npy the output to PATH; used by --check's reference subprocess")
     ap.add_argument("--iters", type=int, default=20)
     args = ap.parse_args()
 
@@ -113,12 +116,30 @@ def main():
     jp = [{k: jnp.asarray(v) for k, v in p.items()} for p in params]
     fn = jax.jit(lambda x, p: model(x, p, cfg[3]))
 
+    if args.dump_ref:
+        np.save(args.dump_ref, np.asarray(fn(jx, jp)))
+        return
+
     if args.check:
         got = np.asarray(fn(jx, jp))
+        # Reference on JAX CPU (deterministic params, seed=0) in a subprocess —
+        # backends can't be switched in-process. Tolerances match the TF32
+        # tensor-core path (docs/decisions.md §10c): abs ~5e-3 on a ~1-std signal.
+        import subprocess, sys, tempfile, os as _os
+        with tempfile.TemporaryDirectory() as td:
+            ref_path = _os.path.join(td, "ref.npy")
+            env = dict(_os.environ, JAX_PLATFORMS="cpu")
+            subprocess.run([sys.executable, __file__, "--config", args.config,
+                            "--dump-ref", ref_path], check=True, env=env)
+            ref = np.load(ref_path)
+        max_abs = float(np.max(np.abs(got - ref)))
+        max_rel = float(np.max(np.abs(got - ref) / (np.abs(ref) + 1e-6)))
+        ok = np.allclose(got, ref, atol=5e-2, rtol=2e-2)
         print(f"config={args.config} out shape={got.shape} "
-              f"finite={np.isfinite(got).all()} "
-              f"mean={got.mean():.4f} std={got.std():.4f}")
-        return
+              f"finite={np.isfinite(got).all()} mean={got.mean():.4f} "
+              f"std={got.std():.4f} | vs JAX-CPU: max_abs={max_abs:.2e} "
+              f"max_rel={max_rel:.2e} allclose(5e-2,2e-2)={'PASS' if ok else 'FAIL'}")
+        sys.exit(0 if (ok and np.isfinite(got).all()) else 1)
 
     for _ in range(4):
         jax.block_until_ready(fn(jx, jp))
