@@ -1,4 +1,4 @@
-# pjrt-ocl
+# OpenMegaKernel (pjrt-ocl)
 
 **Run JAX on any OpenCL device.** `pjrt-ocl` is a [PJRT](https://openxla.org/xla/pjrt)
 plugin that lets `jax.jit` execute on OpenCL-capable hardware — Intel, AMD, NVIDIA,
@@ -261,41 +261,35 @@ The compile pipeline turns this into the per-lane schedule below. Lowering emits
 output blocks for matmul). The scheduler then groups independent ops into **dataflow
 levels**, packs each level's tiles onto **lanes** (persistent workgroups) by cost
 (LPT), and separates levels with **global barriers** — that schedule *is* the bytecode
-the engines execute. `tools/plot_schedule.py` draws it (top), then runs the program
-through the plugin with per-entry instrumentation and draws what the device really did
-(bottom):
+the engines execute.
 
-![scheduled vs measured lane timeline](docs/schedule_diamond.png)
+A schedule is only as good as its cost model, so the plugin **measures** it rather than
+assuming one. On first use it runs a µbenchmark per tile-op family on the actual device
+(two tile counts, slope, so launch overhead cancels), caches the result under
+`~/.cache/pjrt-ocl/` keyed by device+driver, and every subsequent compile schedules with
+those costs — on this CPU `ew=310 mma=5073 reduce=89 gather=201` µs/tile (a matmul tile
+really costs **~16×** an elementwise one), on the NVIDIA GPU
+`ew=15 mma=27 reduce=13 gather=21` (nearly uniform — same program, opposite balance). It
+matters: a naive unit-cost model dedicates whole lanes to the cheap elementwise ops, which
+then finish in under a millisecond and stall at the barrier while the matmul lanes grind on.
 
-Reading it, top panel (the scheduler's intent, on its cost model's clock):
-
-- **Level 0**: independent ops really do run side by side — the matmul's 16 tiles
-  fan out over several lanes while `c+c` and `c*c` run concurrently on others.
-- The dashed **barriers** separate levels: `s * p` and the final join each wait for
-  every lane, because their inputs were produced across lanes.
-- Levels 1–2 have only 4 tiles for 8 lanes: half the lanes are scheduled idle —
-  a structural **bubble** visible at schedule time.
-
-Bottom panel (device timestamps from the same program, white gaps = bubbles): this
-run was forced to the **unit-cost model** (`PJRT_OCL_CALIBRATE=0`), and on this CPU
-that model is badly wrong — a matmul tile really costs **~16×** an elementwise tile
-(measured), so the elementwise lanes finish in under a millisecond and stall at the
-barrier while the matmul lanes grind on: 42% of all lane-time is idle.
-
-This is why the cost model is **measured, not assumed**. On first use the plugin runs
-a µbenchmark per tile-op family on the actual device (two tile counts, slope, so
-launch overhead cancels), caches the result under `~/.cache/pjrt-ocl/` keyed by
-device+driver, and every subsequent compile schedules with those costs — on this CPU
-`ew=310 mma=5073 reduce=89 gather=201` µs/tile, on the NVIDIA GPU
-`ew=15 mma=27 reduce=13 gather=21` (nearly uniform — same schedule, opposite balance).
-With measured costs the packer both **fans the matmul out over all lanes** and
-**sequentializes the cheap elementwise ops behind its chunks** instead of dedicating
-lanes to them:
+`tools/plot_schedule.py` draws the calibrated schedule (top, the scheduler's intent on the
+device's measured clock), then runs the program through the plugin with per-entry
+instrumentation and draws what the device really did (bottom, white gaps = bubbles):
 
 ![scheduled vs measured, device-calibrated cost model](docs/schedule_diamond_calibrated.png)
 
-The planned and measured panels now agree structurally, and idle lane-time drops from
-42% to ~20% (the rest is the CPU runtime's own per-workgroup jitter, not scheduling).
+Reading it:
+
+- **Level 0**: independent ops run side by side — the matmul's tiles fan out over all
+  lanes while `c+c` and `c*c` run concurrently. With measured costs the packer
+  **fans the matmul out over every lane** and **sequentializes the cheap elementwise ops
+  behind its chunks** instead of dedicating lanes to them.
+- The dashed **barriers** separate levels: `s * p` and the final join each wait for
+  every lane, because their inputs were produced across lanes.
+- The planned and measured panels agree structurally; the remaining idle lane-time (~20%)
+  is the CPU runtime's own per-workgroup jitter, not scheduling.
+
 On shapes where cheap ops would otherwise steal lanes from a matmul (e.g. one matmul
 + seven small elementwise ops), the calibrated schedule is ~1.3× faster end-to-end on
 PoCL. Override knobs: `PJRT_OCL_COST_TABLE=<json>` (explicit table),
@@ -307,8 +301,6 @@ Reproduce (any of `diamond`, `chain`, `wide`, or your own StableHLO):
 . ./env.sh
 python tools/plot_schedule.py --example diamond --device Portable \
     --out docs/schedule_diamond_calibrated.png                 # measured costs (default)
-PJRT_OCL_CALIBRATE=0 python tools/plot_schedule.py --example diamond \
-    --device Portable --out docs/schedule_diamond.png          # unit-cost model
 python tools/plot_schedule.py --stablehlo my_program.mlir      # planned timeline only
 ```
 
