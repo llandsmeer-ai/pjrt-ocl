@@ -821,6 +821,27 @@ materialization + phases — a memory/phase win that a *compute*-bound or larger
 harmless where latency-bound). Behind `PJRT_OCL_MM_VIEWFOLD=0` per the "revert if it ever regresses"
 rule. Gather→gather→EW *composition* (compose two access maps) is still the deferred sibling (§14).
 
+### 14b. The CUDA gap vs. model size — we're overhead-bound, not compute-bound (2026-07-16)
+
+Measured ours (TF32 megakernel, NVIDIA) vs. native JAX CUDA on the same GPU, forward pass:
+
+| config   | ours (ms) | CUDA (ms) | gap    | ours GFLOP/s |
+|----------|-----------|-----------|--------|--------------|
+| tiny     | 1.58      | 0.13      | 11.9×  | 37           |
+| small    | 4.75      | 0.21      | 22.7×  | 198          |
+| base     | 9.90      | 0.44      | 22.5×  | 2,114        |
+| large_l1 | 5.83      | 0.57      | **10.2×** | **9,584**  |
+
+`large_l1` = one layer of the compute-bound `large` shape (D=1024, ff=4096, 16 heads). As the
+work becomes matmul-dominated the picture inverts: our throughput jumps to **9.6 TFLOP/s** and the
+gap **halves** (22× → 10×). So base's 22× is overhead/small-op-bound (many tiny barrier phases,
+§14 profiling), NOT a fundamental matmul deficit — on compute-bound work we are within ~10×, and
+that residual is cuBLAS-vs-our-tiling (the in-megakernel TF32 path runs at ~10% of native; the
+tuned standalone `mm2` TF32 kernel is faster but only fires for pure-matmul programs, §10c/§10b).
+The honest answer to "comparable range of performance": **yes on compute-bound layers, no on
+tiny/overhead-bound ones.** The full multi-layer `large` is blocked on arena reuse (§16); re-measure
+the end-to-end large gap once that lands.
+
 ## 15. Fixed-trip while: OP_FOR + bytecode unroll (2026-07-16, poc/12)
 
 **Observation**: essentially every `stablehlo.while` JAX emits is a *counted loop*
