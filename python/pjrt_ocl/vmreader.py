@@ -29,9 +29,9 @@ import numpy as np
 
 from .lowering import (
     ARENA_ALIGN, BUFENT_STRUCT, CONSTHDR_STRUCT, DT_F32, DTYPE_NUMPY,
-    HEADER_STRUCT, INSTR_STRUCT, MAGIC, OP_ADD_F32, OP_AFFINE_F32, OP_FILL_F32,
-    OP_IOTA_F32, OP_LTS_F32, OP_MUL_F32, OP_NAMES, OP_NOP, OP_SUB_F32, OP_WHILE,
-    SECTION_ALIGN, VERSION,
+    HEADER_STRUCT, INSTR_STRUCT, MAGIC, OP_ADD_F32, OP_AFFINE_F32, OP_DOT,
+    OP_FILL_F32, OP_IOTA_F32, OP_LTS_F32, OP_MUL_F32, OP_NAMES, OP_NOP,
+    OP_SUB_F32, OP_WHILE, SECTION_ALIGN, VERSION,
 )
 from . import scheduler as S
 from . import opsem
@@ -241,9 +241,9 @@ def parse(data: bytes) -> Program:
         pos += INSTR_STRUCT.size
         if op not in OP_NAMES:
             raise FormatError(f"instr[{i}] unknown opcode {op}")
-        # the 8th word is a second immediate for OP_AFFINE_F32 (t bits); it must
-        # stay a zero padding word for every other opcode.
-        if imm2 != 0 and op != OP_AFFINE_F32:
+        # the 8th word is a second immediate: OP_AFFINE_F32's t bits, or OP_DOT's
+        # batch count. It must stay a zero padding word for every other opcode.
+        if imm2 != 0 and op not in (OP_AFFINE_F32, OP_DOT):
             raise FormatError(f"instr[{i}] nonzero padding")
         if aux_off > n_aux:
             raise FormatError(f"instr[{i}] aux offset {aux_off} > n_aux {n_aux}")

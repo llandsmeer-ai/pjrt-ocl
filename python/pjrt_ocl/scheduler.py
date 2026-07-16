@@ -46,6 +46,7 @@ TILE_SCATTER = 6      # strided scatter: dst[out_off + affine(i)] = a[i]
 TILE_DYN_GATHER = 7   # dynamic_slice: gather with a runtime base offset
 TILE_DYN_SCATTER = 8  # dynamic_update_slice: scatter with a runtime base offset
 TILE_RED_WINDOW = 9   # windowed reduction (pooling)
+TILE_RED_SEG = 10     # segmented reduce: out[o] = reduce(in[o*seg : (o+1)*seg])
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -150,11 +151,14 @@ class Task:
                              TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW):
             return max(1, math.ceil(self.p1 / TILE_SIZE))
         if self.tile_op == TILE_MMA:
-            return math.ceil(self.p0 / MMA_T) * math.ceil(self.p1 / MMA_T)
+            return (math.ceil(self.p0 / MMA_T) * math.ceil(self.p1 / MMA_T)
+                    * max(1, self.p3))          # p3 = batch count
         if self.tile_op == TILE_REDUCE_PART:
             return max(1, math.ceil(self.p0 / self.p1)) if self.p1 else 1
         if self.tile_op == TILE_REDUCE_COMB:
             return 1
+        if self.tile_op == TILE_RED_SEG:      # tiled over the n_out outputs (p0)
+            return max(1, math.ceil(self.p0 / TILE_SIZE))
         raise ScheduleError(f"n_tiles: unknown tile_op {self.tile_op}")
 
 
