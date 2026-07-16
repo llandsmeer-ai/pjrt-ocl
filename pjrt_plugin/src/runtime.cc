@@ -335,6 +335,12 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   if (SupportsClC(rt->dev_, 2, 0)) variants.push_back({"-cl-std=CL2.0", true});
   variants.push_back({"", true});                    // lenient pre-3.0 drivers
   variants.push_back({"-DVMO_NO_DEVICE_FENCE", false});
+  // CPU devices get explicit-float8 tile bodies: CPU OpenCL runtimes only
+  // auto-vectorize the implicit work-item loop, which our in-kernel tile
+  // loops defeat — measured 5 vs 46 GB/s on PoCL (poc/09, decisions.md #11).
+  if (!rt->info_.is_gpu)
+    for (auto& v : variants)
+      v.opts += v.opts.empty() ? "-DVMO_CPU_TILES" : " -DVMO_CPU_TILES";
   std::string build_log;
   bool built = false;
   for (const auto& v : variants) {
@@ -1340,11 +1346,15 @@ void OclRuntime::CalibrateCosts() {
   else if (const char* h = std::getenv("HOME"); h && h[0])
     dir = std::string(h) + "/.cache/pjrt-ocl";
   else return;
+  // Key includes the kernel source + build options: measured per-tile costs
+  // go stale when the kernels (or their device-keyed variants) change.
   const std::string key =
       info_.platform_name + "|" + info_.device_name + "|" +
-      info_.driver_version;
+      info_.driver_version + "|" + info_.build_opts;
   uint64_t hash = 1469598103934665603ull;
   for (unsigned char c : key) hash = (hash ^ c) * 1099511628211ull;
+  for (const char* c = kVmClSource; *c; ++c)
+    hash = (hash ^ static_cast<unsigned char>(*c)) * 1099511628211ull;
   char hex[17];
   std::snprintf(hex, sizeof hex, "%016llx",
                 static_cast<unsigned long long>(hash));
