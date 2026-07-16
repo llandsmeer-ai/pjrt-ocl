@@ -34,8 +34,44 @@ Workloads (all f32, checked bit-comparable across modes via the `sig` column):
 `PJRT_OCL_WHILE=while|for|unroll` pins the path per subprocess; `xla-cpu` rows
 are the JAX CPU backend on the same machine.
 
-## Results
+## Results (2026-07-16; best-of-5 wall ms per execute)
 
-See `results_pocl.csv` / `results_nvidia.csv` (best-of-5 wall ms per execute;
-`compile_s` includes the first execute). Summary and the chosen `auto`
-threshold: docs/decisions.md §14.
+Full data: `results_pocl.csv` / `results_nvidia.csv`. Highlights (ms):
+
+**NVIDIA (persistent VM engine)** — FOR is 3.2–3.5x over WHILE on fori-ew,
+unroll ~2x more and reaches XLA-CPU parity at small sizes:
+
+| workload | n×T | while | for | unroll | xla-cpu |
+|---|---|---|---|---|---|
+| fori-ew | 4096×8   | 0.52 | 0.16 | **0.09** | 0.09 |
+| fori-ew | 4096×512 | 27.9 | 7.9  | **4.1**  | 2.9  |
+| fori-ew | 1M×512   | 53.6 | **28.6** | (arena guard) | 2.9* |
+| scan-rnn | 4096×8  | 1.09 | 0.70 | **0.42** | 0.39 |
+| scan-rnn | 1M×8    | 2.24 | 1.79 | **1.10** | 1.87 |
+
+**PoCL (host-dispatch engine)** — FOR removes the blocking per-iteration cond
+read; unroll additionally batches phases across iterations (up to 21x):
+
+| workload | n×T | while | for | unroll | xla-cpu |
+|---|---|---|---|---|---|
+| fori-ew | 4096×8   | 1.91 | 0.71 | **0.24** | 0.12 |
+| fori-ew | 4096×128 | 29.8 | 21.0 | **1.4**  | 0.82 |
+| fori-ew | 1M×8     | 20.3 | 19.2 | **10.8** | 10.2 |
+| scan-rnn | 4096×8  | 8.9  | 6.9  | **4.4**  | 0.16 |
+| scan-rnn | 1M×8    | 274.6 | 270.2 | **126.8** | 0.16* |
+
+\* XLA CPU rows marked * are after XLA-side loop optimizations our comparison
+can't disable (and CPU-contended rows fluctuate); the primary comparison is
+while/for/unroll on the same backend.
+
+Scan at large n×T is bound by the dynamic_update_slice identity copy (the full
+ys buffer re-materialized per iteration), not loop mechanics — the next scan
+lever is in-place DUS into the loop carry (docs/decisions.md §15).
+
+## Decision
+
+`PJRT_OCL_WHILE=auto` (default): unroll when `trip <= PJRT_OCL_UNROLL_TRIPS`
+(64) and `trip x estimated body bytes <= PJRT_OCL_UNROLL_ARENA_MB` (256 — the
+arena is a bump allocator; >=2 GiB overflows the u32/bit-31 offset space, now
+a clean compile error), else OP_FOR. Plain OP_WHILE only for genuinely
+data-dependent conds. Full write-up: docs/decisions.md §15.

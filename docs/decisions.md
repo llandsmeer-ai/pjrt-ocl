@@ -768,3 +768,57 @@ heads, 6 layers, batch=4) OpenCL/NVIDIA vs native JAX CUDA. **14.5 ms → 7.6 ms
 
 Conclusion: the general mechanisms (access-map fusion, collaborative reduce, TF32) are in and
 correct; closing the last ~17× is a set of large, mostly-independent efforts, not a single fix.
+
+## 15. Fixed-trip while: OP_FOR + bytecode unroll (2026-07-16, poc/12)
+
+**Observation**: essentially every `stablehlo.while` JAX emits is a *counted loop*
+(`lax.scan`/`fori_loop`: carry k init'd to a constant, cond `arg_k < const`, body returns
+`arg_k + const_step`). Data-dependent whiles are rare in practice. When the trip count is known
+at compile time, the cond sub-list — and, critically, every *runtime read* of the cond — is
+unnecessary; only data dependencies between iterations need synchronization.
+
+**What was built** (`_detect_fixed_trip` in lowering.py; `PJRT_OCL_WHILE=while|for|unroll|auto`):
+- **OP_FOR (op 53) / ENT_FOR (0xFFFFFFFB) / TASK_FOR**: body sub-list + trip count in the entry
+  (`wait_flag`); the VM frame's `phase` word counts remaining iterations. Persistent engine:
+  1 global barrier/iteration instead of 2 + cond phases + per-lane atomic cond read. Host-dispatch
+  engine: **no blocking cond read at all** — the whole loop streams into the enqueue ring (the
+  per-iteration cond read was the last remaining sync after §11's phase batching).
+- **Unroll**: body inlined `trip` times, pure SSA (no carries, no copies), the counter bound to a
+  per-iteration const-pool scalar so its add-chain DCEs and cross-iteration fusion applies —
+  a fori of `x*1.01+0.5` over 10 steps collapses to ONE affine instruction via `_compose_affines`.
+- **auto** (default): unroll iff `trip <= PJRT_OCL_UNROLL_TRIPS` (64) AND
+  `trip × est. body result bytes <= PJRT_OCL_UNROLL_ARENA_MB` (256 MB); else OP_FOR.
+
+**Measured** (poc/12 bench, best-of-5; fori-ew = `x = x*a+b` vector a/b; scan-rnn =
+`c = c*0.9+xs[t]` stacking ys):
+- **NVIDIA (persistent VM)**: FOR = **3.2–3.5×** over WHILE on fori-ew (e.g. 4096×T512:
+  27.9 → 7.9 ms), **1.5×** on scan-rnn. Unroll doubles that again where it fits
+  (4096×T8: 0.52 → 0.09 ms = **matches XLA CPU exactly**; scan 1M×T8 1.10 ms **beats** XLA's 1.87).
+- **PoCL (host-dispatch)**: FOR = 1.1–2.7× on fori-ew (4096×T8: 1.9 → 0.71 ms); unroll up to
+  **21×** over WHILE at 4096 (T128: 29.8 → 1.4 ms) and ~2× at 1M×T8 scan (275 → 127 ms, after
+  this session's passthrough fix).
+- Scan at LARGE n×T is bound by the dynamic_update_slice identity copy (full ys buffer
+  re-materialized every iteration — 4096×T512 ≈ 4 GB of traffic dwarfing loop overhead in every
+  mode). **Next lever for scan: in-place DUS into the loop carry**, not loop mechanics.
+
+**Traps hit** (fixes in this branch):
+- Unrolling past ~2 GiB of arena silently misaddresses: buffer offsets are u32 AND bit 31 is
+  VMO_IO_BIT — a 512-trip 1M-elem forced unroll returned `inf`. Now a clean LoweringError; the
+  bump allocator has no SSA liveness reuse (the M1 "reuse" line item remains unimplemented —
+  implementing it would widen unroll's applicable range considerably).
+- Outputs are I/O ports: a result buffer nothing writes (trip-0 unroll, passthrough) reaches
+  PJRT as garbage. The arena-based validators can't see it — only real-plugin e2e caught it.
+- Pre-existing, scan-blocking: `_fuse_views` folded the DUS identity gather into downstream
+  readers, orphaning the scatter (DCE'd it → ys returned all zeros; there were NO scan tests).
+  Gathers now fold only if their dst has exactly one writer and their src is never written later
+  (carries are multi-write). Viewed OP_COPY also dropped its view descriptor in
+  `_copy_to_task`/numpy interp.
+- Passthrough carries (scan's xs) paid 2 full-length snapshot copies per iteration for nothing —
+  now skipped (PoCL scan 1M×T8: 440 → 275 ms before the loop even changes mode).
+- A worktree branches from **origin/main**, not local main: the missing local redseg barrier fix
+  made PoCL assert `region_entry_barrier != NULL` at plugin init and perfectly impersonated a
+  new-kernel-control-flow bug. Merge local main into worktrees before debugging PoCL builds.
+
+**Decision**: `auto` is the default (unroll small, OP_FOR the rest, plain WHILE only for genuine
+data-dependent conds). Detection is deliberately narrow (LT/signed, positive const step) —
+widen only when a real program shows a different counted shape.
