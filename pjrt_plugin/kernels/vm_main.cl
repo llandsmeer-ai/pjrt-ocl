@@ -89,9 +89,8 @@ __kernel void vm2(__global uchar *arena,
                 continue;
             }
             if (w.task == ENT_FOR) {           /* fixed-trip iteration done */
-                /* Barrier between iterations: the body's last phase writes
-                 * loop carries the next iteration's first phase reads across
-                 * lanes. phase counts REMAINING iterations. */
+                /* Barrier publishes loop carries the next iteration reads
+                 * across lanes. phase counts REMAINING iterations. */
                 vmo_barrier(bar, nlanes);
                 barrier_i++;
                 if (--st[sp].phase != 0u) {

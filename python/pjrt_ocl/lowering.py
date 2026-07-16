@@ -728,6 +728,17 @@ def _unroll_while(ctx: _Ctx, op, trip: int, k: int, init: int, step: int,
             else:
                 _lower_op(ctx, io)
         cur = ret
+    # A result that aliases a buffer NO instruction writes (trip 0 -> the init
+    # operand; a passthrough carry -> an input; a const-folded counter -> the
+    # const pool) must be materialized: the executor binds outputs as I/O
+    # ports, and a port only holds data if some instruction writes it.
+    written = {ins.dst for ins in ctx.instrs if ins.op != OP_NOP}
+    for j in range(n):
+        if cur[j] not in written:
+            _, n_elems, dtype = _tensor_info(op.operands[j].type)
+            dst = ctx.new_buffer(n_elems, dtype)
+            ctx.emit(Instr(OP_COPY_F32, dst=dst, a=cur[j], n=n_elems))
+            cur[j] = dst
     for j in range(n):
         ctx.value_to_buf[op.results[j]] = cur[j]
 
