@@ -234,10 +234,11 @@ it's the alternative you'd actually use.
   elementwise and `gather` at 16M run **~6–8x faster** than XLA CPU
   (~100 GB/s effective — the zero-copy I/O ports matter doubly on an
   integrated GPU, where "device memory" is the same LPDDR5X). Crossover vs
-  XLA CPU: ~2M elements for elementwise, ~4M for `gather`, ~256K for the
-  `while` loop. `dot_general` is faster from N≈256 up — ~1.1 TFLOP/s at
-  2048³ via the standalone SGEMM path, ~2.8x XLA CPU. `matrix × vector` is
-  at parity at 2048 via the dedicated `gemv` kernel.
+  XLA CPU: ~512K elements for elementwise, ~1M for `gather`, ~32K for the
+  `while` loop (scheduler chain fusion moved every crossover earlier).
+  `dot_general` is faster from N≈256 up — ~1.1 TFLOP/s at 2048³ via the
+  standalone SGEMM path, ~2.3x XLA CPU. `matrix × vector` is at parity at
+  2048 via the dedicated `gemv` kernel.
 - **`while` loops**: ~23 µs/iteration overhead at small N (the affine-fold +
   in-place-carry + barrier-spin fixes cut it ~5x), and 1.6x *faster* than XLA
   CPU at 16M.
@@ -261,9 +262,9 @@ same 8 cores. It answers "what does the OpenCL detour cost on a CPU?" —
   which our in-kernel tile loops defeated — every hot tile body now has an
   explicit-`float8` CPU variant selected by a device-keyed build define
   (`poc/09-cpu-kernels`, `docs/decisions.md` §11). Result: at 16M elements
-  our OpenCL-on-CPU is **~3x faster than native XLA CPU** on elementwise
-  (4.8 vs 16.2 ms), **2.3x** on `dynamic_slice`, `matvec` at parity, `while`
-  within 1.3x.
+  our OpenCL-on-CPU is **~4x faster than native XLA CPU** on elementwise
+  at 16M, **~4x** on `dynamic_slice`, `while` within 1.2x; `matvec` drifts
+  1.2–1.7x behind run-to-run (XLA multithreads the dot harder).
 - **`dot_general` remains XLA's win, but by 3x rather than 88x**: the packed
   + KC-blocked CPU SGEMM (`poc/10-cpu-sgemm`) reaches ~156 GFLOP/s at 2048³
   vs Eigen's ~400–600. `PJRT_OCL_MM_CPU=reg` selects the simpler register

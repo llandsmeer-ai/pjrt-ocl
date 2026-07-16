@@ -1,69 +1,69 @@
 op,N,ours_ms,ref_ms
-elementwise add (a+b),4096,0.059839,0.009895
-elementwise add (a+b),8192,0.077028,0.009021
-elementwise add (a+b),16384,0.085958,0.008503
-elementwise add (a+b),32768,0.087958,0.011463
-elementwise add (a+b),65536,0.086557,0.015151
-elementwise add (a+b),131072,0.088496,0.022079
-elementwise add (a+b),262144,0.094206,0.041769
-elementwise add (a+b),524288,0.105227,0.074793
-elementwise add (a+b),1048576,0.19174,0.134827
-elementwise add (a+b),2097152,0.288152,0.422247
-elementwise add (a+b),4194304,0.521919,0.764688
-elementwise add (a+b),8388608,1.021667,6.572437
-elementwise add (a+b),16777216,1.950092,12.932974
-elementwise mul (a*b),4096,0.059316,0.00776
-elementwise mul (a*b),8192,0.06944,0.003659
-elementwise mul (a*b),16384,0.08257,0.008049
-elementwise mul (a*b),32768,0.082236,0.010486
-elementwise mul (a*b),65536,0.082065,0.016852
-elementwise mul (a*b),131072,0.081757,0.02094
-elementwise mul (a*b),262144,0.091728,0.034792
-elementwise mul (a*b),524288,0.1091,0.087381
-elementwise mul (a*b),1048576,0.162352,0.157041
-elementwise mul (a*b),2097152,0.281831,0.360694
-elementwise mul (a*b),4194304,0.529885,0.754851
-elementwise mul (a*b),8388608,1.016685,6.147201
-elementwise mul (a*b),16777216,1.943012,12.389302
-matrix x vector (NxN . Nx1),128,0.015634,0.004019
-matrix x vector (NxN . Nx1),256,0.026562,0.00852
-matrix x vector (NxN . Nx1),384,0.038627,0.007624
-matrix x vector (NxN . Nx1),512,0.044068,0.013892
-matrix x vector (NxN . Nx1),768,0.072082,0.018633
-matrix x vector (NxN . Nx1),1024,0.101491,0.028562
-matrix x vector (NxN . Nx1),1536,0.11536,0.088193
-matrix x vector (NxN . Nx1),2048,0.266497,0.275254
-matrix x matrix (NxN . NxN),128,0.074491,0.068209
-matrix x matrix (NxN . NxN),256,0.121537,0.162347
-matrix x matrix (NxN . NxN),384,0.304315,0.375328
-matrix x matrix (NxN . NxN),512,0.412239,0.537406
-matrix x matrix (NxN . NxN),768,0.914841,1.713767
-matrix x matrix (NxN . NxN),1024,2.004831,3.837364
-matrix x matrix (NxN . NxN),1536,5.995427,16.999714
-matrix x matrix (NxN . NxN),2048,15.178867,41.642995
-gather (dynamic_slice),4096,0.064328,0.006351
-gather (dynamic_slice),8192,0.079622,0.006304
-gather (dynamic_slice),16384,0.095688,0.006624
-gather (dynamic_slice),32768,0.144312,0.007396
-gather (dynamic_slice),65536,0.14951,0.009269
-gather (dynamic_slice),131072,0.10013,0.018395
-gather (dynamic_slice),262144,0.105323,0.018855
-gather (dynamic_slice),524288,0.095856,0.035194
-gather (dynamic_slice),1048576,0.100413,0.05277
-gather (dynamic_slice),2097152,0.164882,0.099076
-gather (dynamic_slice),4194304,0.255037,0.273548
-gather (dynamic_slice),8388608,0.437597,0.699334
-gather (dynamic_slice),16777216,0.792924,6.309724
-while loop (32x a*1.5+1),4096,0.66182,0.01294
-while loop (32x a*1.5+1),8192,0.718473,0.021579
-while loop (32x a*1.5+1),16384,0.850039,0.034335
-while loop (32x a*1.5+1),32768,0.855906,0.083885
-while loop (32x a*1.5+1),65536,0.859716,0.465921
-while loop (32x a*1.5+1),131072,0.87602,0.68533
-while loop (32x a*1.5+1),262144,0.919021,1.453485
-while loop (32x a*1.5+1),524288,1.352325,1.246094
-while loop (32x a*1.5+1),1048576,1.917992,4.113711
-while loop (32x a*1.5+1),2097152,3.566377,7.298469
-while loop (32x a*1.5+1),4194304,11.357152,13.906431
-while loop (32x a*1.5+1),8388608,21.911628,23.209371
-while loop (32x a*1.5+1),16777216,42.78965,67.255168
+elementwise add (a+b),4096,0.06296,0.008445
+elementwise add (a+b),8192,0.088059,0.026104
+elementwise add (a+b),16384,0.126497,0.027314
+elementwise add (a+b),32768,0.115229,0.037646
+elementwise add (a+b),65536,0.09736,0.047315
+elementwise add (a+b),131072,0.088357,0.065338
+elementwise add (a+b),262144,0.09999,0.08462
+elementwise add (a+b),524288,0.123895,0.156758
+elementwise add (a+b),1048576,0.196708,0.307412
+elementwise add (a+b),2097152,0.317657,0.640251
+elementwise add (a+b),4194304,0.566299,1.050639
+elementwise add (a+b),8388608,1.011482,10.019463
+elementwise add (a+b),16777216,2.040952,17.578393
+elementwise mul (a*b),4096,0.070673,0.009138
+elementwise mul (a*b),8192,0.074138,0.009028
+elementwise mul (a*b),16384,0.104392,0.009948
+elementwise mul (a*b),32768,0.102146,0.026484
+elementwise mul (a*b),65536,0.099373,0.033111
+elementwise mul (a*b),131072,0.108775,0.040203
+elementwise mul (a*b),262144,0.108754,0.073631
+elementwise mul (a*b),524288,0.114726,0.147505
+elementwise mul (a*b),1048576,0.206484,0.25067
+elementwise mul (a*b),2097152,0.335684,0.711529
+elementwise mul (a*b),4194304,0.59832,1.209213
+elementwise mul (a*b),8388608,1.16432,4.222217
+elementwise mul (a*b),16777216,2.361864,18.195932
+matrix x vector (NxN . Nx1),128,0.021403,0.013147
+matrix x vector (NxN . Nx1),256,0.028331,0.016445
+matrix x vector (NxN . Nx1),384,0.039316,0.02259
+matrix x vector (NxN . Nx1),512,0.08222,0.033085
+matrix x vector (NxN . Nx1),768,0.086646,0.031756
+matrix x vector (NxN . Nx1),1024,0.09782,0.041544
+matrix x vector (NxN . Nx1),1536,0.125453,0.134824
+matrix x vector (NxN . Nx1),2048,0.291704,0.2785
+matrix x matrix (NxN . NxN),128,0.109474,0.108085
+matrix x matrix (NxN . NxN),256,0.184908,0.549962
+matrix x matrix (NxN . NxN),384,0.374943,0.752273
+matrix x matrix (NxN . NxN),512,0.601622,1.110499
+matrix x matrix (NxN . NxN),768,1.279993,3.234009
+matrix x matrix (NxN . NxN),1024,2.12514,4.800172
+matrix x matrix (NxN . NxN),1536,6.048425,14.47289
+matrix x matrix (NxN . NxN),2048,15.335549,35.770422
+gather (dynamic_slice),4096,0.074972,0.008155
+gather (dynamic_slice),8192,0.093059,0.00856
+gather (dynamic_slice),16384,0.120577,0.011657
+gather (dynamic_slice),32768,0.162273,0.011378
+gather (dynamic_slice),65536,0.12482,0.014077
+gather (dynamic_slice),131072,0.12768,0.028171
+gather (dynamic_slice),262144,0.13067,0.044256
+gather (dynamic_slice),524288,0.101607,0.067865
+gather (dynamic_slice),1048576,0.102235,0.104465
+gather (dynamic_slice),2097152,0.199762,0.170229
+gather (dynamic_slice),4194304,0.321464,0.529842
+gather (dynamic_slice),8388608,0.490328,0.843347
+gather (dynamic_slice),16777216,0.819191,4.925289
+while loop (32x a*1.5+1),4096,0.061582,0.02703
+while loop (32x a*1.5+1),8192,0.072532,0.032502
+while loop (32x a*1.5+1),16384,0.096769,0.070823
+while loop (32x a*1.5+1),32768,0.124677,0.133047
+while loop (32x a*1.5+1),65536,0.077493,0.831008
+while loop (32x a*1.5+1),131072,0.089023,1.394543
+while loop (32x a*1.5+1),262144,0.099764,1.794666
+while loop (32x a*1.5+1),524288,0.640947,3.305461
+while loop (32x a*1.5+1),1048576,1.069185,5.886821
+while loop (32x a*1.5+1),2097152,3.441475,13.513329
+while loop (32x a*1.5+1),4194304,11.046921,25.432972
+while loop (32x a*1.5+1),8388608,21.924898,44.297702
+while loop (32x a*1.5+1),16777216,42.905429,69.278581
