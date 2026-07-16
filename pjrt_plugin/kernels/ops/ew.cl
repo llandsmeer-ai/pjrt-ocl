@@ -112,6 +112,45 @@ static void vmo_select_tile(__global uchar *arena, __global uchar **iop, const t
     }
 }
 
+#ifdef VMO_CPU_TILES
+/* float8 twins of vmo_ew_bin/un — every builtin used has a vector overload.
+ * SUB_SIGN is spelled with select() (vector-safe ternary). */
+static float8 vmo_ew_bin8(const uint sub, const float8 x, const float8 y)
+{
+    switch (sub) {
+    case SUB_ADD: return x + y;   case SUB_MUL: return x * y;
+    case SUB_SUB: return x - y;   case SUB_DIV: return x / y;
+    case SUB_MAX: return fmax(x, y); case SUB_MIN: return fmin(x, y);
+    case SUB_POW: return pow(x, y);
+    case SUB_ATAN2: return atan2(x, y);
+    case SUB_REMAINDER: return fmod(x, y);
+    default: return (float8)(0.0f);
+    }
+}
+static float8 vmo_ew_un8(const uint sub, const float8 x)
+{
+    switch (sub) {
+    case SUB_COPY: return x;      case SUB_NEG: return -x;
+    case SUB_EXP: return exp(x);  case SUB_LOG: return log(x);
+    case SUB_SQRT: return sqrt(x); case SUB_RSQRT: return rsqrt(x);
+    case SUB_TANH: return tanh(x); case SUB_ABS: return fabs(x);
+    case SUB_FLOOR: return floor(x); case SUB_CEIL: return ceil(x);
+    case SUB_SIGN: return select(select((float8)(1.0f), (float8)(-1.0f),
+                                        x < (float8)(0.0f)),
+                                 x, x == (float8)(0.0f) | isnan(x));
+    case SUB_LOG1P: return log1p(x);
+    case SUB_EXPM1: return expm1(x);
+    case SUB_CBRT: return cbrt(x);
+    case SUB_SIN: return sin(x);
+    case SUB_COS: return cos(x);
+    case SUB_TAN: return tan(x);
+    case SUB_RINT: return rint(x);
+    case SUB_ROUND: return round(x);
+    default: return (float8)(0.0f);
+    }
+}
+#endif
+
 static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                         uint lid, uint lsz)
 {
@@ -119,6 +158,38 @@ static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop, const t
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
     __global float *d = AP(float, t.dst);
     __global const float *a = AP(const float, t.a), *b = AP(const float, t.b);
+#ifdef VMO_CPU_TILES
+    /* CPU shape (poc/09 a4, decisions.md #11): a contiguous chunk per WI,
+     * explicit float8 body + scalar tail. PoCL's work-group vectorizer cannot
+     * vectorize ANY explicit in-kernel loop (measured 5 GB/s scalar vs
+     * 46 GB/s this shape); on GPUs this define is never set — they keep the
+     * coalesced stride-lsz loop below. Chunking preserves the aliasing
+     * guarantee for SUB_AFFINE (each WI reads/writes only its own elements). */
+    const uint chunk = (hi - lo + lsz - 1) / lsz;
+    const uint clo = min(lo + lid * chunk, hi), chi = min(clo + chunk, hi);
+    uint i = clo;
+    if (vmo_ew_is_bin(sub)) {
+        for (; i + 8 <= chi; i += 8)
+            vstore8(vmo_ew_bin8(sub, vload8(0, a + i), vload8(0, b + i)), 0, d + i);
+        for (; i < chi; ++i) d[i] = vmo_ew_bin(sub, a[i], b[i]);
+    } else if (vmo_ew_is_un(sub)) {
+        for (; i + 8 <= chi; i += 8)
+            vstore8(vmo_ew_un8(sub, vload8(0, a + i)), 0, d + i);
+        for (; i < chi; ++i) d[i] = vmo_ew_un(sub, a[i]);
+    } else if (sub == SUB_AFFINE) {
+        const float s = as_float(t.p2), tt = as_float(t.p3);
+        for (; i + 8 <= chi; i += 8)
+            vstore8(mad(vload8(0, a + i), (float8)(s), (float8)(tt)), 0, d + i);
+        for (; i < chi; ++i) d[i] = mad(a[i], s, tt);
+    } else if (sub == SUB_FILL) {
+        const float v = as_float(t.p2);
+        for (; i + 8 <= chi; i += 8) vstore8((float8)(v), 0, d + i);
+        for (; i < chi; ++i) d[i] = v;
+    } else if (sub == SUB_IOTA_FLAT) {
+        for (; i < chi; ++i) d[i] = (float)i;
+    }
+    else if (sub == SUB_LTS) { if (lid == 0 && lo == 0) d[0] = (a[0] < b[0]) ? 1.0f : 0.0f; }
+#else
     if (vmo_ew_is_bin(sub))
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = vmo_ew_bin(sub, a[i], b[i]);
     else if (vmo_ew_is_un(sub))
@@ -134,6 +205,7 @@ static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop, const t
     else if (sub == SUB_IOTA_FLAT)
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = (float)i;
     else if (sub == SUB_LTS) { if (lid == 0 && lo == 0) d[0] = (a[0] < b[0]) ? 1.0f : 0.0f; }
+#endif
 }
 
 #ifdef cl_khr_fp64

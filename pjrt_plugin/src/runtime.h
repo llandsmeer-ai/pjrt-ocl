@@ -118,6 +118,7 @@ class OclRuntime {
   cl_kernel vm_seg_kernel() const { return vm_seg_kernel_; }
   cl_kernel vm_one_kernel() const { return vm_one_kernel_; }
   cl_kernel mm_kernel() const { return mm_kernel_; }
+  cl_kernel gemv_kernel() const { return gemv_kernel_; }
   // Execution trace (PJRT_OCL_VM_TRACE=<path>): host-dispatch is forced and
   // every schedule entry runs as its own single-workgroup launch on a per-lane
   // profiling queue; per-entry device timestamps are appended to <path> as one
@@ -187,6 +188,7 @@ class OclRuntime {
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
   cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
   cl_kernel mm_kernel_ = nullptr;      // standalone SGEMM (pure-matmul fast path)
+  cl_kernel gemv_kernel_ = nullptr;    // width-1 matmul (both device classes)
   std::string trace_path_;             // empty = tracing off
   bool trace_suppressed_ = false;      // true during cost calibration
   std::string cost_table_path_;        // measured cost JSON ("" = unit costs)

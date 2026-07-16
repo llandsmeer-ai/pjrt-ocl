@@ -335,6 +335,12 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   if (SupportsClC(rt->dev_, 2, 0)) variants.push_back({"-cl-std=CL2.0", true});
   variants.push_back({"", true});                    // lenient pre-3.0 drivers
   variants.push_back({"-DVMO_NO_DEVICE_FENCE", false});
+  // CPU devices get explicit-float8 tile bodies: CPU OpenCL runtimes only
+  // auto-vectorize the implicit work-item loop, which our in-kernel tile
+  // loops defeat — measured 5 vs 46 GB/s on PoCL (poc/09, decisions.md #11).
+  if (!rt->info_.is_gpu)
+    for (auto& v : variants)
+      v.opts += v.opts.empty() ? "-DVMO_CPU_TILES" : " -DVMO_CPU_TILES";
   std::string build_log;
   bool built = false;
   for (const auto& v : variants) {
@@ -364,6 +370,9 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->mm_kernel_ = clCreateKernel(rt->program_, "mm2", &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateKernel mm2: " + std::to_string(cerr));
+  rt->gemv_kernel_ = clCreateKernel(rt->program_, "gemv", &cerr);
+  if (cerr != CL_SUCCESS)
+    return fail("clCreateKernel gemv: " + std::to_string(cerr));
   rt->dummy_buf_ = clCreateBuffer(rt->ctx_, CL_MEM_READ_WRITE, 4, nullptr, &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateBuffer dummy: " + std::to_string(cerr));
@@ -475,6 +484,7 @@ OclRuntime::~OclRuntime() {
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
   if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
   if (mm_kernel_) clReleaseKernel(mm_kernel_);
+  if (gemv_kernel_) clReleaseKernel(gemv_kernel_);
   if (dummy_buf_) clReleaseMemObject(dummy_buf_);
   for (auto& [sz, v] : buf_pool_)
     for (cl_mem m : v) clReleaseMemObject(m);
@@ -578,17 +588,27 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
     for (const VmEntry& en : p.entries)
       if (en.task == kEntBarrier || en.task == kEntWhile || en.task == kEntIf)
         clean = false;
-    // Gate to LARGE matmul: the 8x4 tile needs enough output tiles to fill the
-    // SMs. Below ~1024 the megakernel's 4x4/256-thread MMA (more workgroups per
-    // unit work, better latency hiding) is faster; above it mm2 wins ~1.2-1.3x
-    // (measured, docs/decisions.md #9b). PJRT_OCL_MM_KERNEL=0/1 forces it.
+    // Routing gates (PJRT_OCL_MM_KERNEL=0/1 forces off/on):
+    //  - N==1 -> gemv kernel on BOTH device classes (the MMA tile wastes
+    //    63/64 of its work on a width-1 RHS; poc/09 c2 wins everywhere).
+    //  - GPU: LARGE matmul only — the 8x4 mm2 tile needs enough output tiles
+    //    to fill the SMs; below ~1024 the megakernel's 4x4/256-thread MMA
+    //    (more workgroups per unit work) is faster; above it mm2 wins
+    //    ~1.2-1.3x (measured, docs/decisions.md #9b).
+    //  - CPU/host-dispatch: the VMO_CPU_TILES mm2 body (barrier-free 4x16
+    //    register block, poc/09 b2, ~11x the MMA tile in-VM) for anything
+    //    non-trivial; tiny matmuls stay on the megakernel (launch parity).
     const uint32_t M = tasks[0].p0, N = tasks[0].p1, Kd = tasks[0].p2;
-    // GPU only: the mm2 tile is tuned for GPU occupancy; CPU/host-dispatch
-    // devices keep their validated path.
-    bool big = !rt->host_dispatch() && M >= 1024 && N >= 1024 && Kd >= 256;
+    bool route;
+    if (N == 1)
+      route = M >= 16 && Kd >= 8;
+    else if (rt->host_dispatch())
+      route = M >= 16 && N >= 16 && Kd >= 16;
+    else
+      route = M >= 1024 && N >= 1024 && Kd >= 256;
     if (const char* e = std::getenv("PJRT_OCL_MM_KERNEL"); e && e[0])
-      big = (e[0] != '0') && !rt->host_dispatch();
-    if (clean && big) {
+      route = e[0] != '0';
+    if (clean && route) {
       lp->mm_ok_ = true;
       lp->mm_M_ = M;
       lp->mm_N_ = N;
@@ -768,26 +788,42 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
 
 // Standalone SGEMM launch: one 256-thread workgroup per 128x128 output tile.
 // mm2(arena, io0..io7, M, N, K, dst, a, b). No barrier buffer / lanes / tasks.
+// N==1 routes to gemv(arena, io0..io7, M, K, dst, a, b) — one row per WI.
+// Geometry per engine: GPU mm2 = one 256-WI workgroup per 128x64 output tile;
+// CPU mm2 (VMO_CPU_TILES body) = one single-WI workgroup per 4-row block.
 bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
-  cl_kernel k = rt_->mm_kernel();
-  constexpr uint32_t kTM = 128, kTN = 64;  // must match MM2_TM/MM2_TN
-  const size_t tiles_m = (mm_M_ + kTM - 1) / kTM;
-  const size_t tiles_n = (mm_N_ + kTN - 1) / kTN;
-  const size_t lsz = 256, gsz = tiles_m * tiles_n * lsz;   // MM2_NT threads/wg
+  const bool is_gemv = mm_N_ == 1;
+  cl_kernel k = is_gemv ? rt_->gemv_kernel() : rt_->mm_kernel();
+  size_t gsz, lsz;
+  if (is_gemv) {
+    lsz = 256;
+    gsz = (mm_M_ + lsz - 1) / lsz * lsz;
+  } else if (rt_->host_dispatch()) {
+    lsz = 1;
+    gsz = (mm_M_ + 3) / 4;
+  } else {
+    constexpr uint32_t kTM = 128, kTN = 64;  // must match MM2_TM/MM2_TN
+    const size_t tiles_m = (mm_M_ + kTM - 1) / kTM;
+    const size_t tiles_n = (mm_N_ + kTN - 1) / kTN;
+    lsz = 256;
+    gsz = tiles_m * tiles_n * lsz;           // MM2_NT threads/wg
+  }
   clSetKernelArg(k, 0, sizeof(arena_), &arena_);
   for (int pt = 0; pt < kNIoPorts; ++pt) {
     cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
     clSetKernelArg(k, 1 + pt, sizeof(cl_mem), &b);
   }
-  clSetKernelArg(k, 9, sizeof(uint32_t), &mm_M_);
-  clSetKernelArg(k, 10, sizeof(uint32_t), &mm_N_);
-  clSetKernelArg(k, 11, sizeof(uint32_t), &mm_K_);
-  clSetKernelArg(k, 12, sizeof(uint32_t), &mm_dst_);
-  clSetKernelArg(k, 13, sizeof(uint32_t), &mm_a_);
-  clSetKernelArg(k, 14, sizeof(uint32_t), &mm_b_);
+  int arg = 9;
+  clSetKernelArg(k, arg++, sizeof(uint32_t), &mm_M_);
+  if (!is_gemv) clSetKernelArg(k, arg++, sizeof(uint32_t), &mm_N_);
+  clSetKernelArg(k, arg++, sizeof(uint32_t), &mm_K_);
+  clSetKernelArg(k, arg++, sizeof(uint32_t), &mm_dst_);
+  clSetKernelArg(k, arg++, sizeof(uint32_t), &mm_a_);
+  clSetKernelArg(k, arg++, sizeof(uint32_t), &mm_b_);
   if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
                              nullptr) != CL_SUCCESS) {
-    *err = "Execute: mm2 launch failed";
+    *err = is_gemv ? "Execute: gemv launch failed"
+                   : "Execute: mm2 launch failed";
     return false;
   }
   return true;
@@ -1340,11 +1376,15 @@ void OclRuntime::CalibrateCosts() {
   else if (const char* h = std::getenv("HOME"); h && h[0])
     dir = std::string(h) + "/.cache/pjrt-ocl";
   else return;
+  // Key includes the kernel source + build options: measured per-tile costs
+  // go stale when the kernels (or their device-keyed variants) change.
   const std::string key =
       info_.platform_name + "|" + info_.device_name + "|" +
-      info_.driver_version;
+      info_.driver_version + "|" + info_.build_opts;
   uint64_t hash = 1469598103934665603ull;
   for (unsigned char c : key) hash = (hash ^ c) * 1099511628211ull;
+  for (const char* c = kVmClSource; *c; ++c)
+    hash = (hash ^ static_cast<unsigned char>(*c)) * 1099511628211ull;
   char hex[17];
   std::snprintf(hex, sizeof hex, "%016llx",
                 static_cast<unsigned long long>(hash));

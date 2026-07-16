@@ -577,3 +577,44 @@ NVIDIA megakernel 1.06–1.19× (cheap in-kernel barriers); **PoCL host-dispatch
 (each phase there is a kernel launch + clFinish, 7→1). Correct vs JAX CPU on both. 199 pytest
 + runtime_test green. Does NOT reduce memory traffic (ops still each read/write their buffers)
 — that is elementwise *op* fusion (the affine folding, §10a), orthogonal to chaining.
+
+## 12. CPU performance: why XLA CPU wins, and the fix (2026-07-16, poc/09)
+
+- Context: first honest PoCL-vs-native-XLA-CPU bench (README, 2026-07-16) showed 2.6x (EW 16M)
+  to ~90x (matmul 2048) to ~320x (matvec) deficits. poc/09 microbenches candidate kernel shapes
+  on PoCL AND Xe2 against an 8-thread memcpy wall (84.7 GB/s).
+- ❌ **Root cause 1 (EW): PoCL's work-group vectorizer only vectorizes the implicit WI loop.**
+  Any explicit in-kernel loop around the body — including our tile loop, restructured variants
+  with straight-line bodies, with or without guards — leaves the kernel SCALAR: 5 GB/s vs
+  46 GB/s for explicit float8 (a4). Not fixable by loop restructuring; measured, not assumed.
+- ❌ **Root cause 2 (matmul/matvec): the GPU MMA tile shape is pessimal on CPU.** __local
+  staging is an extra memcpy and every WG barrier makes PoCL loop-split; barrier-free
+  register-blocked float8 (1 WI/WG) is 4x faster standalone (60.9 vs 15.6 GFLOP/s @1024) and
+  ~11x vs in-VM; GEMV via a row-dot kernel beats the MMA tile on BOTH devices (12.7 vs ~0.6
+  GB/s PoCL; 73 vs 37 Xe2).
+- ❌ **Root cause 3 (small ops): PoCL's launch floor is 17–52 µs** (pipelined, measured) vs
+  XLA's ~12 µs full dispatch. Not ours to fix in-kernel; accepted.
+- ✅ **No single EW pattern wins both device classes** (a4: CPU 46 / Xe2 62; current a1: CPU 5 /
+  Xe2 104; a2 wins both but needs element-sized grids, incompatible with the lane/tile model).
+  **CHOSEN: device-keyed build define `-DVMO_CPU_TILES` (set when `!is_gpu`) selects an
+  explicit-float8 per-WI-contiguous EW tile body; GPUs keep the scalar coalesced loop.** This
+  is the CLAUDE.md "vendor tuning behind the kernel-table" mechanism, realized as a build
+  variant of the same source (precedent: the -cl-std probe, §3b).
+- ✅ CPU-shaped SGEMM + GEMV kernels routed via the pure-matmul fast path (precedent: mm2,
+  §10b). Iteration ladder recorded in poc/09 README: land b2 shape first (~11x), cache
+  blocking/packing later (Eigen parity NOT the goal; ~8x off is acceptable for a debug backend
+  that was ~90x off).
+- ✅ **SHIPPED (2026-07-16, three iterations, each 199/1 green on PoCL AND Xe2):**
+  1. `-DVMO_CPU_TILES` float8 EW bodies: add 16M f32 44.7 → **3.16 ms (63.8 GB/s)** — 14x, and
+     3.7x FASTER than native XLA CPU (11.8 ms). Xe2 build bit-identical (104 GB/s unchanged).
+     Cost-table cache key now includes kernel source + build opts (stale-cost bug otherwise).
+  2. CPU-shaped `mm2` body (barrier-free 4x16 float8 register block, geometry 1 WI/WG) +
+     **`gemv` kernel routed on BOTH device classes for N==1**: PoCL matmul 2048 3183 → **223 ms**
+     (14x, 77 GFLOP/s; XLA/Eigen 618 — cache-blocking is the recorded next rung), PoCL matvec
+     113 → **0.77 ms (147x)**; Xe2 matvec 0.456 → **0.253 ms** (1.8x, GPU win as predicted).
+  3. float8 movers for contiguous rank-1 dyn_gather/dyn_scatter + vector reduce partials:
+     dynamic_slice 16M 20.9 → **1.53 ms** (14x; XLA 5.7). reduce_sum 16M 1.15 ms (XLA 0.57 —
+     read-only stream, ours still has tree/barrier overhead; acceptable, revisit if it matters).
+- 🧭 Remaining known gaps, deliberately deferred: CPU matmul cache blocking (~8x to Eigen),
+  reduce 2x, PoCL launch floor (~17-52 µs, PoCL-internal), i32/f16 EW tiles still scalar on CPU
+  (extend vmo_ew_bin8 pattern when a workload cares).

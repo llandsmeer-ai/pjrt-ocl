@@ -61,6 +61,21 @@ static void vmo_dyn_gather_tile(__global uchar *arena, __global uchar **iop, __g
     const int is64 = x[1 + 5 * rank];
     const int base = vmo_dyn_base(arena, iop, x, rank, is64);
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, t.p1);
+#ifdef VMO_CPU_TILES
+    /* Contiguous rank-1 f32 slice (the common dynamic_slice) is a straight
+     * copy: d[i] = a[base+i]. The generic body's per-element div/mod runs
+     * scalar on CPU runtimes (poc/09); use the chunk-per-WI float8 mover. */
+    if (esz == 4 && rank == 1 && strides[0] == 1) {
+        __global float *d = AP(float, t.dst);
+        __global const float *a = AP(const float, t.a) + base;
+        const uint chunk = (hi - lo + lsz - 1) / lsz;
+        const uint clo = min(lo + lid * chunk, hi), chi = min(clo + chunk, hi);
+        uint i = clo;
+        for (; i + 8u <= chi; i += 8u) vstore8(vload8(0, a + i), 0, d + i);
+        for (; i < chi; ++i) d[i] = a[i];
+        return;
+    }
+#endif
     if (esz == 8)      DYN_GATHER_BODY(ulong);
     else if (esz == 2) DYN_GATHER_BODY(ushort);
     else if (esz == 1) DYN_GATHER_BODY(uchar);
@@ -90,6 +105,20 @@ static void vmo_dyn_scatter_tile(__global uchar *arena, __global uchar **iop, __
     const int is64 = x[1 + 5 * rank];
     const int base = vmo_dyn_base(arena, iop, x, rank, is64);
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, t.p1);
+#ifdef VMO_CPU_TILES
+    /* Contiguous rank-1 f32 update (the common dynamic_update_slice) is a
+     * straight copy: d[base+i] = a[i] — same CPU mover as dyn_gather. */
+    if (esz == 4 && rank == 1 && strides[0] == 1) {
+        __global float *d = AP(float, t.dst) + base;
+        __global const float *a = AP(const float, t.a);
+        const uint chunk = (hi - lo + lsz - 1) / lsz;
+        const uint clo = min(lo + lid * chunk, hi), chi = min(clo + chunk, hi);
+        uint i = clo;
+        for (; i + 8u <= chi; i += 8u) vstore8(vload8(0, a + i), 0, d + i);
+        for (; i < chi; ++i) d[i] = a[i];
+        return;
+    }
+#endif
     if (esz == 8)      DYN_SCATTER_BODY(ulong);
     else if (esz == 2) DYN_SCATTER_BODY(ushort);
     else if (esz == 1) DYN_SCATTER_BODY(uchar);
