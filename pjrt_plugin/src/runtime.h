@@ -159,6 +159,12 @@ class OclRuntime {
   // persistent spin-barrier deadlocks (imbalance-starvation, docs/decisions.md
   // #1 / poc/07); OFF for GPUs. Overridable via PJRT_OCL_ENGINE=host|mega|auto.
   bool host_dispatch() const { return host_dispatch_; }
+  // True for OpenCL GPU devices. Matmul launch GEOMETRY keys on this (not on
+  // host_dispatch): the mm2 kernel is correct only under its GPU tiled
+  // geometry on a GPU, so a fence-less GPU that runs the host EW engine must
+  // still launch matmul with GPU geometry — the CPU packed/register geometry
+  // silently produces wrong results on a GPU.
+  bool is_gpu() const { return info_.is_gpu; }
   std::mutex& mu() { return mu_; }
 
   // Device-resident buffer helpers (for device-resident PJRT_Buffers). Each

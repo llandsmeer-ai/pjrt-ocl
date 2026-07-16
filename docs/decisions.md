@@ -924,3 +924,30 @@ constants pinned (uploaded once at load), I/O ports out of the arena, WHILE/IF r
 live across the whole region, in-place aliasing, and viewfold gather sources live for their
 viewers. Verify: arena size drops, 215 pytest pass, transformer correct on both devices/both mm
 variants, and `large` lowers < 2^31 and matches JAX-CPU.
+
+## 17. Matmul launch geometry must key on `is_gpu`, not `host_dispatch` (found 2026-07-16)
+
+**Found while profiling `large`** (forced `PJRT_OCL_ENGINE=host` on the NVIDIA GPU to get a
+per-phase breakdown): a standalone large matmul crashed with `mm2_pack launch failed`, then —
+after a first fix — returned silently WRONG results (max_abs 169).
+
+**Root cause**: `LaunchMatmul` chose its launch geometry from `rt_->host_dispatch()`:
+- packed CPU-SGEMM path (pack B panels + 6×16 `mm2p`), and
+- register CPU path (`lsz=1, gsz=(M+3)/4`),
+
+both intended for CPU devices, vs. the GPU tiled path (`lsz=256`, tiles×256). But
+`host_dispatch_ = !is_gpu || !has_device_fence` (runtime.cc): host-dispatch is the EW-engine
+choice, and it is ON for **fence-less GPUs** too. So a GPU without a device fence — or any GPU
+forced onto the host engine — launched the mm2 kernel with CPU geometry, which the kernel does not
+implement correctly on a GPU. Two failure modes: (1) `mm2_pack`/`mm2p` kernels are only compiled
+for non-GPU devices, so the pack path launched a **null** kernel (`launch failed`); (2) the
+register path launched but computed garbage (wrong thread→output mapping for GPU).
+
+**Fix**: matmul geometry now keys on `is_gpu()` (added an accessor). GPU devices always use the
+GPU tiled geometry regardless of the EW engine; only genuine CPU devices take packed/register.
+The packed-scratch alloc is likewise gated on `!is_gpu() && mm_pack_kernel()`. Matmul dispatch is
+independent of the EW engine (`mm_ok_ ? LaunchMatmul : …`), so this is safe. **Verified**: GPU
+`ENGINE=host` large matmul now max_abs 2e-4 (was 169 / crash); GPU-normal + CPU paths unchanged;
+234→235 pytest (added `test_e2e_matmul_host_dispatch`, which forces the host engine and would have
+caught this on any GPU CI). This was latent for real fence-less-GPU vendors — exactly the AMD/Intel
+portability targets — so it is a genuine correctness fix, not just a debug-path curiosity.

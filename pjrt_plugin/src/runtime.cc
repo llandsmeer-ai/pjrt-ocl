@@ -698,7 +698,11 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
       // scratch; PJRT_OCL_MM_CPU=reg keeps the register kernel (fallback for
       // hardware that prefers it, and for ragged N).
       const char* mmc = std::getenv("PJRT_OCL_MM_CPU");
-      if (rt->host_dispatch() && N > 1 && N % 16 == 0 &&
+      // The packed SGEMM kernels (mm2_pack/mm2p) are only built on non-GPU
+      // devices (see clCreateKernel guard). A GPU forced into host-dispatch
+      // (PJRT_OCL_ENGINE=host) still reaches here — gate on the kernel actually
+      // existing, else the packed path launches a null kernel and fails.
+      if (!rt->is_gpu() && rt->mm_pack_kernel() && N > 1 && N % 16 == 0 &&
           !(mmc && !std::strcmp(mmc, "reg"))) {
         lp->mm_bp_bytes_ = size_t{Kd} * N * 4;
         lp->mm_bp_ = rt->PoolAlloc(lp->mm_bp_bytes_, err);
@@ -887,7 +891,7 @@ bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
   if (is_gemv) {
     lsz = 256;
     gsz = (mm_M_ + lsz - 1) / lsz * lsz;
-  } else if (rt_->host_dispatch() && mm_bp_) {
+  } else if (!rt_->is_gpu() && mm_bp_) {
     // Packed path: pack B panels, then KC sweeps of the 6x16 kernel, all
     // enqueued back-to-back on the in-order queue (caller drains).
     cl_kernel kp = rt_->mm_pack_kernel();
@@ -931,7 +935,7 @@ bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
       }
     }
     return true;
-  } else if (rt_->host_dispatch()) {
+  } else if (!rt_->is_gpu()) {
     lsz = 1;
     gsz = (mm_M_ + 3) / 4;
   } else {
