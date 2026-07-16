@@ -1,0 +1,4 @@
+/home/ubuntu/project/build-test/CMakeFiles/pjrt_ocl.dir
+/home/ubuntu/project/build-test/CMakeFiles/runtime_test.dir
+/home/ubuntu/project/build-test/CMakeFiles/edit_cache.dir
+/home/ubuntu/project/build-test/CMakeFiles/rebuild_cache.dir

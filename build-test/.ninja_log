@@ -1,0 +1,9 @@
+# ninja log v5
+1	10	1784151073505571030	vm_cl_source.h	92bf94411e0162ad
+1	10	1784151073505571030	/home/ubuntu/project/build-test/vm_cl_source.h	92bf94411e0162ad
+10	938	1784151074430576489	CMakeFiles/runtime_test.dir/src/runtime_test.cc.o	a10205a3556eea20
+10	1778	1784151075269581440	CMakeFiles/runtime_test.dir/src/runtime.cc.o	4dd614f0f34623f
+1779	1850	1784151075343581876	runtime_test	b8c79a4eb13fe6d
+3	960	1784151734950417784	CMakeFiles/runtime_test.dir/src/runtime_test.cc.o	a10205a3556eea20
+3	1843	1784151735832422865	CMakeFiles/runtime_test.dir/src/runtime.cc.o	4dd614f0f34623f
+1843	1917	1784151735907423297	runtime_test	b8c79a4eb13fe6d
