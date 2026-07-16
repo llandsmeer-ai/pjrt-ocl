@@ -373,6 +373,51 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->gemv_kernel_ = clCreateKernel(rt->program_, "gemv", &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateKernel gemv: " + std::to_string(cerr));
+
+  // NVIDIA-only TF32 tensor-core megakernel (docs/decisions.md §10b, poc/08):
+  // the SAME vm2 program rebuilt with -DVMO_NV_PTX, which swaps vmo_mma_tile's
+  // scalar 4x4 microtile for wmma.mma.sync m16n16k8 tensor cores so IN-PROGRAM
+  // matmuls (transformer QKV/FFN/out projections + batched attention) run on
+  // tensor cores without leaving the megakernel. Built as a SEPARATE program
+  // because inline PTX is rejected by PoCL/AMD/Intel — it must never touch the
+  // portable program above. Attempted only on NVIDIA; on any build failure
+  // vm_tc_kernel_ stays null and the persistent engine transparently uses the
+  // portable vm_kernel_ (try-and-fallback, mirroring the dialect probe).
+  // PJRT_OCL_MEGA_TC=0 disables it (portable path, for A/B occupancy measures).
+  bool mega_tc = rt->info_.is_gpu &&
+                 (rt->info_.device_name.find("NVIDIA") != std::string::npos ||
+                  rt->info_.platform_name.find("NVIDIA") != std::string::npos) &&
+                 rt->info_.has_device_fence;
+  if (const char* e = std::getenv("PJRT_OCL_MEGA_TC"); e && e[0] == '0')
+    mega_tc = false;
+  if (mega_tc) {
+    std::string tc_opts = rt->info_.build_opts + " -DVMO_NV_PTX";
+    const char* tsrc = kVmClSource;
+    size_t tlen = std::strlen(tsrc);
+    cl_int tce;
+    rt->tc_mega_program_ =
+        clCreateProgramWithSource(rt->ctx_, 1, &tsrc, &tlen, &tce);
+    if (tce == CL_SUCCESS &&
+        clBuildProgram(rt->tc_mega_program_, 1, &rt->dev_, tc_opts.c_str(),
+                       nullptr, nullptr) == CL_SUCCESS) {
+      rt->vm_tc_kernel_ = clCreateKernel(rt->tc_mega_program_, "vm2", &tce);
+      if (tce != CL_SUCCESS) rt->vm_tc_kernel_ = nullptr;
+    }
+    if (!rt->vm_tc_kernel_ && rt->tc_mega_program_) {
+      std::string log(1 << 14, '\0');
+      size_t ls = 0;
+      clGetProgramBuildInfo(rt->tc_mega_program_, rt->dev_,
+                            CL_PROGRAM_BUILD_LOG, log.size(), log.data(), &ls);
+      log.resize(std::min(ls, log.size()));
+      std::fprintf(stderr,
+                   "[pjrt-ocl] TF32 tensor-core megakernel unavailable, using "
+                   "portable in-program matmul. Build log:\n%s\n",
+                   log.c_str());
+      clReleaseProgram(rt->tc_mega_program_);
+      rt->tc_mega_program_ = nullptr;
+    }
+  }
+
   rt->dummy_buf_ = clCreateBuffer(rt->ctx_, CL_MEM_READ_WRITE, 4, nullptr, &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateBuffer dummy: " + std::to_string(cerr));
@@ -426,6 +471,12 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
       rt->ngroups_ = std::min(rt->ngroups_, measured);
   if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
+  if (const char* v = std::getenv("PJRT_OCL_INFO"); v && v[0])
+    std::fprintf(stderr,
+                 "[pjrt-ocl] engine=%s in-program-matmul=%s lanes=%u\n",
+                 rt->host_dispatch_ ? "host" : "mega",
+                 rt->vm_tc_kernel_ ? "TF32-tensor-core" : "portable-fp32",
+                 rt->ngroups_);
   // Calibration executes µbenchmark programs through the normal engine, so
   // lane sizing must be final first. (Today's calibration programs are all
   // n_lanes=1 and immune to oversubscription; the ordering keeps that from
@@ -452,11 +503,11 @@ cl_uint OclRuntime::ProbeResidency() {
   bool ok = true;
   for (cl_uint i = 0; i < 16 && ok; ++i) {
     if (i == 5)
-      ok = clSetKernelArg(vm_kernel_, i, sizeof(d), &d) == CL_SUCCESS;
+      ok = clSetKernelArg(vm_exec_kernel(), i, sizeof(d), &d) == CL_SUCCESS;
     else if (i == 6)
-      ok = clSetKernelArg(vm_kernel_, i, sizeof(nlanes), &nlanes) == CL_SUCCESS;
+      ok = clSetKernelArg(vm_exec_kernel(), i, sizeof(nlanes), &nlanes) == CL_SUCCESS;
     else
-      ok = clSetKernelArg(vm_kernel_, i, sizeof(dummy), &dummy) == CL_SUCCESS;
+      ok = clSetKernelArg(vm_exec_kernel(), i, sizeof(dummy), &dummy) == CL_SUCCESS;
   }
   cl_uint count = 0;
   if (ok) {
@@ -465,7 +516,7 @@ cl_uint OclRuntime::ProbeResidency() {
     const size_t launch_groups =
         std::min<size_t>(4096, std::max<size_t>(64, 4 * info_.compute_units));
     size_t g = launch_groups * local_size_, l = local_size_;
-    if (clEnqueueNDRangeKernel(queue_, vm_kernel_, 1, nullptr, &g, &l, 0,
+    if (clEnqueueNDRangeKernel(queue_, vm_exec_kernel(), 1, nullptr, &g, &l, 0,
                                nullptr, nullptr) == CL_SUCCESS &&
         clFinish(queue_) == CL_SUCCESS) {
       cl_uint out[3] = {0, 0, 0};
@@ -481,6 +532,7 @@ cl_uint OclRuntime::ProbeResidency() {
 
 OclRuntime::~OclRuntime() {
   if (vm_kernel_) clReleaseKernel(vm_kernel_);
+  if (vm_tc_kernel_) clReleaseKernel(vm_tc_kernel_);
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
   if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
   if (mm_kernel_) clReleaseKernel(mm_kernel_);
@@ -488,6 +540,7 @@ OclRuntime::~OclRuntime() {
   if (dummy_buf_) clReleaseMemObject(dummy_buf_);
   for (auto& [sz, v] : buf_pool_)
     for (cl_mem m : v) clReleaseMemObject(m);
+  if (tc_mega_program_) clReleaseProgram(tc_mega_program_);
   if (program_) clReleaseProgram(program_);
   if (queue_) clReleaseCommandQueue(queue_);
   if (ctx_) clReleaseContext(ctx_);
@@ -763,7 +816,7 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
     *err = "Execute: bar reset failed";
     return false;
   }
-  cl_kernel k = rt_->vm_kernel();
+  cl_kernel k = rt_->vm_exec_kernel();
   cl_uint nlanes = p.n_lanes;
   size_t lsz = 256, gsz = size_t{nlanes} * lsz;
   clSetKernelArg(k, 0, sizeof(arena_), &arena_);
