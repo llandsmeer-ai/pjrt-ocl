@@ -569,3 +569,17 @@ built to host it.
   §10b). Iteration ladder recorded in poc/09 README: land b2 shape first (~11x), cache
   blocking/packing later (Eigen parity NOT the goal; ~8x off is acceptable for a debug backend
   that was ~90x off).
+- ✅ **SHIPPED (2026-07-16, three iterations, each 199/1 green on PoCL AND Xe2):**
+  1. `-DVMO_CPU_TILES` float8 EW bodies: add 16M f32 44.7 → **3.16 ms (63.8 GB/s)** — 14x, and
+     3.7x FASTER than native XLA CPU (11.8 ms). Xe2 build bit-identical (104 GB/s unchanged).
+     Cost-table cache key now includes kernel source + build opts (stale-cost bug otherwise).
+  2. CPU-shaped `mm2` body (barrier-free 4x16 float8 register block, geometry 1 WI/WG) +
+     **`gemv` kernel routed on BOTH device classes for N==1**: PoCL matmul 2048 3183 → **223 ms**
+     (14x, 77 GFLOP/s; XLA/Eigen 618 — cache-blocking is the recorded next rung), PoCL matvec
+     113 → **0.77 ms (147x)**; Xe2 matvec 0.456 → **0.253 ms** (1.8x, GPU win as predicted).
+  3. float8 movers for contiguous rank-1 dyn_gather/dyn_scatter + vector reduce partials:
+     dynamic_slice 16M 20.9 → **1.53 ms** (14x; XLA 5.7). reduce_sum 16M 1.15 ms (XLA 0.57 —
+     read-only stream, ours still has tree/barrier overhead; acceptable, revisit if it matters).
+- 🧭 Remaining known gaps, deliberately deferred: CPU matmul cache blocking (~8x to Eigen),
+  reduce 2x, PoCL launch floor (~17-52 µs, PoCL-internal), i32/f16 EW tiles still scalar on CPU
+  (extend vmo_ew_bin8 pattern when a workload cares).
