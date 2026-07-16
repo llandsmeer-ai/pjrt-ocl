@@ -1082,3 +1082,45 @@ portability targets — so it is a genuine correctness fix, not just a debug-pat
   (a) no `return` on a path that precedes a barrier, (b) no barrier as the final statement
   before the dispatch loop's backedge.** Validate on PoCL (the strictest region-former) before
   merging barrier-bearing kernels; a laptop-green NVIDIA/Intel run does not cover this.
+
+## 19. Fusion pattern → singular fused op (methodology, 2026-07-17)
+
+**The general principle** (established by profiling the transformer `base`, §14b/§18): when an op
+sequence's intermediate results are **immediately reduced and broadcast back** — a
+reduce → broadcast → elementwise → reduce → broadcast chain — each step is a separate
+**cross-workgroup phase** with a full global-memory round-trip. At small tensor sizes every phase
+is latency-bound (~28–30 µs floor: the barrier + memory latency can't be hidden), so a 7-phase
+layernorm costs ~0.21 ms while cuBLAS/XLA fuse it into ~1 kernel at ~7 µs (**~30× gap**). This —
+NOT matmul — is the dominant cost on realistic (base-scale) transformer workloads: our small
+matmuls are already competitive/faster than CUDA; the loss is entirely in layernorm/softmax/gelu
+running at ~1–4% of memory bandwidth (component profile in `docs/` / session notes).
+
+**The fix pattern**: RECOGNIZE the fixed idiom and lower it to a SINGLE fused megakernel op that
+does the whole computation **in local memory with one global read + one global write** — the
+workgroup-per-segment collaborative pattern already used by `vmo_redseg_tile` (§14 front 2). A
+`seg`-wide row is staged into local once; all reduces (max/sum/sumsq) run as local tree-reduces;
+the normalize is applied and written back — zero intermediate global buffers, one phase instead of
+five to seven.
+
+**How to add a new fused op** (the reusable recipe — apply next time a workload shows a
+reduce+broadcast idiom eating phases, e.g. RMSNorm, logsumexp, log_softmax, GroupNorm, attention's
+scale+softmax):
+1. **Identify the idiom** and confirm it reduces over the **innermost (suffix) axis** — that's what
+   the segment model (`OP_REDUCE_SEG`/`TILE_RED_SEG`) already tiles as workgroup-per-segment.
+2. **Add a tensor opcode** (`OP_*`) + **tile-op** (`TILE_*_SEG`); `imm`/`imm2` carry seg size + any
+   scalar param (eps). Params that are per-channel vectors (layernorm's `*g+b`) stay as separate
+   EW — they fuse cheaply via §11/§13; keep the fused op to the phase-heavy reduce core.
+3. **Kernel**: clone `vmo_redseg_tile`'s structure — stage segment to `__local`, tree-reduce,
+   compute, write once. MUST follow the §18 PoCL rules (no `return` before a barrier; no barrier as
+   the last statement before the tile-loop backedge; `valid` guard for over-assigned tiles).
+4. **Recognize + rewrite**: a lowering pass detects the idiom and emits the single op. Prefer a
+   post-lowering peephole on OUR VM-instr stream (robust to StableHLO/jaxlib variation — everything
+   funnels through `OP_REDUCE_SEG` + viewed EW) over matching raw StableHLO; GATE it hard and fall
+   back to the decomposed path on any mismatch (never wrong, only sometimes-unfused).
+5. **Wire** scheduler `n_tiles` (= n_out segments), numpy interp + schedule-sim validators, and add
+   dual-validator tests. **Verify**: phase-count drop, component-ms drop, transformer `--check`
+   still exact on all devices, full-model ms win — keep only if it moves the needle (§14a rule).
+
+**Expected payoff**: layernorm ~7→~2 phases, softmax ~5→~1; on `base` these two ops are ~3.8 ms of
+9.7 ms today, so the ceiling is large. `gelu` is pure-EW (no reduce) and should already chain-fuse
+(§11) — if it doesn't, that's a chain-fusion gap, not a new fused op.
