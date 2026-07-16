@@ -220,13 +220,16 @@ same 8 cores. It answers "what does the OpenCL detour cost on a CPU?" —
   which our in-kernel tile loops defeated — every hot tile body now has an
   explicit-`float8` CPU variant selected by a device-keyed build define
   (`poc/09-cpu-kernels`, `docs/decisions.md` §11). Result: at 16M elements
-  our OpenCL-on-CPU is **3.2x faster than native XLA CPU** on elementwise
-  (3.2 vs 10.5 ms, ~61 GB/s), **4.5x** on `dynamic_slice`, `while` and
-  `matvec` at parity.
-- **`dot_general` remains XLA's win** (~6.5x at 2048³: 77 GFLOP/s from the
-  barrier-free register-blocked kernel vs Eigen's ~600 — cache-blocking is
-  the known next rung, deliberately deferred). Below ~1M elements the ~17–50
-  µs PoCL launch floor keeps small ops 2–7x slower.
+  our OpenCL-on-CPU is **~3x faster than native XLA CPU** on elementwise
+  (4.8 vs 16.2 ms), **2.3x** on `dynamic_slice`, `matvec` at parity, `while`
+  within 1.3x.
+- **`dot_general` remains XLA's win, but by 3x rather than 88x**: the packed
+  + KC-blocked CPU SGEMM (`poc/10-cpu-sgemm`) reaches ~156 GFLOP/s at 2048³
+  vs Eigen's ~400–600. `PJRT_OCL_MM_CPU=reg` selects the simpler register
+  kernel for hardware that prefers it. Below ~1M elements the ~17–50 µs PoCL
+  launch floor keeps small ops 2–7x slower (host-dispatch phases are batched
+  onto the in-order queue; the remaining floor is one `clFinish` + PoCL's
+  per-command cost).
 - If your machine has *any* supported GPU — including an iGPU — prefer it
   (see below). PoCL remains the bring-up/debug/CI backend: printf, host
   debuggers, and sanitizers all work there.
@@ -241,9 +244,9 @@ bytecode through this plugin
 ![ours Xe2 iGPU vs ours PoCL CPU, per-op N-vs-time](docs/bench_plot_lnl_xe2_vs_pocl.png)
 
 - After the CPU kernel work, the two backends **converge on pure streaming**
-  (they share the same LPDDR5X): the iGPU leads ~1.7x on elementwise/`gather`
-  at 16M and ~1.8x on the `while` loop, and `matvec` is a tie. Compute
-  density still separates them: **~18x** on `matmul` at 2048³.
+  (they share the same LPDDR5X): the iGPU leads ~2x on elementwise/`gather`
+  at 16M and ~2x on the `while` loop, and `matvec` is a tie. Compute
+  density still separates them: **~7x** on `matmul` at 2048³.
 - Practical guidance: on any machine with a working GPU ICD, the default
   device selection (first GPU) is the right choice — it never loses, and wins
   big on compute-dense programs. Select PoCL explicitly
