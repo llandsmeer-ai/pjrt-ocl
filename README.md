@@ -1,4 +1,4 @@
-# pjrt-ocl
+# OpenMegaKernel (pjrt-ocl)
 
 **Run JAX on any OpenCL device.** `pjrt-ocl` is a [PJRT](https://openxla.org/xla/pjrt)
 plugin that lets `jax.jit` execute on OpenCL-capable hardware — Intel, AMD, NVIDIA,
