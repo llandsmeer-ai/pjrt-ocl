@@ -91,6 +91,11 @@ enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
 #define ENT_BARRIER 0xFFFFFFFEu
 #define ENT_WHILE   0xFFFFFFFDu
 #define ENT_IF      0xFFFFFFFCu
+/* Fixed-trip loop (counted while, e.g. lax.scan/fori_loop): body entry range
+ * in tile_lo/tile_hi, trip count in wait_flag. No cond sub-list, no cond-flag
+ * read — one barrier per iteration (data deps across iterations) instead of
+ * WHILE's two plus the cond compute. */
+#define ENT_FOR     0xFFFFFFFBu
 #define FLAG_NONE   0xFFFFFFFFu
 
 typedef struct {

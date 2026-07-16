@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import struct
 
 import numpy as np
@@ -138,6 +139,7 @@ OP_DYNAMIC_UPDATE_SLICE = 49  # scatter with a runtime base offset
 OP_REDUCE_WINDOW = 50    # windowed reduction (pooling); aux = kind,rank,out/win/stride/pad/in dims+strides
 OP_AFFINE_F32 = 51       # fused scalar affine d = a*s + t; imm = f32(s) bits, aux = f32(t) bits
 OP_REDUCE_SEG = 52       # segmented reduce over the innermost `seg` elems; imm = (kind<<28)|seg
+OP_FOR = 53              # fixed-trip loop: body = instrs [n, n+imm), b = trip count
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -163,6 +165,7 @@ OP_NAMES = {
     OP_REDUCE_WINDOW: "reduce_window",
     OP_AFFINE_F32: "affine_f32",
     OP_REDUCE_SEG: "reduce_seg",
+    OP_FOR: "for",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
@@ -555,11 +558,14 @@ def _inline_call(ctx: _Ctx, o) -> None:
 class _WhileJob:
     """A deferred stablehlo.while region-lowering job. `while_idx` is the index
     of the WHILE placeholder Instr in ctx.instrs; carry is the list of
-    (buf_id, n_elems, dtype) loop-carried buffers."""
+    (buf_id, n_elems, dtype) loop-carried buffers. `trip` is the compile-time
+    trip count when the loop is a detected counted loop (OP_FOR; the cond
+    region is then never lowered), or None for a genuine data-dependent WHILE."""
     while_idx: int
     cond_block: object
     body_block: object
     carry: list
+    trip: int | None = None
 
 
 # Opcodes whose result element i is a pure function of operand element i (same
@@ -576,6 +582,156 @@ _EW_INPLACE_SAFE = frozenset({
 })
 
 
+def _defining_op(value):
+    """The Operation that produces `value`, or None for block arguments."""
+    owner = getattr(value, "owner", None)
+    owner = getattr(owner, "operation", owner)
+    return owner if getattr(owner, "name", None) else None
+
+
+def _const_scalar_int_of(value) -> int | None:
+    """If `value` is a scalar (1-element) integer stablehlo.constant, return
+    its python int value; else None."""
+    from jaxlib.mlir import ir
+    op = _defining_op(value)
+    if op is None or op.name != "stablehlo.constant":
+        return None
+    try:
+        _, n_elems, dtype = _tensor_info(op.results[0].type)
+    except LoweringError:
+        return None
+    if n_elems != 1 or dtype not in (DT_I32, DT_I64, DT_U32):
+        return None
+    arr = np.asarray(ir.DenseIntElementsAttr(op.attributes["value"]),
+                     dtype=np.int64).reshape(-1)
+    return int(arr[0])
+
+
+def _detect_fixed_trip(op):
+    """Detect the counted-loop pattern JAX emits for lax.scan / fori_loop:
+    some carry k is a scalar int counter with a constant init, the cond region
+    is exactly `compare LT (arg_k, constant)` and the body's k-th return is
+    `add(arg_k, constant step)` with step > 0. Nobody writes data-dependent
+    whiles by hand in JAX — scans dominate — so this catches nearly all loops.
+
+    Returns (trip_count, k, init, step, counter_dtype) or None. The compare
+    must not be UNSIGNED (init/limit/step are read as signed ints)."""
+    cond_block = op.regions[0].blocks[0]
+    body_block = op.regions[1].blocks[0]
+    cmp = ret = None
+    for inner in cond_block.operations:
+        io = inner.operation
+        if io.name == "stablehlo.constant":
+            continue
+        if io.name == "stablehlo.compare":
+            if cmp is not None:
+                return None
+            cmp = io
+        elif io.name == "stablehlo.return":
+            ret = io
+        else:
+            return None              # cond computes more than a counter check
+    if cmp is None or ret is None or ret.operands[0] != cmp.results[0]:
+        return None
+    try:
+        direction = str(cmp.attributes["comparison_direction"])
+    except KeyError:
+        return None
+    if "comparison_direction LT" not in direction:
+        return None
+    try:
+        if "UNSIGNED" in str(cmp.attributes["compare_type"]):
+            return None
+    except KeyError:
+        pass                             # compare_type is optional (NOTYPE)
+    k = next((i for i, a in enumerate(cond_block.arguments)
+              if cmp.operands[0] == a), None)
+    if k is None:
+        return None
+    limit = _const_scalar_int_of(cmp.operands[1])
+    init = _const_scalar_int_of(op.operands[k])
+    if limit is None or init is None:
+        return None
+    body_ret = None
+    for inner in body_block.operations:
+        io = inner.operation
+        if io.name == "stablehlo.return":
+            body_ret = io
+    if body_ret is None:
+        return None
+    upd = _defining_op(body_ret.operands[k])
+    if upd is None or upd.name != "stablehlo.add":
+        return None
+    step = None
+    if upd.operands[0] == body_block.arguments[k]:
+        step = _const_scalar_int_of(upd.operands[1])
+    elif upd.operands[1] == body_block.arguments[k]:
+        step = _const_scalar_int_of(upd.operands[0])
+    if step is None or step <= 0:
+        return None
+    trip = max(0, (limit - init + step - 1) // step)
+    if trip >= 1 << 31:
+        return None
+    counter_dt = _tensor_info(op.operands[k].type)[2]
+    return trip, k, init, step, counter_dt
+
+
+def _while_mode() -> str:
+    """PJRT_OCL_WHILE: auto (default; unroll small counted loops, OP_FOR the
+    rest), for / unroll (force that path for counted loops), while (disable
+    trip-count detection — the A/B baseline)."""
+    m = os.environ.get("PJRT_OCL_WHILE", "auto").strip().lower()
+    return m if m in ("auto", "for", "unroll", "while") else "auto"
+
+
+def _unroll_trip_limit() -> int:
+    """auto mode unrolls counted loops up to this trip count (PoC poc/12:
+    bytecode size grows linearly and compile/upload time with it, while the
+    per-iteration win over OP_FOR shrinks; see docs/decisions.md)."""
+    try:
+        return int(os.environ.get("PJRT_OCL_UNROLL_TRIPS", "32"))
+    except ValueError:
+        return 32
+
+
+def _emit_const_scalar_int(ctx: _Ctx, val: int, dtype: int) -> int:
+    """Materialize a scalar integer into the const pool; return its buffer."""
+    buf = ctx.new_buffer(1, dtype)
+    ctx.consts.append((buf, np.array([val], DTYPE_NUMPY[dtype]).tobytes()))
+    return buf
+
+
+def _unroll_while(ctx: _Ctx, op, trip: int, k: int, init: int, step: int,
+                  counter_dt: int) -> None:
+    """Inline a counted loop's body `trip` times into the current list (pure
+    SSA — no carry buffers, no copies). The counter arg is rebound to a fresh
+    const-pool scalar each iteration (its value is compile-time known), so the
+    counter-add chain goes dead (DCE) and iterations don't serialize on it;
+    dynamic_slice by the counter reads a constant. Constants in the body are
+    lowered once (same ir.Value each iteration — the binding persists)."""
+    n = len(op.operands)
+    body = op.regions[1].blocks[0]
+    cur = [ctx.buf_for(v) for v in op.operands]
+    for it in range(trip):
+        for j in range(n):
+            ctx.value_to_buf[body.arguments[j]] = cur[j]
+        ctx.value_to_buf[body.arguments[k]] = _emit_const_scalar_int(
+            ctx, init + it * step, counter_dt)
+        ret = None
+        for inner in body.operations:
+            io = inner.operation
+            if io.name == "stablehlo.return":
+                ret = [ctx.buf_for(v) for v in io.operands]
+            elif (io.name == "stablehlo.constant"
+                  and io.results[0] in ctx.value_to_buf):
+                continue
+            else:
+                _lower_op(ctx, io)
+        cur = ret
+    for j in range(n):
+        ctx.value_to_buf[op.results[j]] = cur[j]
+
+
 @_handles("stablehlo.while")
 def _lower_while(ctx: _Ctx, op):
     """Lower stablehlo.while to an OP_WHILE instruction over cond/body sub-lists.
@@ -590,7 +746,25 @@ def _lower_while(ctx: _Ctx, op):
 
     The cond/body regions are lowered LATER (region_queue, drained after the
     root list) so their instrs land at indices >= main_len — the root walk only
-    covers [0, main_len) and must never step into a sub-list (root_len rule)."""
+    covers [0, main_len) and must never step into a sub-list (root_len rule).
+
+    COUNTED LOOPS (poc/12): when the loop is a detected fixed-trip counter
+    pattern (lax.scan / fori_loop — the overwhelmingly common case), the cond
+    region never needs to run: small loops UNROLL inline (enables cross-
+    iteration fusion + affine composition; no control at all), larger ones
+    become OP_FOR (body sub-list + trip count; no cond compute, no cond-flag
+    read, one barrier per iteration instead of two). PJRT_OCL_WHILE forces a
+    path for A/B; default `auto` picks by trip count."""
+    fixed = _detect_fixed_trip(op)
+    mode = _while_mode()
+    if fixed is not None and mode != "while":
+        trip, ck, init, step, counter_dt = fixed
+        if mode == "unroll" or (mode == "auto"
+                                and trip <= _unroll_trip_limit()):
+            _unroll_while(ctx, op, trip, ck, init, step, counter_dt)
+            return
+    else:
+        fixed = None
     n = len(op.operands)
     carry: list = []
     for k in range(n):
@@ -603,7 +777,8 @@ def _lower_while(ctx: _Ctx, op):
     while_idx = len(ctx.instrs)
     ctx.emit(Instr(OP_WHILE))          # placeholder; patched once regions lower
     ctx.region_queue.append(_WhileJob(
-        while_idx, op.regions[0].blocks[0], op.regions[1].blocks[0], carry))
+        while_idx, op.regions[0].blocks[0], op.regions[1].blocks[0], carry,
+        trip=fixed[0] if fixed is not None else None))
     for k in range(n):                 # results alias the carry buffers
         ctx.value_to_buf[op.results[k]] = carry[k][0]
 
@@ -616,23 +791,28 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
     n = len(carry)
 
     # --- cond sub-list: bind block args to carries, lower, read the scalar ----
+    # A fixed-trip loop (job.trip) has NO cond sub-list: the trip count drives
+    # iteration, so the counter compare/convert never executes.
     cond_start = len(ctx.instrs)
-    for k in range(n):
-        ctx.value_to_buf[job.cond_block.arguments[k]] = carry[k][0]
-    cond_scalar = None
-    for inner in job.cond_block.operations:
-        io = inner.operation
-        if io.name == "stablehlo.return":
-            cond_scalar = ctx.buf_for(io.operands[0])
-        else:
-            _lower_op(ctx, io)
-    if cond_scalar is None:
-        raise LoweringError("stablehlo.while cond region has no return")
-    # The device reads the loop scalar with a 4-byte atomic; the compare result
-    # is a 1-byte i1. Convert it to an f32 0.0/1.0 flag so all 4 bytes are
-    # defined (a bare bool slot would leave 3 padding bytes in the atomic read).
-    cond_flag = ctx.new_buffer(1, DT_F32)
-    ctx.emit(Instr(OP_CONVERT, dst=cond_flag, a=cond_scalar, n=1))
+    cond_flag = 0
+    if job.trip is None:
+        for k in range(n):
+            ctx.value_to_buf[job.cond_block.arguments[k]] = carry[k][0]
+        cond_scalar = None
+        for inner in job.cond_block.operations:
+            io = inner.operation
+            if io.name == "stablehlo.return":
+                cond_scalar = ctx.buf_for(io.operands[0])
+            else:
+                _lower_op(ctx, io)
+        if cond_scalar is None:
+            raise LoweringError("stablehlo.while cond region has no return")
+        # The device reads the loop scalar with a 4-byte atomic; the compare
+        # result is a 1-byte i1. Convert it to an f32 0.0/1.0 flag so all 4
+        # bytes are defined (a bare bool slot would leave 3 padding bytes in
+        # the atomic read).
+        cond_flag = ctx.new_buffer(1, DT_F32)
+        ctx.emit(Instr(OP_CONVERT, dst=cond_flag, a=cond_scalar, n=1))
     cond_len = len(ctx.instrs) - cond_start
 
     # --- body sub-list: lower, then copy new values back into the carries -----
@@ -679,7 +859,7 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
     # nested control (a WHILE/IF in this body) can make a carry's "producer" be a
     # nested region's init-copy; in-placing that corrupts the nested loop. Only
     # in-place flat elementwise bodies (the common fori/scan recurrence).
-    has_nested = any(ctx.instrs[i].op in (OP_WHILE, OP_IF)
+    has_nested = any(ctx.instrs[i].op in (OP_WHILE, OP_IF, OP_FOR)
                      for i in range(body_start, body_end0))
     inplace = [False] * n
     for k in ([] if has_nested else range(n)):
@@ -715,8 +895,13 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
         ctx.emit(Instr(OP_COPY_F32, dst=cbuf, a=temps[k], n=n_elems))
     body_len = len(ctx.instrs) - body_start
 
-    ctx.instrs[job.while_idx] = Instr(OP_WHILE, dst=cond_flag, a=cond_start,
-                                      b=cond_len, n=body_start, imm=body_len)
+    if job.trip is not None:
+        ctx.instrs[job.while_idx] = Instr(OP_FOR, b=job.trip,
+                                          n=body_start, imm=body_len)
+    else:
+        ctx.instrs[job.while_idx] = Instr(OP_WHILE, dst=cond_flag,
+                                          a=cond_start, b=cond_len,
+                                          n=body_start, imm=body_len)
 
 
 def _lower_op(ctx: _Ctx, o) -> None:
@@ -740,7 +925,7 @@ def _reads_of(ins: Instr) -> set[int]:
     if op == OP_NOP:
         return set()
     base = set(ins.reads_hint)
-    if op in (OP_WHILE, OP_IF):
+    if op in (OP_WHILE, OP_IF, OP_FOR):
         return base                      # region instrs are separately live
     if op in opsem.READS:
         return base | opsem.reads_of(ins)
@@ -817,9 +1002,9 @@ def _dce_nops(ctx: _Ctx) -> None:
     live_instr = [False] * len(instrs)
     # seed: control ops are always live (side effects / device-read cond_flag)
     for idx, ins in enumerate(instrs):
-        if ins.op in (OP_WHILE, OP_IF):
+        if ins.op in (OP_WHILE, OP_IF, OP_FOR):
             live_instr[idx] = True
-            if ins.dst:
+            if ins.dst and ins.op != OP_FOR:   # FOR has no cond flag
                 live_buf.add(ins.dst)
     changed = True
     while changed:
@@ -871,10 +1056,24 @@ def _fuse_views(ctx: _Ctx) -> None:
     changed = True
     while changed:
         changed = False
+        writer_idxs: dict[int, list[int]] = {}
+        for idx, ins in enumerate(instrs):
+            if ins.op != OP_NOP:
+                writer_idxs.setdefault(ins.dst, []).append(idx)
         for gi, g in enumerate(instrs):
             if g.op != OP_GATHER_STRIDED or g.dst in outs:
                 continue
             if ctx.buffers[g.dst].dtype != DT_F32:
+                continue
+            # The gather's dst must be a pure view of its source: skip if any
+            # OTHER instr writes g.dst (read-modify-write, e.g. the identity
+            # copy + dyn_scatter pair of dynamic_update_slice — folding it
+            # orphans the scatter's write), or if g.a is written after the
+            # gather (loop carries are multi-write: the folded readers would
+            # see the NEXT iteration's value).
+            if len(writer_idxs.get(g.dst, ())) != 1:
+                continue
+            if any(w > gi for w in writer_idxs.get(g.a, ())):
                 continue
             gbuf = g.dst
             readers = [(j, ins) for j, ins in enumerate(instrs)

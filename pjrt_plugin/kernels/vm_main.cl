@@ -88,6 +88,21 @@ __kernel void vm2(__global uchar *arena,
                 st[sp].pc++;
                 continue;
             }
+            if (w.task == ENT_FOR) {           /* fixed-trip iteration done */
+                /* Barrier between iterations: the body's last phase writes
+                 * loop carries the next iteration's first phase reads across
+                 * lanes. phase counts REMAINING iterations. */
+                vmo_barrier(bar, nlanes);
+                barrier_i++;
+                if (--st[sp].phase != 0u) {
+                    st[sp].pc = w.tile_lo;
+                    st[sp].end = w.tile_lo + w.tile_hi;
+                } else {
+                    sp--;
+                    st[sp].pc++;
+                }
+                continue;
+            }
             if (st[sp].phase == 0) {           /* while-cond range done */
                 vmo_barrier(bar, nlanes);
                 barrier_i++;
@@ -128,6 +143,18 @@ __kernel void vm2(__global uchar *arena,
             st[sp].end = en.tile_lo + en.tile_hi;
             st[sp].widx = epc;
             st[sp].phase = 0;
+            continue;
+        }
+        if (en.task == ENT_FOR) {
+            if (en.wait_flag == 0u) {          /* trip 0: skip the loop */
+                st[sp].pc++;
+                continue;
+            }
+            sp++;
+            st[sp].pc = en.tile_lo;
+            st[sp].end = en.tile_lo + en.tile_hi;
+            st[sp].widx = epc;
+            st[sp].phase = en.wait_flag;       /* remaining iterations */
             continue;
         }
         if (en.task == ENT_IF) {

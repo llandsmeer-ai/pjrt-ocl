@@ -30,7 +30,7 @@ import numpy as np
 from .lowering import (
     ARENA_ALIGN, BUFENT_STRUCT, CONSTHDR_STRUCT, DT_F32, DTYPE_NUMPY,
     HEADER_STRUCT, INSTR_STRUCT, MAGIC, OP_ADD_F32, OP_AFFINE_F32, OP_DOT,
-    OP_FILL_F32, OP_IOTA_F32, OP_LTS_F32, OP_MUL_F32, OP_NAMES, OP_NOP,
+    OP_FILL_F32, OP_FOR, OP_IOTA_F32, OP_LTS_F32, OP_MUL_F32, OP_NAMES, OP_NOP,
     OP_SUB_F32, OP_WHILE, SECTION_ALIGN, VERSION,
 )
 from . import scheduler as S
@@ -269,7 +269,7 @@ def parse(data: bytes) -> Program:
         # the 8th word is a general second immediate: OP_AFFINE_F32's t bits,
         # OP_DOT's batch count, or an elementwise op's operand-b view aux-offset.
         # (Control/nop never use it.)
-        if imm2 != 0 and op in (OP_NOP, OP_WHILE):
+        if imm2 != 0 and op in (OP_NOP, OP_WHILE, OP_FOR):
             raise FormatError(f"instr[{i}] nonzero padding")
         if aux_off > n_aux:
             raise FormatError(f"instr[{i}] aux offset {aux_off} > n_aux {n_aux}")
@@ -278,6 +278,12 @@ def parse(data: bytes) -> Program:
                 raise FormatError(f"instr[{i}] WHILE sub-list out of range")
             if dst >= n_buffers:
                 raise FormatError(f"instr[{i}] WHILE cond buffer out of range")
+        elif op == OP_FOR:
+            # body = [n, n+imm), b = trip count; dst/a unused (no cond).
+            if n + imm > n_instrs:
+                raise FormatError(f"instr[{i}] FOR sub-list out of range")
+            if dst != 0 or a != 0:
+                raise FormatError(f"instr[{i}] FOR nonzero dst/a")
         else:
             for name, buf_id in (("dst", dst), ("a", a), ("b", b)):
                 # NOP/FILL/IOTA leave unused fields 0; a 0 index is always valid
@@ -348,7 +354,7 @@ def _parse_schedule(data: bytes, pos: int, n_buffers: int) -> ParsedSchedule:
         pos += S.ENTRY_STRUCT.size
         task, tile_lo, tile_hi, wf, wc, sf, slots, epad = fields
         is_sentinel = task in (S.TASK_NOP, S.TASK_BARRIER,
-                               S.TASK_WHILE, S.TASK_IF)
+                               S.TASK_WHILE, S.TASK_IF, S.TASK_FOR)
         if not is_sentinel and task >= n_tasks:
             raise FormatError(f"entry[{i}] task {task} out of range ({n_tasks})")
         entries.append(ParsedEntry(task, tile_lo, tile_hi, wf, wc, sf,
@@ -432,6 +438,10 @@ def execute(prog: Program, args: list[np.ndarray]) -> list[np.ndarray]:
                     if view(ins.dst, 1)[0] == np.float32(0.0):
                         break
                     run_range(ins.n, ins.imm, depth + 1)
+            elif op == OP_FOR:
+                # body = [n, n+imm) run b times (fixed trip; no cond list)
+                for _ in range(ins.b):
+                    run_range(ins.n, ins.imm, depth + 1)
             elif op in opsem.INTERP:
                 opsem.INTERP[op](ins, _InterpRT(prog, view))
             else:  # unreachable: parse() rejects unknown opcodes
@@ -462,7 +472,7 @@ def _split_phases(sched: ParsedSchedule) -> list[list[tuple[int, ParsedEntry]]]:
         for e in stream:
             if e.task == S.TASK_BARRIER:
                 p += 1
-            elif e.task in (S.TASK_WHILE, S.TASK_IF):
+            elif e.task in (S.TASK_WHILE, S.TASK_IF, S.TASK_FOR):
                 raise NotImplementedError(
                     "_split_phases: control entries present (use _run_control)")
             elif e.task == S.TASK_NOP:
@@ -477,7 +487,8 @@ def _check_coverage(sched: ParsedSchedule) -> None:
     per_task: dict[int, list[tuple[int, int]]] = {}
     for stream in sched.lane_streams:
         for e in stream:
-            if e.task in (S.TASK_BARRIER, S.TASK_NOP, S.TASK_WHILE, S.TASK_IF):
+            if e.task in (S.TASK_BARRIER, S.TASK_NOP, S.TASK_WHILE, S.TASK_IF,
+                          S.TASK_FOR):
                 continue
             per_task.setdefault(e.task, []).append((e.tile_lo, e.tile_hi))
     for tid, task in enumerate(sched.tasks):
@@ -514,7 +525,7 @@ def execute_schedule(prog: Program, args: list[np.ndarray],
         raise ValueError(f"expected {len(prog.inputs)} args, got {len(args)}")
     sched = prog.schedule
     _check_coverage(sched)
-    has_control = any(e.task in (S.TASK_WHILE, S.TASK_IF)
+    has_control = any(e.task in (S.TASK_WHILE, S.TASK_IF, S.TASK_FOR)
                       for s in sched.lane_streams for e in s)
 
     arena = np.zeros(prog.arena_bytes, dtype=np.uint8)
@@ -653,6 +664,8 @@ def _run_control(sched: ParsedSchedule, arena: np.ndarray, view,
                     stacks[lane].pop()
                     stacks[lane][-1][0] += 1
                     continue
+                if w.task == S.TASK_FOR:            # iteration done
+                    return "FOR_BODY"
                 return "WHILE_COND" if f[3] == 0 else "WHILE_BODY"
             e = stream[f[0]]
             if e.task == S.TASK_BARRIER:
@@ -661,6 +674,16 @@ def _run_control(sched: ParsedSchedule, arena: np.ndarray, view,
                 if len(stacks[lane]) > MAX_WHILE_DEPTH:
                     raise FormatError(f"WHILE nesting exceeds {MAX_WHILE_DEPTH}")
                 stacks[lane].append([e.tile_lo, e.tile_lo + e.tile_hi, f[0], 0])
+                continue
+            if e.task == S.TASK_FOR:
+                if e.wait_flag == 0:                # trip 0: skip the loop
+                    f[0] += 1
+                    continue
+                if len(stacks[lane]) > MAX_WHILE_DEPTH:
+                    raise FormatError(f"WHILE nesting exceeds {MAX_WHILE_DEPTH}")
+                # f[3] counts REMAINING iterations for a FOR frame
+                stacks[lane].append([e.tile_lo, e.tile_lo + e.tile_hi, f[0],
+                                     e.wait_flag])
                 continue
             if e.task == S.TASK_IF:
                 raise NotImplementedError("schedule simulator: IF entries")
@@ -696,6 +719,17 @@ def _run_control(sched: ParsedSchedule, arena: np.ndarray, view,
                     f[1] = w.wait_flag + w.wait_count
                     f[3] = 1
                 else:                               # loop exits -> pop
+                    stacks[lane].pop()
+                    stacks[lane][-1][0] += 1
+        elif kind == "FOR_BODY":                    # fixed-trip iteration done
+            for lane in range(n):
+                f = stacks[lane][-1]
+                w = streams[lane][f[2]]
+                f[3] -= 1
+                if f[3] > 0:                        # more iterations -> body
+                    f[0] = w.tile_lo
+                    f[1] = w.tile_lo + w.tile_hi
+                else:                               # done -> pop
                     stacks[lane].pop()
                     stacks[lane][-1][0] += 1
         else:                                       # WHILE_BODY -> recheck cond

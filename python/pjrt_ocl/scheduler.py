@@ -59,6 +59,7 @@ TASK_NOP = 0xFFFFFFFF
 TASK_BARRIER = 0xFFFFFFFE
 TASK_WHILE = 0xFFFFFFFD
 TASK_IF = 0xFFFFFFFC
+TASK_FOR = 0xFFFFFFFB   # fixed-trip loop: body in tile_lo/tile_hi, trips in wait_flag
 FLAG_NONE = 0xFFFFFFFF
 
 # tensor opcode -> (tile_op, ew_subop) for the compute instrs we cover today.
@@ -71,7 +72,7 @@ _TENSOR_TO_EW = {
 }
 
 # region ops: scheduled recursively into per-lane control entries + sub-streams
-_REGION_OPS = {L.OP_WHILE}
+_REGION_OPS = {L.OP_WHILE, L.OP_FOR}
 
 SCHED_HDR_STRUCT = struct.Struct("<IIII")      # n_tasks,n_entries,n_flags,n_lanes
 TASK_STRUCT = struct.Struct("<IIIIIIII")       # 32B
@@ -510,25 +511,34 @@ class _Scheduler:
 
     def _emit_while(self, idx: int) -> None:
         ins = self.prog.instrs[idx]
+        is_for = ins.op == L.OP_FOR
         while_entries = []
         for lane in range(self.n_lanes):
-            # tile_lo/tile_hi (cond range) + wait_flag/wait_count (body range)
-            # are patched once the sub-lists are scheduled; signal_flag carries
-            # the cond BUFFER id (executor patches to a byte offset at load).
-            e = Entry(TASK_WHILE, tile_lo=0, tile_hi=0, wait_flag=0,
-                      wait_count=0, signal_flag=ins.dst)
+            # WHILE: tile_lo/tile_hi (cond range) + wait_flag/wait_count (body
+            # range) are patched once the sub-lists are scheduled; signal_flag
+            # carries the cond BUFFER id (executor patches to a byte offset at
+            # load). FOR: body range in tile_lo/tile_hi (patched), trip count
+            # in wait_flag, no cond buffer.
+            if is_for:
+                e = Entry(TASK_FOR, tile_lo=0, tile_hi=0, wait_flag=ins.b,
+                          wait_count=0, signal_flag=FLAG_NONE)
+            else:
+                e = Entry(TASK_WHILE, tile_lo=0, tile_hi=0, wait_flag=0,
+                          wait_count=0, signal_flag=ins.dst)
             self.lanes[lane].append(e)
             while_entries.append(e)
         self.region_queue.append(_WhileJob(
             while_entries,
-            list(range(ins.a, ins.a + ins.b)),        # cond instr range
+            [] if is_for else list(range(ins.a, ins.a + ins.b)),  # cond range
             list(range(ins.n, ins.n + ins.imm))))     # body instr range
 
     def schedule_region(self, job: _WhileJob) -> None:
         """Schedule one while's cond then body sub-lists contiguously into every
         lane, then patch each lane's WHILE entry with its own (per-lane) cond/
-        body entry ranges. Nested whiles enqueue further jobs (drained later, so
-        their sub-ranges land beyond this body)."""
+        body entry ranges (a FOR entry has no cond range: body goes in
+        tile_lo/tile_hi, its trip count is already in wait_flag). Nested whiles
+        enqueue further jobs (drained later, so their sub-ranges land beyond
+        this body)."""
         cond_start = [len(l) for l in self.lanes]
         self.schedule_range(job.cond_indices, trailing_barrier=False)
         body_start = [len(l) for l in self.lanes]
@@ -536,10 +546,14 @@ class _Scheduler:
         body_end = [len(l) for l in self.lanes]
         for lane in range(self.n_lanes):
             e = job.while_entries[lane]
-            e.tile_lo = cond_start[lane]
-            e.tile_hi = body_start[lane] - cond_start[lane]      # cond_len
-            e.wait_flag = body_start[lane]
-            e.wait_count = body_end[lane] - body_start[lane]     # body_len
+            if e.task == TASK_FOR:
+                e.tile_lo = body_start[lane]
+                e.tile_hi = body_end[lane] - body_start[lane]    # body_len
+            else:
+                e.tile_lo = cond_start[lane]
+                e.tile_hi = body_start[lane] - cond_start[lane]  # cond_len
+                e.wait_flag = body_start[lane]
+                e.wait_count = body_end[lane] - body_start[lane]  # body_len
 
 
 def schedule_program(prog: L.VMProgram,

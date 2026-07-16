@@ -54,6 +54,8 @@ enum VmDtype : uint32_t {
 enum EntSentinel : uint32_t {
   kEntNop = 0xFFFFFFFFu, kEntBarrier = 0xFFFFFFFEu,
   kEntWhile = 0xFFFFFFFDu, kEntIf = 0xFFFFFFFCu,
+  // fixed-trip loop: body range in tile_lo/tile_hi, trip count in wait_flag
+  kEntFor = 0xFFFFFFFBu,
 };
 constexpr uint32_t kEwSubSelect = 21;
 

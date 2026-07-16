@@ -168,7 +168,7 @@ def planned_timeline(S, config, sched):
                 e = stream[pos[lane]]
                 if e.task == S.TASK_BARRIER:
                     break
-                if e.task in (S.TASK_WHILE, S.TASK_IF):
+                if e.task in (S.TASK_WHILE, S.TASK_IF, S.TASK_FOR):
                     raise SystemExit(
                         "planned timeline: control flow (while/if) has no "
                         "static duration; use an example without loops")

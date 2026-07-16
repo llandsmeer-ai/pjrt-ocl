@@ -132,3 +132,110 @@ def test_while_then_elementwise():
             (jnp.int32(0), x))
         return y * y
     check(f, np.float32(1.0))          # (1 + 10)^2 = 121.0
+
+
+# --- fixed-trip detection: OP_FOR + unroll (poc/12) --------------------------
+# Counted loops (lax.scan / fori_loop) are detected at lowering time and take
+# one of two cond-free paths: bytecode UNROLL (small trips) or OP_FOR (a body
+# sub-list run a compile-time number of times). PJRT_OCL_WHILE pins the path.
+
+import os
+import pytest
+
+
+@pytest.fixture(params=["while", "for", "unroll"])
+def while_mode(request, monkeypatch):
+    monkeypatch.setenv("PJRT_OCL_WHILE", request.param)
+    return request.param
+
+
+def _op_counts(f, *args):
+    prog = L.lower_artifact(to_artifact(f, *args))
+    ops = [i.op for i in prog.instrs]
+    return ops.count(L.OP_WHILE), ops.count(L.OP_FOR)
+
+
+def test_fixed_trip_all_modes(while_mode):
+    """The same counted loop is correct through while, OP_FOR, and unroll."""
+    def f(x):
+        return jax.lax.fori_loop(0, 7, lambda i, a: a * 1.5 + 0.25, x)
+    check(f, np.linspace(-1.0, 1.0, 1000, dtype=np.float32))
+
+
+def test_scan_stacked_outputs(while_mode):
+    """lax.scan carrying state AND stacking per-step outputs (dynamic_update_
+    slice into the ys carry). Regression test: _fuse_views used to fold the
+    DUS identity gather and orphan the scatter (ys came back all zeros)."""
+    def f(c, xs):
+        def step(c, xt):
+            c = c * 0.9 + xt
+            return c, c * 2.0
+        return jax.lax.scan(step, c, xs)
+    c0 = np.zeros(4, np.float32)
+    xs = np.arange(20, dtype=np.float32).reshape(5, 4)
+    check(f, c0, xs)
+
+
+def test_scan_counter_is_any_carry_index(while_mode):
+    """scan's counter is carry index 1 (xs is 0); detection must find it via
+    the cond compare, not assume position 0."""
+    def f(c, xs):
+        return jax.lax.scan(lambda c, xt: (c + xt, c), c, xs)
+    check(f, np.float32(0.0), np.arange(6, dtype=np.float32))
+
+
+def test_fixed_trip_detection_lowers_op_for():
+    os.environ["PJRT_OCL_WHILE"] = "for"
+    try:
+        def f(x):
+            return jax.lax.fori_loop(0, 100, lambda i, a: a + 1.0, x)
+        n_while, n_for = _op_counts(f, np.float32(0.0))
+        assert (n_while, n_for) == (0, 1)
+    finally:
+        os.environ.pop("PJRT_OCL_WHILE", None)
+
+
+def test_auto_unrolls_small_and_fors_large():
+    os.environ["PJRT_OCL_WHILE"] = "auto"
+    try:
+        def small(x):
+            return jax.lax.fori_loop(0, 4, lambda i, a: a + 1.0, x)
+        def large(x):
+            return jax.lax.fori_loop(0, 1000, lambda i, a: a + 1.0, x)
+        assert _op_counts(small, np.float32(0.0)) == (0, 0)   # unrolled
+        assert _op_counts(large, np.float32(0.0)) == (0, 1)   # OP_FOR
+    finally:
+        os.environ.pop("PJRT_OCL_WHILE", None)
+
+
+def test_data_dependent_while_keeps_op_while():
+    """A genuinely data-dependent cond must never be converted."""
+    def f(x):
+        return jax.lax.while_loop(lambda v: v < 100.0, lambda v: v * 2.0, x)
+    n_while, n_for = _op_counts(f, np.float32(1.0))
+    assert (n_while, n_for) == (1, 0)
+    check(f, np.float32(1.0))
+
+
+def test_fixed_trip_zero_iterations(while_mode):
+    def f(x):
+        return jax.lax.fori_loop(3, 3, lambda i, a: a * 100.0, x)
+    check(f, np.float32(7.0))
+
+
+def test_fixed_trip_counter_used_in_body(while_mode):
+    """Body consumes the counter value itself (i as data): the unroll path
+    const-folds it per iteration, FOR keeps the counter add live."""
+    def f(x):
+        return jax.lax.fori_loop(
+            0, 6, lambda i, a: a + jnp.float32(1.0) * i.astype(jnp.float32), x)
+    check(f, np.float32(0.0))          # 0+1+2+3+4+5 = 15
+
+
+def test_fixed_trip_nonunit_step_via_while():
+    """Hand-written counted while with step 3: trip = ceil((10-0)/3) = 4."""
+    def f(x):
+        return jax.lax.while_loop(
+            lambda c: c[0] < 10, lambda c: (c[0] + 3, c[1] + 1.0),
+            (jnp.int32(0), x))[1]
+    check(f, np.float32(0.0))          # 4 iterations

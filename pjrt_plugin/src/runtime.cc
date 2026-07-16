@@ -218,6 +218,10 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
         if (uint64_t(en.tile_lo) + en.tile_hi > count ||
             uint64_t(en.wait_flag) + en.wait_count > count)
           return fail("control sub-range out of lane stream");
+      } else if (en.task == kEntFor) {
+        // wait_flag is the trip count (not a range); no cond buffer.
+        if (uint64_t(en.tile_lo) + en.tile_hi > count)
+          return fail("control sub-range out of lane stream");
       } else if (en.task != kEntNop && en.task >= n_tasks) {
         return fail("entry task index out of range");
       }
@@ -651,7 +655,8 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
       ((tasks[0].tile_op >> 8) & 0xFFu) == kDtF32 && tasks[0].p3 <= 1) {
     bool clean = true;
     for (const VmEntry& en : p.entries)
-      if (en.task == kEntBarrier || en.task == kEntWhile || en.task == kEntIf)
+      if (en.task == kEntBarrier || en.task == kEntWhile ||
+          en.task == kEntIf || en.task == kEntFor)
         clean = false;
     // Routing gates (PJRT_OCL_MM_KERNEL=0/1 forces off/on):
     //  - N==1 -> gemv kernel on BOTH device classes (the MMA tile wastes
@@ -1026,7 +1031,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     return p.entries[p.lane_tab[L].off + pc];
   };
 
-  enum Ev { EV_BARRIER, EV_COND_DONE, EV_BODY_DONE, EV_DONE };
+  enum Ev { EV_BARRIER, EV_COND_DONE, EV_BODY_DONE, EV_FOR_DONE, EV_DONE };
   // Advance lane L to its next barrier/transition, collecting its contiguous
   // tile-entry run into seg[2L..2L+1]. Direct mirror of vm2's interpreter.
   auto advance = [&](uint32_t L) -> Ev {
@@ -1043,6 +1048,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
           st[L].back().pc++;
           continue;
         }
+        if (w.task == kEntFor) return EV_FOR_DONE;
         return (f.phase == 0) ? EV_COND_DONE : EV_BODY_DONE;
       }
       const VmEntry& en = lane_entry(L, f.pc);
@@ -1050,6 +1056,17 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       if (en.task == kEntWhile) {
         if (static_cast<int>(st[L].size()) >= MAX_DEPTH) return EV_DONE;
         st[L].push_back({en.tile_lo, en.tile_lo + en.tile_hi, f.pc, 0});
+        continue;
+      }
+      if (en.task == kEntFor) {
+        if (en.wait_flag == 0) {  // trip 0: skip the loop
+          f.pc++;
+          continue;
+        }
+        if (static_cast<int>(st[L].size()) >= MAX_DEPTH) return EV_DONE;
+        // phase counts REMAINING iterations for a FOR frame
+        st[L].push_back({en.tile_lo, en.tile_lo + en.tile_hi, f.pc,
+                         static_cast<int>(en.wait_flag)});
         continue;
       }
       // tile (or NOP): extend the contiguous segment
@@ -1215,6 +1232,22 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
           f.end = w.wait_flag + w.wait_count;
           f.phase = 1;
         } else {  // loop exits -> pop, advance parent
+          st[L].pop_back();
+          st[L].back().pc++;
+        }
+      }
+    } else if (ev == EV_FOR_DONE) {
+      // Fixed-trip iteration done: decrement and loop or pop. NO cond read,
+      // NO drain — the whole loop's phases stream into the enqueue ring
+      // (this is the point of OP_FOR on the host-dispatch engine: a while
+      // costs one blocking cond read per iteration).
+      for (uint32_t L = 0; L < n; ++L) {
+        Frame& f = st[L].back();
+        const VmEntry& w = lane_entry(L, f.widx);
+        if (--f.phase > 0) {
+          f.pc = w.tile_lo;
+          f.end = w.tile_lo + w.tile_hi;
+        } else {
           st[L].pop_back();
           st[L].back().pc++;
         }

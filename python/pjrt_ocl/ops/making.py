@@ -186,12 +186,15 @@ opsem.register_ew_sim(23, _convert_ew_sim)   # SUB_CONVERT
 
 
 def _copy_to_task(ins) -> Task:
-    return Task(TILE_EW, dst=ins.dst, a=ins.a, b=0, p0=EW_SUB_COPY,
-                p1=ins.n, p2=0, p3=0)
+    # p2 carries the operand-a VIEW aux-offset (0 = direct): _fuse_views may
+    # fold a broadcast/transpose into a copy (SUB_COPY is in the device's
+    # viewable range), e.g. a while carry initialized from a broadcast.
+    return Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.a, p0=EW_SUB_COPY,
+                p1=ins.n, p2=ins.imm, p3=ins.imm2)
 
 
 def _copy_interp(ins, rt):
-    rt.view(ins.dst, ins.n)[:] = rt.view(ins.a, ins.n)
+    rt.view(ins.dst, ins.n)[:] = rt.viewed(ins.a, ins.n, ins.imm)
 
 
 def _copy_reads(ins) -> set[int]:
