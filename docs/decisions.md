@@ -487,10 +487,25 @@ Baseline 17 TFLOP/s @ N=2048 vs cuBLAS 117 TFLOP/s (6.8x). Key facts established
   Rolling the K-loop didn't help. This is the fundamental tension the CLAUDE.md notes:
   aggressive matmul tiling is incompatible with one-kernel-does-everything.
 
-Path forward (not yet built): (a) lift matmul into its OWN program/kernel (high register
-budget, high occupancy, free to use 8×8 tiles + float4 vectorized *local* loads + double
-buffering) — this is the portable route to ~cuBLAS at these sizes; or (b) an NVIDIA-only
-TF32 tensor-core tile via inline PTX `wmma.load.*.shared`/`wmma.mma.sync` behind the
-kernel-table override (refs captured: hgemmtest passes `__local` ptrs as `"l"` into
-`.shared` WMMA ops; CUTLASS `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`). Kept the
-stable 64×64/4×4 tile for now.
+SHIPPED (path a, partial): a standalone `mm2` SGEMM kernel + a pure-matmul fast path.
+`runtime.cc` detects a program that is a single f32 TILE_MMA with no barrier/control
+entries and, for LARGE matmul on GPU (M,N≥1024, K≥256; `PJRT_OCL_MM_KERNEL` forces),
+launches `mm2` (one 256-thread workgroup per 128×64 tile, 8×4 register microtile,
+double-buffered smem, transposed As for vectorized local loads) instead of the megakernel.
+Standalone => independent register budget, so an 8×4 tile does not spill. N=2048:
+17.1 → **21.1 TFLOP/s** (1.23×). Gated because below ~1024 the megakernel's 4×4/256-thread
+MMA wins (more workgroups per unit work → better latency hiding). Correct on non-square /
+non-tile-multiple / large shapes; 199 pytest + runtime_test green.
+
+What the tuning sweep established (all standalone, N=2048/4096): tile/register configs
+4×4-256t, 8×8-64t, 8×8-256t(128²), 8×4-256t all **plateau at ~17–23 TFLOP/s** — the 8×8's
+64 accumulator registers cap occupancy at ~25% (2 workgroups/SM), and without
+bank-conflict-free smem swizzling + register-level (not just smem) prefetch the kernel
+can't approach the ~100 TFLOP/s a production FP32 SGEMM reaches. **cuBLAS hits 134 TFLOP/s
+at N=4096 — ABOVE Blackwell's ~125 FP32 peak — so it is TENSOR-CORE (TF32) bound.** Hard
+conclusion: **matmul parity REQUIRES TF32 tensor cores**; portable FP32 tops out ~1.3× off
+even when perfect. Next: an NVIDIA-only TF32 tensor-core body inside `mm2` behind a build
+guard (poc first, per hard rules), via inline PTX `wmma.load.*.shared`/`wmma.mma.sync`
+(hgemmtest passes `__local` ptrs as `"l"` into `.shared` WMMA ops; CUTLASS
+`mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`). The `mm2` dispatch path is already
+built to host it.

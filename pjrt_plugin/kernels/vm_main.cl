@@ -187,3 +187,100 @@ __kernel void vm2_one(__global uchar *arena,
         vmo_exec_tiles(arena, iop, aux, tasks[en.task], en.tile_lo, en.tile_hi,
                        As, Bs);
 }
+
+/* ---- Standalone SGEMM (pure-matmul fast path) --------------------------------
+ * Launched OUTSIDE the megakernel for programs that are a single TILE_MMA with
+ * no barriers/control (the common `a@b`). Being its own kernel gives it an
+ * independent register budget, so an 8x8 register microtile (64 accumulators)
+ * stays in registers instead of spilling to global memory — inside the shared
+ * megakernel the same tile spills catastrophically (docs/decisions.md #9b) and
+ * the megakernel's launch is also occupancy-capped to ~2 workgroups/SM. Here we
+ * launch one 256-thread workgroup per 128x128 output tile, filling the GPU.
+ * As is stored TRANSPOSED (As[kk*TM+m]) so each thread's a[] is contiguous for
+ * a 128-bit vload4. dst/a/b arrive as VM buffer handles (arena offset or I/O
+ * port), resolved by the same VMO_BASE macro the tiles use. */
+/* 64x64 output tile, 8x8 threads (64 per workgroup), each thread an 8x8 register
+ * microtile. Small tile + few threads => 4x more workgroups than a 128x128 tile
+ * (e.g. 1024 vs 256 at N=2048) for far higher SM occupancy, while keeping the
+ * 8x8 arithmetic intensity a standalone kernel can afford (no megakernel
+ * register sharing). */
+#define MM2_TM 128
+#define MM2_TN 64
+#define MM2_BK 16
+#define MM2_TD 16                 /* 16x16 threads == 256 */
+#define MM2_NT (MM2_TD * MM2_TD)  /* 256 threads/workgroup */
+#define MM2_RM (MM2_TM / MM2_TD)  /* 8 */
+#define MM2_RN (MM2_TN / MM2_TD)  /* 4 */
+
+__kernel void mm2(__global uchar *arena, VMO_IO_PARAMS,
+                  const uint M, const uint N, const uint K,
+                  const uint dsth, const uint ah, const uint bh)
+{
+    VMO_IO_ARRAY;
+    /* DOUBLE-BUFFERED: two smem panels; prefetch the next K-block into the idle
+     * panel while the current one is consumed, so global-load latency overlaps
+     * compute (one barrier/iter instead of load->barrier->compute->barrier). */
+    __local float As[2][MM2_BK * MM2_TM];   /* transposed: As[buf][kk*TM + m] */
+    __local float Bs[2][MM2_BK * MM2_TN];   /* Bs[buf][kk*TN + n] */
+    const uint lid = get_local_id(0);
+    const uint tiles_n = (N + MM2_TN - 1) / MM2_TN;
+    const uint tile = get_group_id(0);
+    const uint tr = tile / tiles_n, tc = tile % tiles_n;
+    const uint row0 = tr * MM2_TM, col0 = tc * MM2_TN;
+    const uint ty = lid / MM2_TD, tx = lid % MM2_TD;
+    __global const float *ga = AP(const float, ah);
+    __global const float *gb = AP(const float, bh);
+
+    float acc[MM2_RM][MM2_RN];
+    for (int i = 0; i < MM2_RM; i++)
+        for (int j = 0; j < MM2_RN; j++) acc[i][j] = 0.0f;
+
+#define MM2_STAGE(BUF, K0)                                                      \
+    do {                                                                       \
+        for (uint idx = lid; idx < MM2_TM * MM2_BK; idx += MM2_NT) {          \
+            const uint m = idx / MM2_BK, kk = idx % MM2_BK;                    \
+            const uint gr = row0 + m, gk = (K0) + kk;                         \
+            As[BUF][kk * MM2_TM + m] =                                         \
+                (gr < M && gk < K) ? ga[gr * K + gk] : 0.0f;                   \
+        }                                                                      \
+        for (uint idx = lid; idx < MM2_BK * MM2_TN; idx += MM2_NT) {          \
+            const uint kk = idx / MM2_TN, n = idx % MM2_TN;                    \
+            const uint gk = (K0) + kk, gc = col0 + n;                         \
+            Bs[BUF][kk * MM2_TN + n] =                                         \
+                (gk < K && gc < N) ? gb[gk * N + gc] : 0.0f;                   \
+        }                                                                      \
+    } while (0)
+
+    MM2_STAGE(0, 0);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    uint buf = 0;
+    for (uint k0 = 0; k0 < K; k0 += MM2_BK) {
+        if (k0 + MM2_BK < K) MM2_STAGE(buf ^ 1, k0 + MM2_BK);
+        for (uint kk = 0; kk < MM2_BK; ++kk) {
+            float a[MM2_RM], b[MM2_RN];
+            for (int i = 0; i < MM2_RM; i += 4) {
+                float4 v = vload4(0, &As[buf][kk * MM2_TM + ty * MM2_RM + i]);
+                a[i] = v.x; a[i + 1] = v.y; a[i + 2] = v.z; a[i + 3] = v.w;
+            }
+            for (int j = 0; j < MM2_RN; j += 4) {
+                float4 v = vload4(0, &Bs[buf][kk * MM2_TN + tx * MM2_RN + j]);
+                b[j] = v.x; b[j + 1] = v.y; b[j + 2] = v.z; b[j + 3] = v.w;
+            }
+            for (int i = 0; i < MM2_RM; i++)
+                for (int j = 0; j < MM2_RN; j++)
+                    acc[i][j] += a[i] * b[j];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        buf ^= 1;
+    }
+#undef MM2_STAGE
+    __global float *gd = AP(float, dsth);
+    for (int i = 0; i < MM2_RM; i++) {
+        const uint gr = row0 + ty * MM2_RM + i;
+        if (gr >= M) continue;
+        for (int j = 0; j < MM2_RN; j++) {
+            const uint gc = col0 + tx * MM2_RN + j;
+            if (gc < N) gd[gr * N + gc] = acc[i][j];
+        }
+    }
+}

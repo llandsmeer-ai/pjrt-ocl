@@ -361,6 +361,9 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->vm_one_kernel_ = clCreateKernel(rt->program_, "vm2_one", &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateKernel vm2_one: " + std::to_string(cerr));
+  rt->mm_kernel_ = clCreateKernel(rt->program_, "mm2", &cerr);
+  if (cerr != CL_SUCCESS)
+    return fail("clCreateKernel mm2: " + std::to_string(cerr));
   rt->dummy_buf_ = clCreateBuffer(rt->ctx_, CL_MEM_READ_WRITE, 4, nullptr, &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateBuffer dummy: " + std::to_string(cerr));
@@ -413,6 +416,7 @@ OclRuntime::~OclRuntime() {
   if (vm_kernel_) clReleaseKernel(vm_kernel_);
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
   if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
+  if (mm_kernel_) clReleaseKernel(mm_kernel_);
   if (dummy_buf_) clReleaseMemObject(dummy_buf_);
   for (auto& [sz, v] : buf_pool_)
     for (cl_mem m : v) clReleaseMemObject(m);
@@ -504,6 +508,37 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
     t.b = elem_off(t.b);
     if ((t.tile_op & 0xFFu) == kTopEw && t.p0 == kEwSubSelect)
       t.p3 = elem_off(t.p3);
+  }
+
+  // Pure-matmul fast path (docs/decisions.md #9b): exactly one f32 MMA task and
+  // no barrier/control entries -> dispatch the standalone mm2 SGEMM instead of
+  // the megakernel (which caps matmul occupancy). Handles/dims come straight
+  // from the (now offset-patched) task.
+  if (tasks.size() == 1 && (tasks[0].tile_op & 0xFFu) == kTopMma &&
+      ((tasks[0].tile_op >> 8) & 0xFFu) == kDtF32) {
+    bool clean = true;
+    for (const VmEntry& en : p.entries)
+      if (en.task == kEntBarrier || en.task == kEntWhile || en.task == kEntIf)
+        clean = false;
+    // Gate to LARGE matmul: the 8x4 tile needs enough output tiles to fill the
+    // SMs. Below ~1024 the megakernel's 4x4/256-thread MMA (more workgroups per
+    // unit work, better latency hiding) is faster; above it mm2 wins ~1.2-1.3x
+    // (measured, docs/decisions.md #9b). PJRT_OCL_MM_KERNEL=0/1 forces it.
+    const uint32_t M = tasks[0].p0, N = tasks[0].p1, Kd = tasks[0].p2;
+    // GPU only: the mm2 tile is tuned for GPU occupancy; CPU/host-dispatch
+    // devices keep their validated path.
+    bool big = !rt->host_dispatch() && M >= 1024 && N >= 1024 && Kd >= 256;
+    if (const char* e = std::getenv("PJRT_OCL_MM_KERNEL"); e && e[0])
+      big = (e[0] != '0') && !rt->host_dispatch();
+    if (clean && big) {
+      lp->mm_ok_ = true;
+      lp->mm_M_ = M;
+      lp->mm_N_ = N;
+      lp->mm_K_ = Kd;
+      lp->mm_dst_ = tasks[0].dst;
+      lp->mm_a_ = tasks[0].a;
+      lp->mm_b_ = tasks[0].b;
+    }
   }
   // Patch control-entry cond buffer ids.
   std::vector<VmEntry> entries = p.entries;
@@ -668,6 +703,33 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
   if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
                              nullptr) != CL_SUCCESS) {
     *err = "Execute: kernel launch failed";
+    return false;
+  }
+  return true;
+}
+
+// Standalone SGEMM launch: one 256-thread workgroup per 128x128 output tile.
+// mm2(arena, io0..io7, M, N, K, dst, a, b). No barrier buffer / lanes / tasks.
+bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
+  cl_kernel k = rt_->mm_kernel();
+  constexpr uint32_t kTM = 128, kTN = 64;  // must match MM2_TM/MM2_TN
+  const size_t tiles_m = (mm_M_ + kTM - 1) / kTM;
+  const size_t tiles_n = (mm_N_ + kTN - 1) / kTN;
+  const size_t lsz = 256, gsz = tiles_m * tiles_n * lsz;   // MM2_NT threads/wg
+  clSetKernelArg(k, 0, sizeof(arena_), &arena_);
+  for (int pt = 0; pt < kNIoPorts; ++pt) {
+    cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+    clSetKernelArg(k, 1 + pt, sizeof(cl_mem), &b);
+  }
+  clSetKernelArg(k, 9, sizeof(uint32_t), &mm_M_);
+  clSetKernelArg(k, 10, sizeof(uint32_t), &mm_N_);
+  clSetKernelArg(k, 11, sizeof(uint32_t), &mm_K_);
+  clSetKernelArg(k, 12, sizeof(uint32_t), &mm_dst_);
+  clSetKernelArg(k, 13, sizeof(uint32_t), &mm_a_);
+  clSetKernelArg(k, 14, sizeof(uint32_t), &mm_b_);
+  if (clEnqueueNDRangeKernel(q, k, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                             nullptr) != CL_SUCCESS) {
+    *err = "Execute: mm2 launch failed";
     return false;
   }
   return true;
@@ -982,7 +1044,8 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
   if (prof) clFinish(q);
   auto t1 = clk();
 
-  if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
+  if (!(mm_ok_               ? LaunchMatmul(q, err)
+        : rt_->host_dispatch() ? LaunchHostDispatch(q, err)
                              : LaunchKernel(q, err))) {
     for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
     outputs->clear();

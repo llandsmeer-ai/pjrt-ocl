@@ -117,6 +117,7 @@ class OclRuntime {
   cl_kernel vm_kernel() const { return vm_kernel_; }
   cl_kernel vm_seg_kernel() const { return vm_seg_kernel_; }
   cl_kernel vm_one_kernel() const { return vm_one_kernel_; }
+  cl_kernel mm_kernel() const { return mm_kernel_; }
   // Execution trace (PJRT_OCL_VM_TRACE=<path>): host-dispatch is forced and
   // every schedule entry runs as its own single-workgroup launch on a per-lane
   // profiling queue; per-entry device timestamps are appended to <path> as one
@@ -178,6 +179,7 @@ class OclRuntime {
   cl_kernel vm_kernel_ = nullptr;
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
   cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
+  cl_kernel mm_kernel_ = nullptr;      // standalone SGEMM (pure-matmul fast path)
   std::string trace_path_;             // empty = tracing off
   bool trace_suppressed_ = false;      // true during cost calibration
   std::string cost_table_path_;        // measured cost JSON ("" = unit costs)
@@ -224,6 +226,9 @@ class LoadedProgram {
   // them. Reads while-cond scalars from the arena between phases. Caller holds
   // the runtime mutex; blocks until the program completes.
   bool LaunchHostDispatch(cl_command_queue q, std::string* err);
+  // Pure-matmul fast path: launch the standalone mm2 SGEMM (one workgroup per
+  // 128x128 output tile) instead of the megakernel. Only taken when mm_ok_.
+  bool LaunchMatmul(cl_command_queue q, std::string* err);
   // Trace mode: lazily creates the per-lane profiling queues (one per lane so
   // lanes run concurrently, like workgroups of one launch do).
   bool EnsureTraceQueues(std::string* err);
@@ -249,6 +254,13 @@ class LoadedProgram {
   std::vector<int> input_port_;
   std::vector<int> output_port_;
   std::vector<cl_mem> io_bufs_;         // size kNIoPorts
+
+  // Pure-matmul fast path (docs/decisions.md #9b): the program is a single
+  // TILE_MMA task, no barriers/control, so ExecuteDevice dispatches the
+  // standalone mm2 kernel. mm_{dst,a,b}_ are the offset/port-patched handles.
+  bool mm_ok_ = false;
+  uint32_t mm_M_ = 0, mm_N_ = 0, mm_K_ = 0;
+  uint32_t mm_dst_ = 0, mm_a_ = 0, mm_b_ = 0;
 };
 
 // ---- Lowering subprocess ----------------------------------------------------
