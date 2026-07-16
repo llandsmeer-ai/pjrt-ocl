@@ -840,6 +840,69 @@ def _dce_nops(ctx: _Ctx) -> None:
             instrs[idx] = Instr(OP_NOP)
 
 
+# Elementwise f32 ops that read operand a (and b) at the output index and leave
+# task fields p2/p3 free — so a strided VIEW descriptor can ride there. Excludes
+# cmp/select/affine/fill (which use p2/p3) and non-f32 paths.
+_VIEWABLE_EW = frozenset({
+    OP_ADD_F32, OP_SUB_F32, OP_MUL_F32, OP_DIV_F32, OP_MAX_F32, OP_MIN_F32,
+    OP_POW_F32, OP_ATAN2_F32, OP_REMAINDER_F32, OP_NEG_F32, OP_EXP_F32,
+    OP_LOG_F32, OP_SQRT_F32, OP_RSQRT_F32, OP_TANH_F32, OP_ABS_F32, OP_FLOOR_F32,
+    OP_CEIL_F32, OP_SIGN_F32, OP_LOG1P_F32, OP_EXPM1_F32, OP_CBRT_F32, OP_SIN_F32,
+    OP_COS_F32, OP_TAN_F32, OP_ROUND_NEAREST_EVEN_F32, OP_ROUND_NEAREST_AFZ_F32,
+    OP_COPY_F32,
+})
+
+
+def _fuse_views(ctx: _Ctx) -> None:
+    """The general access-map fusion: fold a shape op (broadcast/transpose/slice/
+    reshape/reverse — all OP_GATHER_STRIDED) into its consuming elementwise
+    operands as a strided VIEW instead of materializing it. An EW op then reads
+    `src[view_index(i)]` — output element i's read is a static function of i, so
+    the producer never occupies memory and no barrier crosses the (former) edge.
+
+    A gather G (dst=g, src=s, aux=desc) folds iff every reader of g is a viewable
+    f32 EW op that reads g as operand a/b (that operand not already a view) and g
+    is not a program output. Each reader's operand is retargeted to (s, view=desc)
+    — the view aux-offset rides in imm (operand a) / imm2 (operand b), +1 so 0
+    means direct. G becomes NOP (DCE'd). Readers that aren't viewable EW (a
+    matmul, another gather, a reduce) keep the gather materialized."""
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+    changed = True
+    while changed:
+        changed = False
+        for gi, g in enumerate(instrs):
+            if g.op != OP_GATHER_STRIDED or g.dst in outs:
+                continue
+            if ctx.buffers[g.dst].dtype != DT_F32:
+                continue
+            gbuf = g.dst
+            readers = [(j, ins) for j, ins in enumerate(instrs)
+                       if ins.op != OP_NOP and gbuf in _reads_of(ins)]
+            if not readers:
+                continue
+            def foldable(r):
+                if r.op not in _VIEWABLE_EW:
+                    return False
+                if ctx.buffers[r.dst].dtype != DT_F32:
+                    return False
+                if r.a == gbuf and r.imm != 0:      # operand a already viewed
+                    return False
+                if r.b == gbuf and r.imm2 != 0:     # operand b already viewed
+                    return False
+                return r.a == gbuf or r.b == gbuf
+            if not all(foldable(r) for _, r in readers):
+                continue
+            for j, r in readers:
+                if r.a == gbuf:
+                    r = dataclasses.replace(r, a=g.a, imm=g.aux + 1)
+                if r.b == gbuf:
+                    r = dataclasses.replace(r, b=g.a, imm2=g.aux + 1)
+                instrs[j] = r
+            instrs[gi] = Instr(OP_NOP)
+            changed = True
+
+
 def lower_module(module) -> VMProgram:
     """Lower a deserialized stablehlo module's public @main to a VMProgram."""
     from jaxlib.mlir import ir
@@ -877,8 +940,10 @@ def lower_module(module) -> VMProgram:
         _lower_while_regions(ctx, ctx.region_queue.pop(0))
 
     # perf peepholes (index-stable, NOP-substituting): collapse scale/bias chains
-    # into one in-place affine pass, then drop the now-dead scalar broadcasts.
+    # into one in-place affine pass, fold shape ops (broadcast/transpose/slice)
+    # into consuming elementwise operands as strided views, then DCE the dead.
     _compose_affines(ctx)
+    _fuse_views(ctx)
     _dce_nops(ctx)
 
     return VMProgram(

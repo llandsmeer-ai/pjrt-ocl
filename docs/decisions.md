@@ -632,3 +632,44 @@ NVIDIA megakernel 1.06–1.19× (cheap in-kernel barriers); **PoCL host-dispatch
     `PJRT_OCL_MM_CPU=reg` keeps the register kernel (per-hardware choice + ragged-N fallback).
     Stop point recorded: packed A / prefetch / per-core-type tiles not worth it for a debug
     backend.
+
+## 13. General principle: access-map–driven fusion (2026-07-16, transformer workload)
+
+Driving a realistic transformer forward pass (`tools/bench_transformer.py`: layernorm, MHA,
+GELU-FFN, residuals; random weights) exposed the real gaps. The specific fixes all reduce to
+ONE principle, now the guiding design rule for the compiler/runtime.
+
+**Principle.** Model every producer→consumer edge by its *access map* — the function from a
+consumer output index `i` to the producer indices it reads. If that map is a static function
+of `i` (identity → elementwise; `i//seg`/`0` → broadcast; affine strided → transpose/slice/
+reshape), the producer need **not be materialized** and **no barrier** crosses the edge — the
+consumer inlines the read. Materialization + a barrier are required **only** at genuine
+many-to-one / data-dependent edges: reductions, contractions (matmul), dynamic gathers. Fusion
+= compose access maps along edges up to the nearest such boundary; the fused region's *leaves*
+(program inputs + reduction/matmul/gather outputs) are the only things in memory. This is the
+classic loop-fusion / polyhedral view, and it unifies every ad-hoc fold we had: scalar-affine
+(§10a) = broadcast with seg=whole; chain fusion (§11) = identity map; and now shape-op folding.
+
+**Mechanism (shipped): viewed operands.** An elementwise op reads `src[view_index(i)]` through a
+strided descriptor (the `{rank,out_dims,in_strides,src_off}` map gather already uses). Lowering
+pass `_fuse_views` folds an OP_GATHER_STRIDED (broadcast/transpose/slice/reshape/reverse) into
+its consuming viewable f32 EW operands (view aux-offset in imm/imm2 → task p2/p3) and NOP's it;
+a gather feeding a matmul/reduce/other-gather stays materialized. Kernel: `vmo_view_idx` + a
+scalar viewed path in `vmo_ew_tile_f32`. Both validators read via `rt.viewed`. No fence: a
+viewed read is a strided load from an already-materialized (prior-phase) buffer. 210 pytest +
+runtime_test green; transformer bit-close to JAX CPU. General for broadcast/transpose-heavy
+code; marginal on the *latency-bound* transformer (whose real cost was the reduces, below).
+
+**Also shipped alongside (transformer bring-up):**
+- Segmented reduction (OP_REDUCE_SEG) for innermost-suffix partial reductions (softmax/
+  layernorm reduce the last axis); non-suffix still needs a transpose first.
+- dot_general → batched/broadcast matmul: lhs leading free dims flatten into M (`x@W`); equal
+  leading batch dims G give G contiguous per-batch matmuls (attention QKᵀ/AV), batch in p3.
+- **Reduce parallelism fix (§ the big transformer win): workgroup-per-segment collaborative
+  reduce.** Thread-per-output starved layernorm's n_out=512 reduce to ONE workgroup; now one
+  segment/tile reduced by the whole workgroup via a local tree → all lanes busy. layernorm 2x,
+  softmax 3.8x, base transformer 14.5→8.5 ms (gap to CUDA 32x→19x).
+
+Remaining front: in-program matmul (attention/FFN) still runs the megakernel SGEMM at ~5
+TFLOP/s vs cuBLAS TF32 ~46 — being attacked by bringing the proven inline-PTX tensor-core
+kernel (poc/11-tensor-core-mma, per docs/matmul-tensorcore-brief.md; renumbered — poc/08 is occupancy discovery) back to the lane-bytecode path (guarded, portable fallback).

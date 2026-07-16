@@ -39,6 +39,13 @@ from . import opsem
 MAX_WHILE_DEPTH = 8
 
 
+def _is_view_subop(sub: int) -> bool:
+    """Plain float binary/unary EW subops (match ops/ew.cl's ew_is_bin/ew_is_un):
+    these carry a/b strided-view aux-offsets in task p2/p3. cmp/select/affine/
+    fill/bitwise reuse p2/p3 for other data, so they never view."""
+    return sub <= 6 or (25 <= sub <= 26) or (7 <= sub <= 17) or (27 <= sub <= 34)
+
+
 class _InterpRT:
     """Facade passed to opsem.INTERP handlers (numpy reference semantics)."""
 
@@ -51,6 +58,24 @@ class _InterpRT:
         """Read aux word `off` as a signed int32 (strides/offsets)."""
         v = self.aux[off]
         return v - 0x100000000 if v >= 0x80000000 else v
+
+    def viewed(self, buf: int, n: int, view: int) -> np.ndarray:
+        """Read n elements of an operand, applying a strided VIEW if `view` != 0
+        (view = aux-offset + 1). Mirrors the device: element i reads
+        src[src_off + Σ coord_e(i)*stride_e], the same descriptor gather uses."""
+        if not view:
+            return self.view(buf, n)
+        off = view - 1
+        rank = self.aux[off]
+        dims = [self.aux[off + 1 + e] for e in range(rank)]
+        strides = [self.aux_i32(off + 1 + rank + e) for e in range(rank)]
+        src_off = self.aux_i32(off + 1 + 2 * rank)
+        idx = np.zeros(n, dtype=np.int64) + src_off
+        rem = np.arange(n, dtype=np.int64)
+        for e in range(rank - 1, -1, -1):
+            idx += (rem % dims[e]) * strides[e]
+            rem //= dims[e]
+        return self.view(buf)[idx]
 
     @staticmethod
     def f32_from_bits(imm: int) -> np.float32:
@@ -241,9 +266,10 @@ def parse(data: bytes) -> Program:
         pos += INSTR_STRUCT.size
         if op not in OP_NAMES:
             raise FormatError(f"instr[{i}] unknown opcode {op}")
-        # the 8th word is a second immediate: OP_AFFINE_F32's t bits, or OP_DOT's
-        # batch count. It must stay a zero padding word for every other opcode.
-        if imm2 != 0 and op not in (OP_AFFINE_F32, OP_DOT):
+        # the 8th word is a general second immediate: OP_AFFINE_F32's t bits,
+        # OP_DOT's batch count, or an elementwise op's operand-b view aux-offset.
+        # (Control/nop never use it.)
+        if imm2 != 0 and op in (OP_NOP, OP_WHILE):
             raise FormatError(f"instr[{i}] nonzero padding")
         if aux_off > n_aux:
             raise FormatError(f"instr[{i}] aux offset {aux_off} > n_aux {n_aux}")
@@ -373,6 +399,8 @@ def execute(prog: Program, args: list[np.ndarray]) -> list[np.ndarray]:
                              f"buffer is {prog.buffers[buf_id].size_bytes}")
         view(buf_id)[:] = flat
 
+    irt = _InterpRT(prog, view)      # for viewed operand reads (imm/imm2)
+
     def run_range(start: int, length: int, depth: int = 0) -> None:
         if depth > MAX_WHILE_DEPTH:
             raise FormatError(f"WHILE nesting exceeds {MAX_WHILE_DEPTH}")
@@ -382,11 +410,14 @@ def execute(prog: Program, args: list[np.ndarray]) -> list[np.ndarray]:
             if op == OP_NOP:
                 pass
             elif op == OP_ADD_F32:
-                view(ins.dst, ins.n)[:] = view(ins.a, ins.n) + view(ins.b, ins.n)
+                view(ins.dst, ins.n)[:] = (irt.viewed(ins.a, ins.n, ins.imm)
+                                           + irt.viewed(ins.b, ins.n, ins.imm2))
             elif op == OP_MUL_F32:
-                view(ins.dst, ins.n)[:] = view(ins.a, ins.n) * view(ins.b, ins.n)
+                view(ins.dst, ins.n)[:] = (irt.viewed(ins.a, ins.n, ins.imm)
+                                           * irt.viewed(ins.b, ins.n, ins.imm2))
             elif op == OP_SUB_F32:
-                view(ins.dst, ins.n)[:] = view(ins.a, ins.n) - view(ins.b, ins.n)
+                view(ins.dst, ins.n)[:] = (irt.viewed(ins.a, ins.n, ins.imm)
+                                           - irt.viewed(ins.b, ins.n, ins.imm2))
             elif op == OP_FILL_F32:
                 view(ins.dst, ins.n)[:] = _f32_from_bits(ins.imm)
             elif op == OP_IOTA_F32:
@@ -518,17 +549,24 @@ def execute_schedule(prog: Program, args: list[np.ndarray],
                 return
             dst = view(task.dst)
             subop = task.p0
+            # plain binary/unary subops carry a/b VIEW aux-offsets in p2/p3;
+            # cmp/select/affine/fill use p2/p3 for their own data (no views).
+            vw = _is_view_subop(subop)
+
+            def rd(buf, vo):
+                return (sim_rt.viewed(buf, n, vo)[lo:hi] if vw and vo
+                        else view(buf)[lo:hi])
             if subop in (S.EW_ADD, S.EW_MUL, S.EW_SUB):
-                a = view(task.a)[lo:hi]
-                b = view(task.b)[lo:hi]
+                a = rd(task.a, task.p2)
+                b = rd(task.b, task.p3)
                 dst[lo:hi] = (a + b if subop == S.EW_ADD else
                               a * b if subop == S.EW_MUL else a - b)
             elif subop == S.EW_FILL:
                 dst[lo:hi] = _f32_from_bits(task.p2)
             elif subop in opsem.EW_SIM:
-                a = view(task.a)[lo:hi]
+                a = rd(task.a, task.p2)
                 # binary subops read b; unary/select handlers ignore extras.
-                b = view(task.b)[lo:hi] if task.b < len(prog.buffers) else None
+                b = (rd(task.b, task.p3) if task.b < len(prog.buffers) else None)
                 dst[lo:hi] = opsem.EW_SIM[subop](a, b, task, sim_rt, lo, hi)
             else:
                 raise NotImplementedError(

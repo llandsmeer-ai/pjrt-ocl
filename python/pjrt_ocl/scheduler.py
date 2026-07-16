@@ -157,8 +157,8 @@ class Task:
             return max(1, math.ceil(self.p0 / self.p1)) if self.p1 else 1
         if self.tile_op == TILE_REDUCE_COMB:
             return 1
-        if self.tile_op == TILE_RED_SEG:      # tiled over the n_out outputs (p0)
-            return max(1, math.ceil(self.p0 / TILE_SIZE))
+        if self.tile_op == TILE_RED_SEG:      # ONE segment per tile (p0 = n_out)
+            return max(1, self.p0)
         raise ScheduleError(f"n_tiles: unknown tile_op {self.tile_op}")
 
 
@@ -302,9 +302,14 @@ def _instr_to_task(ins: L.Instr, buffers) -> Task:
     adtype = buffers[ins.a].dtype if ins.a < len(buffers) else dtype
     if ins.op in _TENSOR_TO_EW:
         subop = _TENSOR_TO_EW[ins.op]
-        p2 = ins.imm if ins.op == L.OP_FILL_F32 else 0
+        # add/mul/sub: p2/p3 carry the a/b VIEW aux-offsets (0 = direct);
+        # fill: p2 carries the fill value bits (no operands to view).
+        if ins.op == L.OP_FILL_F32:
+            p2, p3 = ins.imm, 0
+        else:
+            p2, p3 = ins.imm, ins.imm2
         task = Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.b,
-                    p0=subop, p1=ins.n, p2=p2, p3=0)
+                    p0=subop, p1=ins.n, p2=p2, p3=p3)
     else:
         mapper = opsem.TO_TASK.get(ins.op)
         if mapper is None:

@@ -151,13 +151,46 @@ static float8 vmo_ew_un8(const uint sub, const float8 x)
 }
 #endif
 
-static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
+/* Strided VIEW index: output element i -> source flat index, via an aux
+ * descriptor {rank, out_dims[rank], in_strides[rank], src_off} — the SAME map
+ * gather uses. Lets an elementwise op read a folded broadcast/transpose/slice
+ * operand in place (docs/decisions.md: access-map fusion) instead of the
+ * producer materializing a whole tensor. */
+static uint vmo_view_idx(__global const int *aux, uint off, uint i)
+{
+    __global const int *x = aux + off;
+    const int rank = x[0];
+    __global const int *dims = x + 1, *strides = x + 1 + rank;
+    int rem = (int)i, o = x[1 + 2 * rank];
+    for (int e = rank - 1; e >= 0; --e) {
+        o += (rem % dims[e]) * strides[e];
+        rem /= dims[e];
+    }
+    return (uint)o;
+}
+
+static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop,
+                        __global const int *aux, const task_t t, uint tile,
                         uint lid, uint lsz)
 {
     const uint sub = t.p0, n = t.p1;
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
     __global float *d = AP(float, t.dst);
     __global const float *a = AP(const float, t.a), *b = AP(const float, t.b);
+    /* Viewed operands: only plain float binary/unary subops carry a/b view
+     * aux-offsets in p2/p3 (cmp/select/affine/fill reuse those fields). */
+    const uint av = (vmo_ew_is_bin(sub) || vmo_ew_is_un(sub)) ? t.p2 : 0u;
+    const uint bv = (vmo_ew_is_bin(sub) || vmo_ew_is_un(sub)) ? t.p3 : 0u;
+    if (av || bv) {          /* strided (gathered) read; not vectorizable */
+        const int isbin = vmo_ew_is_bin(sub);
+        for (uint i = lo + lid; i < hi; i += lsz) {
+            const float x = av ? a[vmo_view_idx(aux, av - 1u, i)] : a[i];
+            d[i] = isbin ? vmo_ew_bin(sub, x,
+                             bv ? b[vmo_view_idx(aux, bv - 1u, i)] : b[i])
+                         : vmo_ew_un(sub, x);
+        }
+        return;
+    }
 #ifdef VMO_CPU_TILES
     /* CPU shape (poc/09 a4, decisions.md #11): a contiguous chunk per WI,
      * explicit float8 body + scalar tail. PoCL's work-group vectorizer cannot
@@ -429,7 +462,8 @@ static void vmo_isfinite_tile(__global uchar *arena, __global uchar **iop, const
     for (uint i = lo + lid; i < hi; i += lsz) d[i] = isfinite(a[i]) ? 1 : 0;
 }
 
-static void vmo_ew_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
+static void vmo_ew_tile(__global uchar *arena, __global uchar **iop,
+                    __global const int *aux, const task_t t, uint tile,
                     uint dt, uint adt, uint lid, uint lsz)
 {
     if (t.p0 == SUB_CMP) { vmo_cmp_tile(arena, iop, t, tile, adt, lid, lsz); return; }
@@ -445,6 +479,6 @@ static void vmo_ew_tile(__global uchar *arena, __global uchar **iop, const task_
 #ifdef cl_khr_fp64
     case DT_F64:              vmo_ew_tile_f64(arena, iop, t, tile, lid, lsz); break;
 #endif
-    default:                  vmo_ew_tile_f32(arena, iop, t, tile, lid, lsz); break;
+    default:                  vmo_ew_tile_f32(arena, iop, aux, t, tile, lid, lsz); break;
     }
 }

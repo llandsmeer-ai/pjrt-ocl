@@ -350,9 +350,11 @@ core path, and it never assumes fp64. Design decisions and their rationale live 
 
 ## Limitations & roadmap
 
-- **Op coverage is partial** and grows test-first. Not yet supported: partial-axis
-  reductions, batched / non-canonical `dot_general`, `if`/`case` control flow, general
-  (data-dependent) gather/scatter, sort. These raise a clear `LoweringError` today.
+- **Op coverage is partial** and grows test-first. Now in: innermost-suffix partial
+  reductions (softmax/layernorm) and batched / broadcast `dot_general` (attention, `x@W`).
+  Not yet: non-suffix reductions and non-canonical `dot_general` (both need an operand
+  transpose first), `if`/`case` control flow, general (data-dependent) gather/scatter, sort.
+  These raise a clear `LoweringError` today.
 - **Dtypes**: the full JAX matrix (f32/f64/i32/u32/i64/bool/f16/bf16) is in; f64 is gated
   on `cl_khr_fp64`. Still to come: i8/i16 and complex.
 - **Two execution engines, auto-selected.** GPUs run a persistent megakernel with an
@@ -366,6 +368,40 @@ core path, and it never assumes fp64. Design decisions and their rationale live 
   large matmul uses a standalone SGEMM but full parity needs TF32 tensor cores
   (inline-PTX WMMA behind the kernel-table override — not yet built); `while` is
   down to ~4x via affine folding + in-place carries (see `docs/decisions.md` §9).
+
+## References
+
+Sources this project drew on, by topic. (Design rationale that cites these lives in
+[`docs/decisions.md`](docs/decisions.md).)
+
+**PJRT & the XLA plugin interface**
+- PJRT C API header — [openxla/xla `xla/pjrt/c/pjrt_c_api.h`](https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api.h) (vendored at a pinned commit)
+- [PJRT overview](https://openxla.org/xla/pjrt) and [PJRT integration guide](https://openxla.org/xla/pjrt/pjrt_integration)
+- [StableHLO specification](https://openxla.org/stablehlo/spec) — op semantics we lower from
+- [JAX](https://github.com/jax-ml/jax) — the frontend; plugins register via a `jax_plugins` entry point
+
+**OpenCL runtime & the cross-workgroup barrier (the project's #1 risk)**
+- [PoCL — Portable Computing Language](https://portablecl.org/) (our CPU/debug backend); its CPU pipeline uses **Continuation-Based Synchronization** ([PoCL papers](https://portablecl.org/publications.html)), i.e. kernel-boundary barriers — the basis of our host-dispatch engine
+- T. Sorensen, A. F. Donaldson, et al., **"Portable Inter-Workgroup Barrier Synchronisation for GPUs"**, OOPSLA 2016 — occupancy-bound execution; why an in-kernel spin-barrier needs all workgroups co-resident (and deadlocks on a non-preemptive CPU runtime)
+- [The OpenCL Specification (Khronos)](https://www.khronos.org/registry/OpenCL/specs/) — memory model, atomics/fences, and the rule that cross-workgroup sync is a kernel boundary
+
+**Persistent-megakernel design (VM + scheduler inspiration)**
+- HazyResearch **Megakernels** — [github.com/HazyResearch/Megakernels](https://github.com/HazyResearch/Megakernels) and the blog posts [*No Bubbles* (Llama-1B)](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles) and [*Whole GPU* (TP-Llama-70B)](https://hazyresearch.stanford.edu/blog/2025-09-28-tp-llama-main) — per-block instruction streams, fine-grained dependency counters instead of a grid barrier, warp specialization
+- [ThunderKittens](https://github.com/HazyResearch/ThunderKittens) — the tile-abstraction lineage
+
+**Matmul & TF32 tensor cores from OpenCL (inline PTX)**
+- [ihavnoid/hgemmtest](https://github.com/ihavnoid/hgemmtest) — WMMA tensor cores invoked via inline PTX from OpenCL C
+- [sschaetz/nvidia-opencl-examples `oclInlinePTX`](https://github.com/sschaetz/nvidia-opencl-examples) — minimal inline-PTX-from-OpenCL syntax
+- [alexarmbr/matmul-playground](https://github.com/alexarmbr/matmul-playground) + blog [*How To Write A Fast Matrix Multiplication From Scratch With Tensor Cores*](https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html) — tiling, swizzling, `ldmatrix`/`mma.sync` fragment layouts
+- [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) (`arch/mma_sm80.h`) — the authoritative TF32 `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32` string
+- [NVIDIA PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/) — `wmma`/`mma.sync`/`ldmatrix`/`cvta` semantics and fragment→register maps
+
+**Compiler fusion (the access-map principle, §13)**
+- XLA operator fusion (`kLoop` / `kInput`) — inline elementwise + broadcast up to a reduction boundary; the model our access-map fusion follows
+- The polyhedral / loop-fusion view (iteration domains + access relations) — fuse an edge where the access is a *function*, not a many-to-one relation
+
+**Baselines & tooling**
+- cuBLAS / XLA:GPU (the CUDA reference in the benchmarks), [Eigen](https://eigen.tuxfamily.org/) (the XLA:CPU matmul baseline)
 
 ## License
 

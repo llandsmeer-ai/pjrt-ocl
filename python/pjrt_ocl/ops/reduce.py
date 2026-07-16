@@ -303,12 +303,11 @@ def _reduce_np_axis(arr, kind):
 
 
 def _redseg_sim(task, entry, rt):
+    # one segment per tile: entry covers segments [tile_lo, tile_hi)
     n_out, seg, kind = task.p0, task.p1, task.p2
     src = rt.view(task.a)
     out = rt.view(task.dst)
-    lo = entry.tile_lo * TILE_SIZE
-    hi = min(entry.tile_hi * TILE_SIZE, n_out)
-    for o in range(lo, hi):
+    for o in range(entry.tile_lo, min(entry.tile_hi, n_out)):
         out[o] = _reduce_np(src[o * seg:(o + 1) * seg], kind)
 
 

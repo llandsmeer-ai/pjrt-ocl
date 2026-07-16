@@ -18,7 +18,7 @@ static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
                    : (dt == DT_F16 || dt == DT_BF16) ? 2u : 4u;
     for (uint tile = tile_lo; tile < tile_hi; ++tile) {
         switch (op) {
-        case TOP_EW:       vmo_ew_tile(arena, iop, t, tile, dt, adt, lid, lsz); break;
+        case TOP_EW:       vmo_ew_tile(arena, iop, aux, t, tile, dt, adt, lid, lsz); break;
         case TOP_MMA:      vmo_mma_tile(arena, iop, t, tile, As, Bs); break;
         case TOP_GATHER:   vmo_gather_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
         case TOP_RED_PART: vmo_reduce_part_tile(arena, iop, t, tile, As, dt, lid, lsz); break;
@@ -28,7 +28,7 @@ static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
         case TOP_DYN_GATHER:  vmo_dyn_gather_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
         case TOP_DYN_SCATTER: vmo_dyn_scatter_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
         case TOP_RED_WINDOW:  vmo_redwin_tile(arena, iop, aux, t, tile, dt, lid, lsz); break;
-        case TOP_RED_SEG:  vmo_redseg_tile(arena, iop, t, tile, dt, lid, lsz); break;
+        case TOP_RED_SEG:  vmo_redseg_tile(arena, iop, t, tile, dt, As, lid, lsz); break;
         default: break;
         }
     }

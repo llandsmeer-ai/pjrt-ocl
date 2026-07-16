@@ -7,7 +7,7 @@ plugin must be untouched and must still build/run on non-NVIDIA devices (PoCL, A
 
 Read `docs/decisions.md` §9 (esp. §9b) and this file before starting. Follow the repo's
 **hard rules** in `CLAUDE.md` — in particular **PoC-first**: prove the mechanism in
-`poc/08-tensor-core-mma/` before integrating anything into the main tree.
+`poc/11-tensor-core-mma/` before integrating anything into the main tree.
 
 ---
 
@@ -41,7 +41,7 @@ compiles; fall back to the portable `mm2` otherwise.
 
 ## Plan (phased; each phase has a gate)
 
-### Phase 0 — PoC (poc/08-tensor-core-mma/, standalone, NO plugin changes)
+### Phase 0 — PoC (poc/11-tensor-core-mma/, standalone, NO plugin changes)
 Write a minimal C + OpenCL host program that:
 1. picks the NVIDIA platform/device (substring "NVIDIA"),
 2. compiles a kernel containing inline-PTX tensor-core ops (start with the **proven f16
@@ -58,7 +58,7 @@ Build the PoC like the others: a small `Makefile`/`CMakeLists` linking `-lOpenCL
 existing `poc/*/` for the pattern. Keep a `README.md` recording what compiled, what didn't
 (with the exact driver error), and the measured TFLOP/s.
 
-### Phase 1 — full TF32 tensor-core SGEMM (still standalone in poc/08)
+### Phase 1 — full TF32 tensor-core SGEMM (still standalone in poc/11)
 Grow the PoC into a real GEMM: block tile in shared memory, warp-level `wmma.mma` accumulation
 loop, epilogue store. Tune for throughput (target: clearly beat the 21 TFLOP/s FP32 mm2;
 stretch: approach cuBLAS's ~100–134 TFLOP/s). Techniques from the refs: shared-mem staging

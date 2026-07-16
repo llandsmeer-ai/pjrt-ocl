@@ -122,12 +122,13 @@ def _register_binop(stablehlo_name: str, opcode: int, subop: int,
     L.handles(stablehlo_name)(_binop_handler(opcode))
 
     def to_task(ins) -> Task:
+        # p2/p3 = a/b view aux-offsets (0 = direct); set by _fuse_views
         return Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.b,
-                    p0=subop, p1=ins.n, p2=0, p3=0)
+                    p0=subop, p1=ins.n, p2=ins.imm, p3=ins.imm2)
 
     def interp(ins, rt) -> None:
-        a = rt.view(ins.a, ins.n)
-        b = rt.view(ins.b, ins.n)
+        a = rt.viewed(ins.a, ins.n, ins.imm)
+        b = rt.viewed(ins.b, ins.n, ins.imm2)
         rt.view(ins.dst, ins.n)[:] = npfn(a, b)
 
     def ew_sim(a, b, task, rt, lo, hi):
@@ -144,11 +145,12 @@ def _register_unop(stablehlo_name: str, opcode: int, subop: int,
     def to_task(ins) -> Task:
         # b aliases a (self): unused by vm2.cl's unary branch, but keeps the
         # python schedule simulator's eager view(task.b)[lo:hi] in-bounds.
+        # p2 = operand a's view aux-offset (0 = direct); p3 unused (no b).
         return Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.a,
-                    p0=subop, p1=ins.n, p2=0, p3=0)
+                    p0=subop, p1=ins.n, p2=ins.imm, p3=0)
 
     def interp(ins, rt) -> None:
-        a = rt.view(ins.a, ins.n)
+        a = rt.viewed(ins.a, ins.n, ins.imm)
         rt.view(ins.dst, ins.n)[:] = npfn(a)
 
     def reads(ins) -> set[int]:
