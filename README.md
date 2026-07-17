@@ -204,6 +204,12 @@ dispatch-free — see methodology above):
   earlier campaign's fixes (affine op folding, in-place carries,
   contention-free barrier spin) are what hold that at 2x rather than the 28x
   it started from.
+- **`lax.scan` (stacked outputs) ties XLA CPU at 1M elements.** The
+  dynamic_update_slice that stacks each step's output used to re-copy the
+  whole ys buffer every iteration (O(T²·n) traffic); the in-place-DUS fold
+  (§15a) scatters the row straight into the loop carry instead. Scan-RNN
+  1M×T8: 1.11 ms vs XLA CPU's 1.09; 1M×T32: 4.84 vs 4.84 (FOR mode; 2× over
+  the copying path on NVIDIA, up to 15× on PoCL host-dispatch).
 
 On the ops closest to parity, the residual mid-size gap is the VM's fixed
 per-instruction cost (barrier + dispatch, ~15 µs vs ~3 µs); fusing more work
