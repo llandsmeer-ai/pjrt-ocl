@@ -128,7 +128,7 @@ Anything unsupported raises a clear `LoweringError` naming the op.
 ## Hardware tested & benchmarks
 
 Correctness comes first; performance is early. Every device below runs the full
-test suite (240 tests: op families x the dtype matrix + e2e); benchmarks are
+test suite (263 tests: op families x the dtype matrix + e2e); benchmarks are
 per-op wall-clock vs problem size N so you can judge whether the library is
 worth it for *your* sizes and hardware. New devices go through
 [`docs/hardware-bringup.md`](docs/hardware-bringup.md).
@@ -235,23 +235,27 @@ NVIDIA (TF32 tensor cores on), vs native JAX CUDA on the same GPU
 
 | config (D, ff, layers) | ours | native CUDA | gap | ours throughput |
 |------------------------|------|-------------|-----|-----------------|
-| base (512, 2048, 6)    | 6.8 ms | 0.43 ms | 15.7× | 3.1 TFLOP/s |
-| large_l1 (1024, 4096, 1) | 5.1 ms | 0.57 ms | 8.9× | 11.0 TFLOP/s |
-| large (1024, 4096, 6)  | 30.9 ms | 3.7 ms | **8.3×** | **10.8 TFLOP/s** |
+| base (512, 2048, 6)    | 5.8 ms | 0.44 ms | 13.4× | 3.6 TFLOP/s |
+| large_l1 (1024, 4096, 1) | 4.6 ms | 0.57 ms | 8.2× | 12.0 TFLOP/s |
+| large (1024, 4096, 6)  | 28.2 ms | 3.7 ms | **7.6×** | **11.9 TFLOP/s** |
 
-(§22's tile/GEMV fixes took `base` 9.7 → 6.8 ms and `large` 33.5 → 30.9 ms.)
-The gap **halves as the model gets compute-bound** (and holds at full
-depth): `base`'s 16× is small-op/overhead-bound, not a matmul deficit — on
-compute-heavy work we sustain **~11 TFLOP/s within ~8× of cuBLAS**. Getting here
-took a campaign of general mechanisms, each of which helps any workload:
+The gap **shrinks as the model gets compute-bound** (and holds at full depth):
+`base`'s 13× is small-op/overhead-bound, not a matmul deficit — on compute-heavy
+work we sustain **~12 TFLOP/s within ~8× of cuBLAS**. `base` came down 9.7 → 5.8
+ms over a campaign of general mechanisms, each of which helps any workload:
 segmented (workgroup-collaborative) reductions for softmax/layernorm; an
 **access-map fusion** pass that folds transposes/reshapes/broadcasts into the
 consuming operand's strided read (no materialization, no barrier); **arena
 liveness-reuse** (bounds device memory by peak live set, not the sum of all
 temporaries — cut the `base` arena 716→105 MiB and unblocked `large` entirely,
-which otherwise overflowed the address space); and TF32 tensor-core matmul with
-a bank-conflict-free staging tile. The residual gap is matmul: the in-megakernel
-tile is arithmetic-intensity-capped by the persistent-kernel co-residency the
+which otherwise overflowed the address space); TF32 tensor-core matmul with a
+bank-conflict-free staging tile; **per-tile latency fixes** (float4 EW, a proper
+GEMV — §22, 9.7 → 6.8 ms); and **fused normalization ops** (§19) that recognize
+the layernorm/softmax `reduce→broadcast→…` idiom and collapse it into a single
+workgroup-per-segment kernel — one global round-trip instead of 5–7 latency-bound
+phases (layernorm 7→2 barriers, softmax 5→0; standalone softmax now *beats* native
+CUDA; 6.8 → 5.8 ms). The residual gap is matmul: the in-megakernel tile is
+arithmetic-intensity-capped by the persistent-kernel co-residency the
 cross-workgroup barrier needs, so closing it further needs a hybrid
 megakernel-plus-standalone-launch split (the documented next lever).
 
