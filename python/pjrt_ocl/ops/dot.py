@@ -49,7 +49,7 @@ import math
 
 from .. import lowering as L
 from .. import opsem
-from ..scheduler import Task, TILE_MMA, MMA_T
+from ..scheduler import Task, TILE_MMA, TILE_RED_SEG, MMA_T
 
 
 def _decode(ins):
@@ -129,6 +129,16 @@ def _dot_general(ctx, op):
 
 def _dot_to_task(ins) -> Task:
     M, N, K, G = _decode(ins)
+    # GEMV routing: A[M,K] @ x[K,1] through the 64x64 MMA tile wastes 63/64 of
+    # every tile (N=1) and runs the K-loop serially per tile — measured 27-46x
+    # off cuBLAS on the chained bench. Route it to the segmented-reduce tile in
+    # dot mode instead (p3=1: out[o] = sum_j A[o*K+j] * x[j]): one row per
+    # tile, whole-workgroup coalesced dot + local tree — M-way parallel.
+    # Folded views (p4/p5) stay on the MMA path (the row read must be
+    # contiguous).
+    if N == 1 and G == 1 and not ins.aview and not ins.bview:
+        return Task(TILE_RED_SEG, dst=ins.dst, a=ins.a, b=ins.b,
+                    p0=M, p1=K, p2=0, p3=1)
     # aview/bview (+1; 0 = contiguous): a folded transpose/reshape/broadcast on
     # this operand (see lowering._fuse_matmul_views). The device reads the
     # pre-transpose SOURCE via the gather descriptor at p4/p5-1.
