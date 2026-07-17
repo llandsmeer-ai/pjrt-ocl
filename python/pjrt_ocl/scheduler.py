@@ -241,14 +241,17 @@ def _writes(ins: L.Instr) -> set[int]:
 
 def _depends(instrs, j: int, i: int) -> bool:
     """Does instr j (later) depend on instr i (earlier)?  RAW on j's reads +
-    WAW on writes (docs/roadmap.md, task spec). WAR is intentionally omitted —
-    the tensor program is SSA so buffers are single-assignment; recorded in
-    NOTES.md."""
+    WAW on writes (docs/roadmap.md, task spec) + WAR on i's reads. WAR never
+    fires in the SSA bulk of a program (nothing is written twice), but loop
+    carries are NOT SSA: copy-backs and in-place carry commits (elementwise
+    and DUS folds) rewrite a buffer that earlier body instrs read — e.g. the
+    in-place scatter's runtime-index read of the counter carry vs the counter
+    copy-back. Without the WAR edge those can share a barrier phase and race
+    across lanes."""
     a, b = instrs[i], instrs[j]
     aw = _writes(a)
-    if not aw:
-        return False
-    return bool((_reads(b) & aw) or (_writes(b) & aw))
+    bw = _writes(b)
+    return bool((_reads(b) & aw) or (bw & aw) or (_reads(a) & bw))
 
 
 def _cross_lane_dep(instrs, j: int, i: int, is_map) -> bool:
