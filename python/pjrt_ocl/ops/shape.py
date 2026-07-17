@@ -92,6 +92,16 @@ def _reshape(ctx, op):
     ctx.value_to_buf[op.results[0]] = ctx.buf_for(op.operands[0])
 
 
+@L.handles("stablehlo.optimization_barrier")
+def _optimization_barrier(ctx, op):
+    # Pure compiler fence: results are the operands, bit for bit. Alias each
+    # result to its operand's buffer (no instruction). The op only exists to
+    # stop XLA-side fusion/CSE (e.g. benchmark chains); our lowering has no
+    # cross-op optimizer to fence, so identity is exact.
+    for res, arg in zip(op.results, op.operands):
+        ctx.value_to_buf[res] = ctx.buf_for(arg)
+
+
 @L.handles("stablehlo.slice")
 def _slice(ctx, op):
     # dst[i] = a[ start + i*slice_stride ] per axis -> a strided gather.
