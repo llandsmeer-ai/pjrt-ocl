@@ -195,6 +195,18 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
     }
 }
 
+/* Uniform grid-stride bound: ceil(seg/lsz)*lsz. EVERY seg-loop in the fused
+ * norm kernels iterates to SEG_UNIFORM (not seg) so all work-items execute the
+ * SAME number of iterations, guarding the body with `j < seg`. A DIVERGENT-trip
+ * grid-stride loop (`j < seg`, lanes doing different counts) that follows a
+ * barrier and performs a GLOBAL store is MISCOMPILED by PoCL 5.0's work-item
+ * loop / parallel-region former — intermittent heap corruption (crash on I/O
+ * ports, wrong values on the arena; non-deterministic, ~half of runs). The
+ * uniform bound makes the post-barrier region's WI-loop structure identical
+ * across lanes and is the §18-class fix (verified 16/16 stable on PoCL, was
+ * ~50% crash before). vmo_redseg_tile dodged this by storing from lid 0 only. */
+#define SEG_UNIFORM(seg, lsz) ((((seg) + (lsz) - 1u) / (lsz)) * (lsz))
+
 /* TOP_SOFTMAX_SEG (§19): fused softmax over the innermost `seg` elements.
  * out[o*seg + j] = exp(x[o*seg+j] - max_j) / sum_j exp(x[o*seg+j] - max_j).
  * ONE segment per tile, reduced COLLABORATIVELY by the whole workgroup (like
@@ -202,7 +214,8 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
  * tree-reduces run in `Bs`, and the result is written once — one global read +
  * one global write, no intermediate global buffers. seg <= MMA_ASZ (gated in
  * the lowering recognizer). Barrier discipline follows §18: no `return` before
- * a barrier, no barrier as the last statement before the tile-loop backedge. */
+ * a barrier, no barrier as the last statement before the tile-loop backedge,
+ * and every post-barrier grid-stride loop uses the UNIFORM bound (above). */
 static void vmo_softmax_seg(__global uchar *arena, __global uchar **iop, const task_t t,
                         uint tile, __local float *As, __local float *Bs, uint lid, uint lsz)
 {
@@ -211,17 +224,18 @@ static void vmo_softmax_seg(__global uchar *arena, __global uchar **iop, const t
     const int valid = o < n_out;          /* over-assigned tiles run the tree
                                            * on init values, skip the store. */
     const uint base = o * seg;
+    const uint jN = SEG_UNIFORM(seg, lsz);
     __global const float *a = AP(const float, t.a);
     __global float *dst = AP(float, t.dst);
     /* stage the segment row into local once (grid-stride if seg > lsz) */
-    if (valid)
-        for (uint j = lid; j < seg; j += lsz)
+    for (uint j = lid; j < jN; j += lsz)
+        if (valid && j < seg)
             As[j] = a[base + j];
     barrier(CLK_LOCAL_MEM_FENCE);
     /* max reduce: per-lane partial over its strided slice, then a local tree */
     float m = -INFINITY;
-    if (valid)
-        for (uint j = lid; j < seg; j += lsz)
+    for (uint j = lid; j < jN; j += lsz)
+        if (valid && j < seg)
             m = fmax(m, As[j]);
     Bs[lid] = m;
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -233,8 +247,8 @@ static void vmo_softmax_seg(__global uchar *arena, __global uchar **iop, const t
     barrier(CLK_LOCAL_MEM_FENCE);          /* all lanes read mx before Bs reuse */
     /* exp(x - max) in place, accumulating the per-lane partial sum */
     float sacc = 0.0f;
-    if (valid)
-        for (uint j = lid; j < seg; j += lsz) {
+    for (uint j = lid; j < jN; j += lsz)
+        if (valid && j < seg) {
             const float e = exp(As[j] - mx);
             As[j] = e;
             sacc += e;
@@ -248,9 +262,9 @@ static void vmo_softmax_seg(__global uchar *arena, __global uchar **iop, const t
     const float sm = Bs[0];
     /* No trailing barrier: this read of Bs[0]/As[j] follows the sum tree's
      * final barrier; the next tile re-stages As and re-barriers before any
-     * shared read (§18). */
-    if (valid)
-        for (uint j = lid; j < seg; j += lsz)
+     * shared read (§18). Uniform-trip guarded store (see SEG_UNIFORM). */
+    for (uint j = lid; j < jN; j += lsz)
+        if (valid && j < seg)
             dst[base + j] = As[j] / sm;
 }
 
@@ -258,7 +272,7 @@ static void vmo_softmax_seg(__global uchar *arena, __global uchar **iop, const t
  * mu = mean(x), var = mean(x^2) - mu^2 (single pass), out = (x-mu)*rsqrt(var+eps).
  * The trailing per-channel affine (*g + b) stays as separate EW ops. eps rides
  * in as_float(t.p2). Same workgroup-per-segment collaborative structure as
- * vmo_softmax_seg; §18 barrier rules apply. */
+ * vmo_softmax_seg; §18 barrier rules + the SEG_UNIFORM grid-stride bound apply. */
 static void vmo_layernorm_seg(__global uchar *arena, __global uchar **iop, const task_t t,
                         uint tile, __local float *As, __local float *Bs, uint lid, uint lsz)
 {
@@ -267,16 +281,17 @@ static void vmo_layernorm_seg(__global uchar *arena, __global uchar **iop, const
     const uint o = tile;
     const int valid = o < n_out;
     const uint base = o * seg;
+    const uint jN = SEG_UNIFORM(seg, lsz);
     __global const float *a = AP(const float, t.a);
     __global float *dst = AP(float, t.dst);
-    if (valid)
-        for (uint j = lid; j < seg; j += lsz)
+    for (uint j = lid; j < jN; j += lsz)
+        if (valid && j < seg)
             As[j] = a[base + j];
     barrier(CLK_LOCAL_MEM_FENCE);
     /* single pass: per-lane partial sum and sum-of-squares */
     float s1 = 0.0f, s2 = 0.0f;
-    if (valid)
-        for (uint j = lid; j < seg; j += lsz) {
+    for (uint j = lid; j < jN; j += lsz)
+        if (valid && j < seg) {
             const float v = As[j];
             s1 += v;
             s2 += v * v;
@@ -300,9 +315,9 @@ static void vmo_layernorm_seg(__global uchar *arena, __global uchar **iop, const
     const float mu = sum / n;
     const float var = sumsq / n - mu * mu;
     const float rs = rsqrt(var + eps);
-    /* No trailing barrier before the backedge (§18). */
-    if (valid)
-        for (uint j = lid; j < seg; j += lsz)
+    /* No trailing barrier before the backedge (§18). Uniform-trip guarded store. */
+    for (uint j = lid; j < jN; j += lsz)
+        if (valid && j < seg)
             dst[base + j] = (As[j] - mu) * rs;
 }
 
