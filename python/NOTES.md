@@ -146,11 +146,15 @@ being built in parallel against the SAME spec (docs/vmprogram.md).
   only a defensive corner.)
 - **A2 — Dependency model.** Task spec: "B depends on A if B reads (a/b, +p3 for select later) or
   writes a buffer that A writes (WAW too)." Implemented RAW (B.reads ∩ A.writes) + WAW
-  (B.writes ∩ A.writes). **WAR is intentionally NOT modeled** — the tensor program is SSA so each
-  buffer is written once; the only writes that alias are the SSA value's own def. If a future
-  buffer-liveness/reuse pass (NOTES "Buffer plan is still naive…") introduces real WAR/WAW on
-  reused arena slots, the WAW edge already covers reuse-of-a-written-slot; WAR would need adding
-  then. Flagged here so the C++ side and the reuse pass author see it.
+  (B.writes ∩ A.writes) + **WAR (B.writes ∩ A.reads) — added 2026-07-17**. WAR was originally
+  omitted (the SSA argument below), but loop CARRIES are not SSA: copy-backs and the in-place
+  carry commits (elementwise + DUS folds) rewrite buffers earlier body instrs read. The concrete
+  bug: the in-place DUS scatter reads the counter carry (runtime index) and shared a barrier
+  phase with the counter copy-back — a cross-lane race the schedule simulator's order-independence
+  check caught. WAR never fires in the SSA bulk of a program (nothing is written twice), so it
+  costs no phases there (verified: transformer-ish block 15 phases either way). Note the arena
+  liveness-reuse pass (§16) aliases SLOTS, not buffer IDs, and guarantees a barrier between
+  intervals — it does not rely on WAR edges.
 - **A3 — Greedy level grouping is order-sensitive but correctness-safe.** "an instr joins the
   current level iff it has no dependency on any instr in the current level; else new level" is a
   single forward pass (not optimal bin-of-levels). It never places an instr in the same level as

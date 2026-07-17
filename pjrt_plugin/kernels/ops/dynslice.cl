@@ -1,10 +1,13 @@
 /* Dynamic slice/update tile ops — gather/scatter with a RUNTIME base offset.
  *
  * Unlike TOP_GATHER/TOP_SCATTER (whose src/out base is a compile-time aux
- * constant), the start offsets here are SCALAR BUFFERS living in the arena: the
- * tile op reads them, clamps to the legal range, and forms the affine base
- * offset at runtime. Their byte offsets ride in the aux pool (the loader can
- * only patch task dst/a/b to byte offsets, not an arbitrary-length index list).
+ * constant), the start offsets here are SCALAR BUFFERS: the tile op reads
+ * them, clamps to the legal range, and forms the affine base offset at
+ * runtime. Their locations ride in the aux pool as idx_byteoff[rank], patched
+ * at LOAD time by the loader from idx_bufid[rank] (lowering can't know them:
+ * its reuse pass moves arena offsets, and an input scalar may be an I/O port).
+ * Each patched word is an arena byte offset or a bit-31 port handle — AP()
+ * resolves both.
  *
  * aux at task.p0 (identical layout for both ops; `dims`/`strides` name the
  * ITERATED space — output for gather, update for scatter):

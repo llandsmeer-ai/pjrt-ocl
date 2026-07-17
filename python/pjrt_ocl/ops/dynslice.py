@@ -8,11 +8,13 @@ the base offset here is computed on device from the start scalars:
     base = sum_d clamp(start_d, 0, in_dim_d - slice_size_d) * in_stride_d
     out[i] = operand[base + affine(i)]
 
-The start scalars live in the arena. The loader only patches task dst/a/b to
-byte offsets, so we carry the start scalars' arena BYTE offsets (for the VM) and
-their buffer ids (for the numpy validators, which address by id) in the aux
-pool. The byte offset of a buffer is fixed at allocation time, so reading it in
-the handler is stable through serialization.
+The start scalars' locations ride in the aux pool as idx_byteoff[rank] (for the
+VM) + idx_bufid[rank] (for the numpy validators, which address by id). The
+handler CANNOT fill idx_byteoff meaningfully: arena offsets are reassigned by
+the _reuse_arena post-pass, and a start scalar that is a program input may live
+in an I/O port (assigned at load time, runtime.cc). So idx_byteoff is written
+as a placeholder 0 here and the loader patches it to elem_off(idx_bufid) —
+arena byte offset or bit-31 port handle — which the kernels read through AP().
 
 dynamic_update_slice(operand, update, i0, ...) is the mirror: copy operand into
 the output, then scatter `update` at the runtime base offset. The copy is an
@@ -49,7 +51,9 @@ def _row_major_strides(shape):
 
 def _index_info(ctx, index_operands):
     """Validate + collect the start-index scalar operands. Returns
-    (buf_ids, byte_offsets, is64)."""
+    (buf_ids, byte_offset_placeholders, is64). The byte offsets are 0
+    placeholders — the loader patches them from the buffer ids (see module
+    docstring); only the ids are meaningful at lowering time."""
     buf_ids, byte_offs, is64 = [], [], None
     for iv in index_operands:
         shape, n, dt = L.tensor_info(iv.type)
@@ -63,9 +67,8 @@ def _index_info(ctx, index_operands):
             is64 = this64
         elif is64 != this64:
             raise L.LoweringError("dynamic_slice: mixed i32/i64 start indices")
-        bid = ctx.buf_for(iv)
-        buf_ids.append(bid)
-        byte_offs.append(ctx.buffers[bid].arena_byte_offset)
+        buf_ids.append(ctx.buf_for(iv))
+        byte_offs.append(0)
     return buf_ids, byte_offs, (is64 or 0)
 
 

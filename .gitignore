@@ -13,3 +13,5 @@ poc/06-fast-mma/bench
 poc/08-occupancy-discovery/poc08
 poc/09-cpu-kernels/poc09
 poc/10-cpu-sgemm/poc10
+tools/bench_plot.png
+tools/bench_plot.csv

@@ -934,7 +934,7 @@ unnecessary; only data dependencies between iterations need synchronization.
   this session's passthrough fix).
 - Scan at LARGE n×T is bound by the dynamic_update_slice identity copy (full ys buffer
   re-materialized every iteration — 4096×T512 ≈ 4 GB of traffic dwarfing loop overhead in every
-  mode). **Next lever for scan: in-place DUS into the loop carry**, not loop mechanics.
+  mode). Next lever for scan: in-place DUS into the loop carry — SHIPPED, see §15a.
 
 **Traps hit** (fixes in this branch):
 - Unrolling past ~2 GiB of arena silently misaddresses: buffer offsets are u32 AND bit 31 is
@@ -957,6 +957,40 @@ unnecessary; only data dependencies between iterations need synchronization.
 **Decision**: `auto` is the default (unroll small, OP_FOR the rest, plain WHILE only for genuine
 data-dependent conds). Detection is deliberately narrow (LT/signed, positive const step) —
 widen only when a real program shows a different counted shape.
+
+### 15a. In-place dynamic_update_slice into the loop carry — SHIPPED 2026-07-17
+
+The §15 "next lever". DUS is pure (`ys' = operand with slice replaced`), lowered as an
+identity-gather copy of the WHOLE operand into a fresh buffer + a scatter of the update row —
+so every scan iteration paid O(T·n) traffic for an O(n) write, O(T²·n) per scan.
+
+**Mechanism** (lowering-only; no new opcodes, no kernel/runtime changes): in the while/FOR body
+commit phase, when carry k's return value is produced by exactly that pair, the gather's source
+is carry k's own buffer (verified structurally: row-major contiguous aux, zero offset, full
+length), the DUS out_buf is returned in exactly one slot and never read in the body, and the
+carry is read by NOTHING but the identity gather and written by nothing else — then: NOP the
+gather, retarget the scatter's dst to the carry buffer, skip both snapshot copies. The pure
+semantics collapse to a mutation because no body instr can observe the carry mid-update.
+
+**Measured** (bench poc/12, `results_*_inplace_dus.csv`, identical sig checksums): NVIDIA FOR
+4096×T512 42.2→20.4 ms (2.1×), 1M×T8 1.79→1.11 ms and 1M×T32 4.84 ms — both now TIED with XLA
+CPU. PoCL FOR 4096×T512 1735→205 ms (8.4×), 1M×T32 3582→237 ms (15×). WHILE mode gains equally.
+Unroll does NOT get the fold (unrolled iterations are SSA, each writes a fresh ys) and now
+LOSES to FOR on large scans (PoCL 4096×T512: 940 vs 205 ms); the auto arena gate already
+steers those to FOR since the estimate counts the full (T,n) DUS result per iteration.
+
+**Trap: the scheduler's no-WAR assumption.** `_depends` modeled only RAW+WAW ("the program is
+SSA" — python/NOTES.md A2). Carries are NOT SSA, and it never bit because the ys temp-copy
+always forced a phase break between the scatter and the carry copy-backs. Removing that copy
+let the in-place scatter's runtime-index read (the counter carry, via reads_hint) share a
+barrier phase with the counter copy-back — a genuine cross-lane race, caught immediately by
+the schedule simulator's lane-order-independence check (great validator). Fix: WAR edges in
+`_depends`. They never fire in a program's SSA bulk (verified 0 phase-count change on a
+transformer-ish block; fori/transformer benches unchanged) — only at carry commit points.
+
+**Remaining scan gap vs XLA CPU** (4096×T128: 5.2 vs 1.3 ms) is per-iteration phase overhead
+(dynamic_slice + scatter each barrier per row), no longer bulk traffic. That's barrier-elision
+territory (§12 / megakernel-survey), not copy elimination.
 
 ## 16. Arena is a bump allocator — no liveness reuse (found 2026-07-16, transformer `large`)
 
@@ -1082,3 +1116,133 @@ portability targets — so it is a genuine correctness fix, not just a debug-pat
   (a) no `return` on a path that precedes a barrier, (b) no barrier as the final statement
   before the dispatch loop's backedge.** Validate on PoCL (the strictest region-former) before
   merging barrier-bearing kernels; a laptop-green NVIDIA/Intel run does not cover this.
+
+## 19. Fusion pattern → singular fused op (methodology, 2026-07-17)
+
+**The general principle** (established by profiling the transformer `base`, §14b/§18): when an op
+sequence's intermediate results are **immediately reduced and broadcast back** — a
+reduce → broadcast → elementwise → reduce → broadcast chain — each step is a separate
+**cross-workgroup phase** with a full global-memory round-trip. At small tensor sizes every phase
+is latency-bound (~28–30 µs floor: the barrier + memory latency can't be hidden), so a 7-phase
+layernorm costs ~0.21 ms while cuBLAS/XLA fuse it into ~1 kernel at ~7 µs (**~30× gap**). This —
+NOT matmul — is the dominant cost on realistic (base-scale) transformer workloads: our small
+matmuls are already competitive/faster than CUDA; the loss is entirely in layernorm/softmax/gelu
+running at ~1–4% of memory bandwidth (component profile in `docs/` / session notes).
+
+**The fix pattern**: RECOGNIZE the fixed idiom and lower it to a SINGLE fused megakernel op that
+does the whole computation **in local memory with one global read + one global write** — the
+workgroup-per-segment collaborative pattern already used by `vmo_redseg_tile` (§14 front 2). A
+`seg`-wide row is staged into local once; all reduces (max/sum/sumsq) run as local tree-reduces;
+the normalize is applied and written back — zero intermediate global buffers, one phase instead of
+five to seven.
+
+**How to add a new fused op** (the reusable recipe — apply next time a workload shows a
+reduce+broadcast idiom eating phases, e.g. RMSNorm, logsumexp, log_softmax, GroupNorm, attention's
+scale+softmax):
+1. **Identify the idiom** and confirm it reduces over the **innermost (suffix) axis** — that's what
+   the segment model (`OP_REDUCE_SEG`/`TILE_RED_SEG`) already tiles as workgroup-per-segment.
+2. **Add a tensor opcode** (`OP_*`) + **tile-op** (`TILE_*_SEG`); `imm`/`imm2` carry seg size + any
+   scalar param (eps). Params that are per-channel vectors (layernorm's `*g+b`) stay as separate
+   EW — they fuse cheaply via §11/§13; keep the fused op to the phase-heavy reduce core.
+3. **Kernel**: clone `vmo_redseg_tile`'s structure — stage segment to `__local`, tree-reduce,
+   compute, write once. MUST follow the §18 PoCL rules (no `return` before a barrier; no barrier as
+   the last statement before the tile-loop backedge; `valid` guard for over-assigned tiles).
+4. **Recognize + rewrite**: a lowering pass detects the idiom and emits the single op. Prefer a
+   post-lowering peephole on OUR VM-instr stream (robust to StableHLO/jaxlib variation — everything
+   funnels through `OP_REDUCE_SEG` + viewed EW) over matching raw StableHLO; GATE it hard and fall
+   back to the decomposed path on any mismatch (never wrong, only sometimes-unfused).
+5. **Wire** scheduler `n_tiles` (= n_out segments), numpy interp + schedule-sim validators, and add
+   dual-validator tests. **Verify**: phase-count drop, component-ms drop, transformer `--check`
+   still exact on all devices, full-model ms win — keep only if it moves the needle (§14a rule).
+
+**Expected payoff**: layernorm ~7→~2 phases, softmax ~5→~1; on `base` these two ops are ~3.8 ms of
+9.7 ms today, so the ceiling is large. `gelu` is pure-EW (no reduce) and should already chain-fuse
+(§11) — if it doesn't, that's a chain-fusion gap, not a new fused op.
+
+## 20. dynamic_slice start scalars: aux byte offsets must be LOADER-patched (found 2026-07-17)
+
+**Found while** reworking the per-op benchmark (§21): `lax.dynamic_slice(x, (k,), ...)` with a
+runtime `k` passed as a *program input* silently sliced at offset 0 on the real device (both
+engines, PoCL and NVIDIA), and a 16-link chained version segfaulted PoCL. All 240 pytest
+validators passed throughout.
+
+**Root cause — two independent invalidations of the same design.** The dynslice handler recorded
+each start scalar's `arena_byte_offset` into the aux pool at lowering time
+(`idx_byteoff[rank]`, read by `vmo_dyn_base` on device). That value is doomed twice:
+1. `_reuse_arena` (§16) reassigns EVERY buffer's arena offset after handlers run — the docstring
+   premise "byte offset is fixed at allocation time" died when §16 landed. Any arena-resident
+   index scalar could end up read from its pre-reuse offset.
+2. A start scalar that is a program input may be assigned an I/O PORT at load time
+   (`runtime.cc` `assign_port`, zero-copy `cl_mem` — never in the arena at all). The recorded
+   arena offset then points at memory nothing ever wrote (→ base 0 or garbage → OOB segfault
+   under PoCL).
+
+**Why validators never caught it**: the numpy validators address start scalars by BUFFER ID
+(`idx_bufid[rank]`, carried in aux for exactly that purpose) — only the real device consumed
+`idx_byteoff`. This is the same blind spot as the §15 "outputs are I/O ports" trap: anything
+arena-offset-shaped is invisible to arena-based validators; only real-plugin e2e sees it.
+
+**Fix (chosen): patch aux at LOAD time, single source of truth.** The loader already resolves
+buffer id → arena-offset-or-port-handle for task dst/a/b (`elem_off`); it now also walks dyn
+gather/scatter tasks and rewrites `aux[idx_byteoff[d]] = elem_off(aux[idx_bufid[d]])` before
+uploading the aux buffer. The kernels read the scalars through `AP()`, which already resolves
+bit-31 port handles, so ports work with no kernel change. The Python handler writes placeholder
+0s. Rejected alternatives: (a) lowering-side post-pass after `_reuse_arena` — fixes staleness
+but cannot know port assignment without duplicating `assign_port` in Python (silent-corruption
+coupling); (b) copying ported scalars into the arena via an extra 1-element instruction —
+correct but pollutes every dynamic_slice with instruction overhead.
+
+**Rule going forward**: an aux word that names a buffer LOCATION must be patched by the loader
+from a buffer id; lowering-time offsets are only valid for things `_reuse_arena` doesn't move
+(shapes, strides, trip counts). Verified: previously-failing repros + full pytest + PoCL/NVIDIA
+device runs of chained dynamic_slice.
+
+**Unrelated observation recorded while validating** (not a bug): on NVIDIA, f32 matmul runs on
+the tf32 tensor-core WMMA path (`-DVMO_NV_PTX`, §14) — a single 64x64 matmul shows median rel
+error ~8e-4 vs f64 (tf32 mantissa = 10 bits, 2^-11 ≈ 5e-4), where PoCL shows ~1e-7 (true f32
+FMA). Same trade cuBLAS/XLA make by default on Ampere+; worth remembering when comparing
+against references with tight tolerances.
+
+## 21. Per-op benchmark: in-program op chaining to kill dispatch noise (2026-07-17)
+
+`tools/plot_bench.py` timed one op per `jit` call; at small N the measurement was dominated by
+per-call noise (python dispatch, PJRT execute overhead, launch latency — µs-scale, same order
+as the kernels), giving jagged curves and run-to-run swings.
+
+**Rework**: every benchmarked function now applies its op CHAIN=16 times inside ONE jitted
+program as a data-dependent chain (link i consumes link i-1's output; matmul B-matrices scaled
+by 1/sqrt(n) so values stay finite), and the reported time is call_time/CHAIN, min-of-7-rounds
+with iteration counts auto-calibrated so every timed round lasts ≥50 ms (timer resolution).
+Host-side per-call overhead is amortized 16x; both backends execute one program containing 16
+real op instances — for ours that's 16 VM instructions (the megakernel's actual regime), for
+XLA 16 kernels/thunks in one executable.
+
+**The load-bearing detail is `stablehlo.optimization_barrier` between links**: without it XLA
+fuses/CSEs a repeated elementwise chain into far fewer kernels and the CUDA side reads ~16x
+faster than reality. Our lowering now supports the op as pure buffer aliasing (zero
+instructions — we have no cross-op optimizer to fence), so it is free on both sides.
+
+**Trap 1: a barrier stops CSE/fusion but NOT dead-code elimination.** First gather version
+threaded only the (unchanged) offset through the barrier; each link's slice output fed nothing,
+so BOTH backends DCE'd 15 of the 16 slices and the panel read a physically impossible
+2.7-4.3 µs/op at N=16M (>10 TB/s). Sanity-check every chained panel against bandwidth
+arithmetic. Fix: the next offset must GENUINELY depend on the previous slice's data —
+`k += (y[0] * z).astype(int32)` where `z` is an opaque zero (`optimization_barrier(0.0)`
+hoisted out of the loop), which no simplifier can fold.
+
+**Trap 2: XLA looks THROUGH the consumer.** With the data dependency alone, XLA rewrote
+`y[0]` as a 1-element slice of `x` (slice-of-dynamic-slice simplification) — the k-chain then
+ran on tiny kernels and the big slices were dead again (CUDA still ~3 µs/op flat at 16M). Fix:
+pass `y` through `optimization_barrier` BEFORE indexing it; the barrier forces `y` materialized
+and simplifications cannot look through it. After both fixes, CUDA lands at ~12 µs/op at 16M —
+which IS physically sane: `x` is 64 MB and fully L2-resident (128 MB L2 on Blackwell), so the
+~5.4 TB/s effective is L2, not HBM, bandwidth. Ours ~30-50 µs/op (per-instruction floor ~5
+instrs/link, then bandwidth). Corollary: a data-dependent chain makes per-op time honest only
+if the consumed data is (a) genuinely needed and (b) barrier-shielded from producer fusion.
+
+Measured with the rework (NVIDIA, 2026-07-17): run-to-run deviation of ours-column medians
+0.1-0.8% per panel (max 5%); the old one-op-per-call method also carried a ~2x BIAS at small N
+(29-39 µs/call where the op itself is ~15 µs — the rest was python/PJRT dispatch, now /16).
+
+Chaining is also what surfaced the §20 dynslice bug — repetition-within-program is a better
+correctness probe than one-shot calls; keep using it.

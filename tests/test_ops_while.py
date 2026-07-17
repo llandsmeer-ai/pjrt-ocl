@@ -239,3 +239,66 @@ def test_fixed_trip_nonunit_step_via_while():
             lambda c: c[0] < 10, lambda c: (c[0] + 3, c[1] + 1.0),
             (jnp.int32(0), x))[1]
     check(f, np.float32(0.0))          # 4 iterations
+
+
+# --- in-place dynamic_update_slice into the loop carry (scan ys stacking) ---
+
+def test_scan_dus_inplace_elides_identity_gather():
+    """In FOR mode the DUS identity gather (full ys copy per iteration) must
+    be folded away: the scatter writes the ys carry buffer directly."""
+    os.environ["PJRT_OCL_WHILE"] = "for"
+    try:
+        def f(c, xs):
+            return jax.lax.scan(lambda c, xt: (c * 0.9 + xt, c), c, xs)
+        prog = L.lower_artifact(to_artifact(
+            f, np.zeros(8, np.float32), np.ones((5, 8), np.float32)))
+        ops = [i.op for i in prog.instrs]
+        assert ops.count(L.OP_DYNAMIC_UPDATE_SLICE) == 1
+        # the full-length (5*8 elem) identity copy of ys must be gone; the
+        # only gathers left are small views (e.g. the (8,)->(1,8) update row).
+        assert not any(i.op == L.OP_GATHER_STRIDED and i.n == 40
+                       for i in prog.instrs)
+    finally:
+        os.environ.pop("PJRT_OCL_WHILE", None)
+
+
+def test_scan_dus_inplace_values(while_mode):
+    """Value-correct scan stacking through the in-place DUS path, with a
+    nontrivial carry recurrence and T > n so row indexing bugs surface."""
+    def f(c, xs):
+        def step(c, xt):
+            c = c * 0.5 + xt
+            return c, c + 1.0
+        return jax.lax.scan(step, c, xs)
+    c0 = np.linspace(0.0, 1.0, 3).astype(np.float32)
+    xs = np.arange(21, dtype=np.float32).reshape(7, 3)
+    check(f, c0, xs)
+
+
+def test_dus_carry_also_read_keeps_copy(while_mode):
+    """The ys carry is ALSO read in the body (sum into a second carry): the
+    in-place fold must bail (reads-of-carry != 1) and stay correct."""
+    def f(x):
+        def body(st):
+            i, ys, acc = st
+            upd = jnp.full((1, 4), 2.0, jnp.float32)
+            ys2 = jax.lax.dynamic_update_slice(ys, upd, (i, jnp.int32(0)))
+            return i + 1, ys2, acc + jnp.sum(ys)
+        st = (jnp.int32(0), jnp.zeros((5, 4), jnp.float32), x)
+        return jax.lax.while_loop(lambda st: st[0] < 5, body, st)[1:]
+    check(f, np.float32(0.0))
+
+
+def test_dus_operand_not_carry_keeps_copy(while_mode):
+    """DUS whose operand is not the carry (fresh zeros each iteration): the
+    fold must bail (gather source != carry buffer) and stay correct."""
+    def f(x):
+        def body(st):
+            i, out = st
+            base = jnp.zeros((4, 2), jnp.float32)
+            upd = jnp.full((1, 2), 1.0, jnp.float32) * (i.astype(jnp.float32) + 1.0)
+            fresh = jax.lax.dynamic_update_slice(base, upd, (i, jnp.int32(0)))
+            return i + 1, out + fresh
+        st = (jnp.int32(0), x)
+        return jax.lax.while_loop(lambda st: st[0] < 4, body, st)[1]
+    check(f, np.zeros((4, 2), np.float32))

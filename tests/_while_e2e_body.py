@@ -81,4 +81,40 @@ rt = run(while_then, jnp.float32(1.0))
 assert float(rt) == 121.0, rt
 print("while then elementwise: ok", float(rt))
 
+# 8. scan with stacked outputs — the in-place dynamic_update_slice-into-carry
+# path (ys is a program OUTPUT bound as an I/O port; only a real-plugin run
+# exercises that binding). Multi-tile rows so the scatter spans lanes.
+def scan_stack(c, xs):
+    def step(c, xt):
+        c = c + xt
+        return c, c * 2.0
+    return jax.lax.scan(step, c, xs)
+n, T = 5000, 6
+c0 = np.zeros(n, np.float32)
+xs8 = np.arange(n * T, dtype=np.float32).reshape(T, n)
+cf, ys = run(scan_stack, jnp.asarray(c0), jnp.asarray(xs8))
+c_ref = c0.copy()
+ys_ref = np.empty_like(xs8)
+for t in range(T):
+    c_ref = c_ref + xs8[t]
+    ys_ref[t] = c_ref * 2.0
+np.testing.assert_array_equal(cf, c_ref)
+np.testing.assert_array_equal(ys, ys_ref)
+print("scan stacked outputs (in-place DUS): ok")
+
+# 9. DUS carry also read in the body — the in-place fold must bail and the
+# two-phase copy path must still be correct on device.
+def dus_read(x):
+    def body(st):
+        i, ys, acc = st
+        upd = jnp.full((1, 8), 2.0, jnp.float32)
+        ys2 = jax.lax.dynamic_update_slice(ys, upd, (i, jnp.int32(0)))
+        return i + 1, ys2, acc + jnp.sum(ys)
+    st = (jnp.int32(0), jnp.zeros((5, 8), jnp.float32), x)
+    return jax.lax.while_loop(lambda st: st[0] < 5, body, st)[1:]
+ys9, acc9 = run(dus_read, jnp.float32(0.0))
+np.testing.assert_array_equal(ys9, np.full((5, 8), 2.0, np.float32))
+assert float(acc9) == 2.0 * 8 * (0 + 1 + 2 + 3 + 4), acc9
+print("DUS carry-also-read (copy path): ok")
+
 print("WHILE E2E PASS")
