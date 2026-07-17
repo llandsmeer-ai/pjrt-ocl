@@ -1159,6 +1159,67 @@ scale+softmax):
 9.7 ms today, so the ceiling is large. `gelu` is pure-EW (no reduce) and should already chain-fuse
 (§11) — if it doesn't, that's a chain-fusion gap, not a new fused op.
 
+### 19a. SHIPPED 2026-07-17: OP_SOFTMAX + OP_LAYERNORM (the first two fused norms)
+
+Implemented both per the recipe above. **Kept ON by default; `PJRT_OCL_FUSE_NORM=0` reverts.**
+
+- **Opcodes/tile-ops**: `OP_SOFTMAX`(54)/`OP_LAYERNORM`(55) in lowering.py;
+  `TILE_SOFTMAX_SEG`(11)/`TILE_LAYERNORM_SEG`(12) in scheduler.py; `TOP_*`/`kTop*` (kMaxTileOp→12)
+  in vm_common.cl/runtime.h. `imm`=seg, `n`=n_out (like OP_REDUCE_SEG); layernorm `imm2`=eps f32 bits.
+- **Recognizer** `_fuse_norm` (lowering.py, runs after `_dce_nops`, before `_reuse_arena`; a second
+  `_dce_nops` cleans the dead intermediates). Post-lowering peephole on OUR instr stream, anchored on
+  `OP_REDUCE_SEG`: **softmax** = MAX-redseg → `sub(x,·)` → `exp` → SUM-redseg → `div(exp,·)`;
+  **layernorm** = SUM-redseg → `div(·,seg)`=mean → `sub(x,mu)` → `mul(sq)` → SUM-redseg →
+  `div(·,seg)`=var → `affine(var,1,eps)` → `pow(·,-0.5)` → `mul(x-mu,·)`. A `bcast_src` helper
+  walks OP_GATHER_STRIDED producers so it matches whether the broadcast is a leftover gather or a
+  folded view. **Gated hard** on every op kind + producer→consumer linkage + `seg<=1024` (local
+  staging) + the affine scale==1 / pow exp==-0.5 / divisor==seg consts; any mismatch → decomposed
+  path untouched. Rewrites the FINAL op in place to the fused op reading X; the rest DCE. **The
+  trailing per-channel `*g+b` is left as separate EW/gather** (it chain-fuses cheaply; the win is the
+  reduce core). Only 2 kinds needed (softmax MAX+SUM, layernorm SUM+SUM). Idiom variation actually
+  seen: softmax keeps a materialized reshape-gather between the reduce and the broadcast-view (the
+  `keepdims` (…,1) reshape) that `_fuse_views` can't fold because the EW slot is already viewed —
+  `bcast_src` handles it; layernorm's broadcasts are all folded views (no leftover gather).
+- **Kernels** `vmo_softmax_seg`/`vmo_layernorm_seg` (reduce.cl), cloned from `vmo_redseg_tile`:
+  stage the seg row into `__local As` once, tree-reduce in `Bs` (softmax: max then sum; layernorm:
+  sum+sumsq one pass, **var = E[x²]−E[x]²**), write once. eps = `as_float(t.p2)`, `rsqrt(var+eps)`.
+- **PoCL bug found + fixed (the whole debugging cost of this task).** A **divergent-trip-count**
+  grid-stride loop (`for(j=lid;j<seg;j+=lsz)`, lanes doing different iteration counts) that
+  **follows a barrier and does a GLOBAL store** is miscompiled by **PoCL 5.0's work-item-loop /
+  parallel-region former** → intermittent **heap corruption**: crash (`free(): invalid pointer` /
+  `POclReleaseMemObject refcount>0`) when the store target is an I/O port, silent wrong values when
+  it's the arena — **non-deterministic, ~50% of runs** (5/5 decomposed stable, ~half of fused
+  crash). NVIDIA (both engines) and the dual Python validators are all correct — it is purely
+  PoCL-CPU codegen. Bisected: staged-copy+barrier+**multi-lane** port store crashes; +**lid-0-only**
+  store is stable (this is why `vmo_redseg_tile`, which stores from lid 0, never hit it); a
+  **uniform-trip** multi-lane store (round the bound up to `ceil(seg/lsz)*lsz`, guard with `j<seg`)
+  is stable AND keeps the store parallel. Fix = `SEG_UNIFORM(seg,lsz)` on **every** post-barrier
+  seg-loop (verified 16/16 stable). This is a new, sharper instance of the §18 PoCL barrier rule:
+  **post-barrier grid-stride loops must have a work-item-UNIFORM trip count.**
+
+**Before/after (this machine; A/B via `PJRT_OCL_FUSE_NORM` on the SAME build):**
+
+| metric                              | fused OFF | fused ON | note |
+|-------------------------------------|-----------|----------|------|
+| barriers: layernorm (4,128,512)     | 7         | **2**    | 2 = fused op + trailing `*g+b` |
+| barriers: softmax (4,8,128,128)     | 5         | **0**    | single op, no cross-wg barrier |
+| standalone layernorm (4,128,512) ms | 0.238     | **0.102**| 2.3×; CUDA 0.091 (→1.1× gap, was ~30×) |
+| standalone softmax (4,8,128,128) ms | 0.158     | **0.043**| 3.7×; **faster** than CUDA's 0.058 |
+| **base transformer ms/iter (TF32)** | 9.73      | **7.34** | GFLOP/s 2151→2852 |
+| base gap vs native CUDA (0.433 ms)  | 22.5×     | **17.0×**| |
+
+**Correctness (all PASS):** 262 pytest + 1 skip (+10 `tests/test_ops_fused_norm.py`: fires, dual
+validators, `FUSE_NORM=0`/`seg>1024` fallbacks) + runtime_test PoCL & NVIDIA. transformer `--check`:
+NVIDIA TF32 tiny/small/base/large_l1/large; NVIDIA `MEGA_TC=0` base/large **f32-exact** (2.2e-6 /
+1.3e-5 — layernorm's one-pass var, NOT TF32 noise); PoCL Portable tiny/base **f32-exact** (5e-7 /
+2.4e-6), stable across repeated runs.
+
+**Surprised by**: how large the standalone win is (softmax now *beats* native CUDA on this shape,
+layernorm ~1.1× — both were ~30× off) and that the base end-to-end still improves 1.33× despite the
+matmuls being untouched. **Kept conservative**: recognizer gates on the exact TF32-era jaxlib 0.10.2
+idiom; `*g+b` left separate; `seg<=1024`. gelu was NOT touched — it is pure-EW and already
+chain-fuses (§11), consistent with the §19 note; no new fused op needed there.
+
 ## 20. dynamic_slice start scalars: aux byte offsets must be LOADER-patched (found 2026-07-17)
 
 **Found while** reworking the per-op benchmark (§21): `lax.dynamic_slice(x, (k,), ...)` with a
