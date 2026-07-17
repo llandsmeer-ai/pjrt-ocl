@@ -650,6 +650,27 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
       t.p3 = elem_off(t.p3);
   }
 
+  // Patch dynamic_slice/update start-scalar locations in the aux pool:
+  // aux idx_byteoff[d] = elem_off(idx_bufid[d]). The lowering cannot write
+  // these — arena offsets are reassigned by its later reuse pass and port
+  // assignment only happens here — so the serialized words are placeholders.
+  // The kernels read them through AP(), which accepts either an arena byte
+  // offset or a bit-31 port handle, exactly what elem_off produces.
+  std::vector<int32_t> aux = p.aux;
+  for (const VmTask& t : p.tasks) {  // unpatched copy: dyn p0 = aux offset
+    const uint32_t base_op = t.tile_op & 0xFFu;
+    if (base_op != kTopDynGather && base_op != kTopDynScatter) continue;
+    const size_t x = t.p0;
+    const int32_t rank = aux[x];
+    if (rank < 0 || x + 1 + 5 * static_cast<size_t>(rank) >= aux.size()) {
+      *err = "LoadedProgram: dyn slice aux block out of range";
+      return nullptr;
+    }
+    for (int32_t d = 0; d < rank; ++d)
+      aux[x + 1 + 3 * rank + d] = static_cast<int32_t>(
+          elem_off(static_cast<uint32_t>(aux[x + 1 + 4 * rank + d])));
+  }
+
   // Pure-matmul fast path (docs/decisions.md #9b): exactly one f32 MMA task and
   // no barrier/control entries -> dispatch the standalone mm2 SGEMM instead of
   // the megakernel (which caps matmul occupancy). Handles/dims come straight
@@ -724,7 +745,7 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
                                p.lane_tab.size() * sizeof(VmProgram::Lane),
                                "lane_tab");
   if (!lp->lane_tab_buf_) return nullptr;
-  lp->aux_buf_ = make_buf(p.aux.data(), p.aux.size() * 4, "aux");
+  lp->aux_buf_ = make_buf(aux.data(), aux.size() * 4, "aux");
   if (!lp->aux_buf_) return nullptr;
 
   uint32_t barinit[3] = {0, 0, 0};

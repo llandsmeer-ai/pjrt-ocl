@@ -850,6 +850,25 @@ def _lower_while(ctx: _Ctx, op):
         ctx.value_to_buf[op.results[k]] = carry[k][0]
 
 
+def _is_identity_gather_aux(ctx: _Ctx, aux_off: int, n_elems: int) -> bool:
+    """True iff a GATHER_STRIDED aux block ([rank, out_dims, in_strides,
+    src_off]) describes a plain contiguous copy of n_elems elements."""
+    rank = ctx.aux[aux_off]
+    if aux_off + 2 + 2 * rank > len(ctx.aux):
+        return False
+    dims = ctx.aux[aux_off + 1:aux_off + 1 + rank]
+    strides = ctx.aux[aux_off + 1 + rank:aux_off + 1 + 2 * rank]
+    if ctx.aux[aux_off + 1 + 2 * rank] != 0:
+        return False                      # nonzero source offset
+    total, acc = 1, 1
+    for d in range(rank - 1, -1, -1):
+        if strides[d] != acc:
+            return False                  # not row-major contiguous
+        acc *= dims[d]
+        total *= dims[d]
+    return total == n_elems
+
+
 def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
     """Lower a queued while's cond + body regions into ctx.instrs (appended
     after the root list) and patch the WHILE placeholder with the resulting
@@ -912,6 +931,7 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
     body_end0 = len(ctx.instrs)
     producer: dict[int, int] = {}
     dup: set[int] = set()
+    writers: dict[int, list[int]] = {}
     body_reads: dict[int, int] = {}
     for i in range(body_start, body_end0):
         bi = ctx.instrs[i]
@@ -920,6 +940,7 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
         if bi.dst in producer:
             dup.add(bi.dst)
         producer[bi.dst] = i
+        writers.setdefault(bi.dst, []).append(i)
         for rbuf in _reads_of(bi):
             body_reads[rbuf] = body_reads.get(rbuf, 0) + 1
     carry_ids = {carry[k][0] for k in range(n)}
@@ -946,6 +967,41 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
         if others != 0:
             continue
         ctx.instrs[pidx] = dataclasses.replace(prod, dst=cbuf)
+        inplace[k] = True
+    # IN-PLACE dynamic_update_slice into the carry (scan's ys stacking). The
+    # DUS lowering is a pair: identity-gather copy carry->fresh out_buf, then
+    # scatter the update row into out_buf. When the carry's ONLY body use is
+    # feeding that copy and out_buf is only ever returned, the pure semantics
+    # collapse to a mutation: NOP the full-length copy and scatter straight
+    # into the carry buffer. This turns scan's O(T*n) per-iteration ys traffic
+    # into O(n) — the dominant large-scan cost (decisions.md §15). The
+    # scatter's runtime index reads (the counter carry) ride in reads_hint, so
+    # body_reads already sees them and the counter keeps its safe snapshot.
+    for k in ([] if has_nested else range(n)):
+        if inplace[k]:
+            continue
+        cbuf, n_elems, _dt = carry[k]
+        rb = ret_bufs[k]
+        if rb in carry_ids or ret_bufs.count(rb) != 1:
+            continue
+        w = writers.get(rb, [])
+        if len(w) != 2:
+            continue
+        g, s = ctx.instrs[w[0]], ctx.instrs[w[1]]
+        if g.op != OP_GATHER_STRIDED or s.op != OP_DYNAMIC_UPDATE_SLICE:
+            continue
+        if g.a != cbuf or g.n != n_elems:
+            continue
+        if not _is_identity_gather_aux(ctx, g.aux, n_elems):
+            continue
+        if body_reads.get(rb, 0) != 0:    # out_buf read inside body: keep copy
+            continue
+        # cbuf may be read ONLY by the identity gather, and written by nothing
+        # else in the body (in-place mutation must not be observable).
+        if body_reads.get(cbuf, 0) != 1 or cbuf in writers:
+            continue
+        ctx.instrs[w[0]] = Instr(OP_NOP)
+        ctx.instrs[w[1]] = dataclasses.replace(s, dst=cbuf)
         inplace[k] = True
     # IDENTITY passthrough (ret == this carry's own buffer, e.g. scan's xs):
     # the "new" value already IS the carry — both snapshot copies are pure
