@@ -195,6 +195,117 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
     }
 }
 
+/* TOP_SOFTMAX_SEG (§19): fused softmax over the innermost `seg` elements.
+ * out[o*seg + j] = exp(x[o*seg+j] - max_j) / sum_j exp(x[o*seg+j] - max_j).
+ * ONE segment per tile, reduced COLLABORATIVELY by the whole workgroup (like
+ * vmo_redseg_tile): the seg-wide row is staged into `As` once, the max/sum
+ * tree-reduces run in `Bs`, and the result is written once — one global read +
+ * one global write, no intermediate global buffers. seg <= MMA_ASZ (gated in
+ * the lowering recognizer). Barrier discipline follows §18: no `return` before
+ * a barrier, no barrier as the last statement before the tile-loop backedge. */
+static void vmo_softmax_seg(__global uchar *arena, __global uchar **iop, const task_t t,
+                        uint tile, __local float *As, __local float *Bs, uint lid, uint lsz)
+{
+    const uint n_out = t.p0, seg = t.p1;
+    const uint o = tile;
+    const int valid = o < n_out;          /* over-assigned tiles run the tree
+                                           * on init values, skip the store. */
+    const uint base = o * seg;
+    __global const float *a = AP(const float, t.a);
+    __global float *dst = AP(float, t.dst);
+    /* stage the segment row into local once (grid-stride if seg > lsz) */
+    if (valid)
+        for (uint j = lid; j < seg; j += lsz)
+            As[j] = a[base + j];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    /* max reduce: per-lane partial over its strided slice, then a local tree */
+    float m = -INFINITY;
+    if (valid)
+        for (uint j = lid; j < seg; j += lsz)
+            m = fmax(m, As[j]);
+    Bs[lid] = m;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint s = lsz / 2; s > 0; s >>= 1) {
+        if (lid < s) Bs[lid] = fmax(Bs[lid], Bs[lid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float mx = Bs[0];
+    barrier(CLK_LOCAL_MEM_FENCE);          /* all lanes read mx before Bs reuse */
+    /* exp(x - max) in place, accumulating the per-lane partial sum */
+    float sacc = 0.0f;
+    if (valid)
+        for (uint j = lid; j < seg; j += lsz) {
+            const float e = exp(As[j] - mx);
+            As[j] = e;
+            sacc += e;
+        }
+    Bs[lid] = sacc;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint s = lsz / 2; s > 0; s >>= 1) {
+        if (lid < s) Bs[lid] = Bs[lid] + Bs[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float sm = Bs[0];
+    /* No trailing barrier: this read of Bs[0]/As[j] follows the sum tree's
+     * final barrier; the next tile re-stages As and re-barriers before any
+     * shared read (§18). */
+    if (valid)
+        for (uint j = lid; j < seg; j += lsz)
+            dst[base + j] = As[j] / sm;
+}
+
+/* TOP_LAYERNORM_SEG (§19): fused layernorm CORE over the innermost `seg` elems.
+ * mu = mean(x), var = mean(x^2) - mu^2 (single pass), out = (x-mu)*rsqrt(var+eps).
+ * The trailing per-channel affine (*g + b) stays as separate EW ops. eps rides
+ * in as_float(t.p2). Same workgroup-per-segment collaborative structure as
+ * vmo_softmax_seg; §18 barrier rules apply. */
+static void vmo_layernorm_seg(__global uchar *arena, __global uchar **iop, const task_t t,
+                        uint tile, __local float *As, __local float *Bs, uint lid, uint lsz)
+{
+    const uint n_out = t.p0, seg = t.p1;
+    const float eps = as_float(t.p2);
+    const uint o = tile;
+    const int valid = o < n_out;
+    const uint base = o * seg;
+    __global const float *a = AP(const float, t.a);
+    __global float *dst = AP(float, t.dst);
+    if (valid)
+        for (uint j = lid; j < seg; j += lsz)
+            As[j] = a[base + j];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    /* single pass: per-lane partial sum and sum-of-squares */
+    float s1 = 0.0f, s2 = 0.0f;
+    if (valid)
+        for (uint j = lid; j < seg; j += lsz) {
+            const float v = As[j];
+            s1 += v;
+            s2 += v * v;
+        }
+    Bs[lid] = s1;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint s = lsz / 2; s > 0; s >>= 1) {
+        if (lid < s) Bs[lid] = Bs[lid] + Bs[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float sum = Bs[0];
+    barrier(CLK_LOCAL_MEM_FENCE);          /* all lanes read sum before Bs reuse */
+    Bs[lid] = s2;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint s = lsz / 2; s > 0; s >>= 1) {
+        if (lid < s) Bs[lid] = Bs[lid] + Bs[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float sumsq = Bs[0];
+    const float n = (float)seg;
+    const float mu = sum / n;
+    const float var = sumsq / n - mu * mu;
+    const float rs = rsqrt(var + eps);
+    /* No trailing barrier before the backedge (§18). */
+    if (valid)
+        for (uint j = lid; j < seg; j += lsz)
+            dst[base + j] = (As[j] - mu) * rs;
+}
+
 static void vmo_reduce_comb_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint dt,
                              uint lid)
 {

@@ -45,7 +45,9 @@ static_assert(sizeof(VmEntry) == 32);
 enum TileOp : uint32_t {
   kTopEw = 0, kTopMma = 1, kTopGather = 2, kTopRedPart = 3, kTopRedComb = 4,
   kTopIotaDim = 5, kTopScatter = 6, kTopDynGather = 7, kTopDynScatter = 8,
-  kTopRedWindow = 9, kTopRedSeg = 10, kMaxTileOp = kTopRedSeg,
+  kTopRedWindow = 9, kTopRedSeg = 10,
+  kTopSoftmaxSeg = 11, kTopLayernormSeg = 12,  // fused segmented norms (§19)
+  kMaxTileOp = kTopLayernormSeg,
 };
 // dtype packed in tile_op bits 8-15 (matches python DT_* / vm_common.cl).
 enum VmDtype : uint32_t {

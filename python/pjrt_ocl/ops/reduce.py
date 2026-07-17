@@ -46,7 +46,7 @@ import math
 from .. import lowering as L
 from .. import opsem
 from ..scheduler import (Task, TILE_REDUCE_PART, TILE_REDUCE_COMB, TILE_RED_SEG,
-                         TILE_SIZE)
+                         TILE_SOFTMAX_SEG, TILE_LAYERNORM_SEG, TILE_SIZE)
 
 # reduction kinds (docs/vmprogram.md v2.1 REDUCE table)
 SUM, MAX, MIN, PROD = 0, 1, 2, 3
@@ -314,3 +314,82 @@ def _redseg_sim(task, entry, rt):
 opsem.register(L.OP_REDUCE_SEG, to_task=_redseg_to_task, interp=_redseg_interp,
                reads=_reduce_reads)
 opsem.register_tile_sim(TILE_RED_SEG, _redseg_sim)
+
+
+# --- fused segmented norms (softmax / layernorm core), §19 -------------------
+# Both are recognized in lowering (_fuse_norm) from the reduce->broadcast idiom
+# and lowered to one fused local-memory op: imm = seg (innermost axis length),
+# n = n_out (segment count); layernorm carries eps in imm2 (f32 bits). The numpy
+# reference here MUST mirror the kernel exactly (vmo_softmax_seg / _layernorm_seg
+# in reduce.cl) so the dual validators agree bit-for-bit on re-parsed bytecode.
+
+def _f32_from_bits(bits: int):
+    import numpy as np
+    return np.frombuffer(np.uint32(bits & 0xFFFFFFFF).tobytes(), "<f4")[0]
+
+
+def _softmax_np(x):   # x: (..., seg); stable softmax matching the kernel
+    import numpy as np
+    m = x.max(-1, keepdims=True)
+    e = np.exp(x - m)
+    return e / e.sum(-1, keepdims=True)
+
+
+def _layernorm_np(x, eps):   # one-pass var = E[x^2] - E[x]^2, matching the kernel
+    import numpy as np
+    mu = x.mean(-1, keepdims=True)
+    var = (x * x).mean(-1, keepdims=True) - mu * mu
+    return (x - mu) / np.sqrt(var + eps)
+
+
+def _softmax_to_task(ins) -> Task:
+    return Task(TILE_SOFTMAX_SEG, dst=ins.dst, a=ins.a, b=0,
+                p0=ins.n, p1=ins.imm)
+
+
+def _layernorm_to_task(ins) -> Task:
+    return Task(TILE_LAYERNORM_SEG, dst=ins.dst, a=ins.a, b=0,
+                p0=ins.n, p1=ins.imm, p2=ins.imm2)   # p2 = eps f32 bits
+
+
+def _softmax_interp(ins, rt) -> None:
+    n_out, seg = ins.n, ins.imm
+    src = rt.view(ins.a, n_out * seg).reshape(n_out, seg)
+    rt.view(ins.dst, n_out * seg)[:] = _softmax_np(src).reshape(-1)
+
+
+def _layernorm_interp(ins, rt) -> None:
+    n_out, seg = ins.n, ins.imm
+    eps = float(_f32_from_bits(ins.imm2))
+    src = rt.view(ins.a, n_out * seg).reshape(n_out, seg)
+    rt.view(ins.dst, n_out * seg)[:] = _layernorm_np(src, eps).reshape(-1)
+
+
+def _norm_reads(ins) -> set:
+    return {ins.a}
+
+
+def _softmax_sim(task, entry, rt):
+    import numpy as np
+    n_out, seg = task.p0, task.p1
+    src = rt.view(task.a)
+    out = rt.view(task.dst)
+    for o in range(entry.tile_lo, min(entry.tile_hi, n_out)):
+        out[o * seg:(o + 1) * seg] = _softmax_np(src[o * seg:(o + 1) * seg])
+
+
+def _layernorm_sim(task, entry, rt):
+    n_out, seg = task.p0, task.p1
+    eps = float(_f32_from_bits(task.p2))
+    src = rt.view(task.a)
+    out = rt.view(task.dst)
+    for o in range(entry.tile_lo, min(entry.tile_hi, n_out)):
+        out[o * seg:(o + 1) * seg] = _layernorm_np(src[o * seg:(o + 1) * seg], eps)
+
+
+opsem.register(L.OP_SOFTMAX, to_task=_softmax_to_task, interp=_softmax_interp,
+               reads=_norm_reads)
+opsem.register(L.OP_LAYERNORM, to_task=_layernorm_to_task,
+               interp=_layernorm_interp, reads=_norm_reads)
+opsem.register_tile_sim(TILE_SOFTMAX_SEG, _softmax_sim)
+opsem.register_tile_sim(TILE_LAYERNORM_SEG, _layernorm_sim)

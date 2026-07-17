@@ -47,6 +47,8 @@ TILE_DYN_GATHER = 7   # dynamic_slice: gather with a runtime base offset
 TILE_DYN_SCATTER = 8  # dynamic_update_slice: scatter with a runtime base offset
 TILE_RED_WINDOW = 9   # windowed reduction (pooling)
 TILE_RED_SEG = 10     # segmented reduce: out[o] = reduce(in[o*seg : (o+1)*seg])
+TILE_SOFTMAX_SEG = 11    # fused softmax over the innermost seg elems (§19)
+TILE_LAYERNORM_SEG = 12  # fused layernorm core over the innermost seg elems (§19)
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -160,8 +162,8 @@ class Task:
             return max(1, math.ceil(self.p0 / self.p1)) if self.p1 else 1
         if self.tile_op == TILE_REDUCE_COMB:
             return 1
-        if self.tile_op == TILE_RED_SEG:      # ONE segment per tile (p0 = n_out)
-            return max(1, self.p0)
+        if self.tile_op in (TILE_RED_SEG, TILE_SOFTMAX_SEG, TILE_LAYERNORM_SEG):
+            return max(1, self.p0)            # ONE segment per tile (p0 = n_out)
         raise ScheduleError(f"n_tiles: unknown tile_op {self.tile_op}")
 
 

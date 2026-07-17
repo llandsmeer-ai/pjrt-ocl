@@ -140,6 +140,8 @@ OP_REDUCE_WINDOW = 50    # windowed reduction (pooling); aux = kind,rank,out/win
 OP_AFFINE_F32 = 51       # fused scalar affine d = a*s + t; imm = f32(s) bits, aux = f32(t) bits
 OP_REDUCE_SEG = 52       # segmented reduce over the innermost `seg` elems; imm = (kind<<28)|seg
 OP_FOR = 53              # fixed-trip loop: body = instrs [n, n+imm), b = trip count
+OP_SOFTMAX = 54          # fused softmax over the innermost `seg` elems; imm = seg (§19)
+OP_LAYERNORM = 55        # fused layernorm core over innermost `seg`; imm = seg, imm2 = eps bits
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -166,6 +168,8 @@ OP_NAMES = {
     OP_AFFINE_F32: "affine_f32",
     OP_REDUCE_SEG: "reduce_seg",
     OP_FOR: "for",
+    OP_SOFTMAX: "softmax",
+    OP_LAYERNORM: "layernorm",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
@@ -1172,6 +1176,185 @@ def _fuse_views(ctx: _Ctx) -> None:
             changed = True
 
 
+# --- fused segmented norms (softmax / layernorm), §19 -----------------------
+
+# Max segment size the collaborative in-local-memory kernel can stage (one row
+# in __local As, sized MMA_ASZ = 1024 floats in the portable build). Larger
+# suffix reductions fall back to the decomposed reduce+broadcast lowering.
+_NORM_SEG_MAX = 1024
+_RSEG_SUM, _RSEG_MAX = 0, 1        # OP_REDUCE_SEG imm kind field (imm >> 28)
+
+
+def _f32_from_bits(bits: int) -> float:
+    return float(np.frombuffer(struct.pack("<I", bits & 0xFFFFFFFF), "<f4")[0])
+
+
+def _fuse_norm(ctx: _Ctx) -> None:
+    """Recognize the softmax / layernorm-core reduce→broadcast idioms in OUR
+    lowered VM-instr stream and collapse each into a SINGLE fused op
+    (OP_SOFTMAX / OP_LAYERNORM) done in local memory by one workgroup-per-segment
+    kernel — one global read + one write instead of 5–7 cross-workgroup phases
+    (§19). Matches on our own instrs (robust to jaxlib/StableHLO variation: both
+    idioms funnel through OP_REDUCE_SEG + viewed EW ops).
+
+    GATED HARD: only fires on the exact innermost-suffix dataflow chain with the
+    right op kinds and producer→consumer linkage; on ANY mismatch it leaves the
+    decomposed lowering untouched (an unfused norm is correct, only slower).
+    PJRT_OCL_FUSE_NORM=0 disables it (A/B + revert lever). Runs before
+    _reuse_arena; the following _dce_nops removes the now-dead intermediates."""
+    if os.environ.get("PJRT_OCL_FUSE_NORM", "1") == "0":
+        return
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+
+    # unique writer per buffer (None if 0 or >1 non-NOP writers: multi-write
+    # carries and RMW pairs must not be traced through).
+    def _writer_map() -> dict:
+        seen: dict = {}
+        multi: set = set()
+        for idx, ins in enumerate(instrs):
+            if ins.op == OP_NOP:
+                continue
+            d = ins.dst
+            if d in seen or d in multi:
+                seen.pop(d, None)
+                multi.add(d)
+            else:
+                seen[d] = idx
+        return seen
+
+    # f32 scalar/broadcast consts (all elements equal) -> python float.
+    const_f: dict = {}
+    for bid, data in ctx.consts:
+        if bid < len(ctx.buffers) and ctx.buffers[bid].dtype == DT_F32:
+            arr = np.frombuffer(data, "<f4")
+            if arr.size >= 1 and np.all(arr == arr[0]):
+                const_f[bid] = float(arr[0])
+
+    def _redseg(imm: int):
+        return imm >> 28, imm & 0x0FFFFFFF        # kind, seg
+
+    changed = True
+    while changed:
+        changed = False
+        writers = _writer_map()
+
+        def bcast_src(buf: int) -> int:
+            """Follow a chain of OP_GATHER_STRIDED (reshape/broadcast) producers
+            back to the ultimate source buffer id."""
+            seen: set = set()
+            while (buf in writers and buf not in seen
+                   and instrs[writers[buf]].op == OP_GATHER_STRIDED):
+                seen.add(buf)
+                buf = instrs[writers[buf]].a
+            return buf
+
+        def find(pred):
+            for j, ins in enumerate(instrs):
+                if ins.op != OP_NOP and pred(j, ins):
+                    return j, ins
+            return None
+
+        def is_op(buf: int, op: int):
+            w = writers.get(buf)
+            return None if w is None else (instrs[w] if instrs[w].op == op else None)
+
+        for r1i, R1 in enumerate(instrs):
+            if R1.op != OP_REDUCE_SEG:
+                continue
+            kind1, seg = _redseg(R1.imm)
+            if seg == 0 or seg > _NORM_SEG_MAX:
+                continue
+            X, n_out = R1.a, R1.n
+            total = n_out * seg
+
+            # ---- softmax: max -> sub(x,·) -> exp -> sum -> div(exp,·) --------
+            if kind1 == _RSEG_MAX:
+                mSUB = find(lambda j, s: s.op == OP_SUB_F32 and s.a == X
+                            and s.n == total and bcast_src(s.b) == R1.dst)
+                if mSUB is None:
+                    continue
+                _, SUB = mSUB
+                mEXP = find(lambda j, s: s.op == OP_EXP_F32 and s.a == SUB.dst)
+                if mEXP is None:
+                    continue
+                _, EXP = mEXP
+                mR2 = find(lambda j, s: s.op == OP_REDUCE_SEG and s.a == EXP.dst
+                           and _redseg(s.imm) == (_RSEG_SUM, seg) and s.n == n_out)
+                if mR2 is None:
+                    continue
+                _, R2 = mR2
+                mDIV = find(lambda j, s: s.op == OP_DIV_F32 and s.a == EXP.dst
+                            and s.n == total and bcast_src(s.b) == R2.dst)
+                if mDIV is None:
+                    continue
+                di, DIV = mDIV
+                if DIV.dst in outs and X == DIV.dst:
+                    continue
+                instrs[di] = Instr(OP_SOFTMAX, dst=DIV.dst, a=X, b=X,
+                                   n=n_out, imm=seg)
+                changed = True
+                break
+
+            # ---- layernorm core ---------------------------------------------
+            if kind1 != _RSEG_SUM:
+                continue
+            # mu = mean(x) = sum(x) / seg
+            mMU = find(lambda j, s: s.op == OP_DIV_F32 and s.n == n_out
+                       and bcast_src(s.a) == R1.dst
+                       and const_f.get(s.b) == float(seg))
+            if mMU is None:
+                continue
+            _, MU = mMU
+            muv = MU.dst
+
+            def is_x_minus_mu(buf: int) -> bool:
+                s = is_op(buf, OP_SUB_F32)
+                return bool(s and s.a == X and s.n == total
+                            and bcast_src(s.b) == muv)
+
+            # (x-mu)^2 -> sum -> var = mean - mu^2 chain
+            mSQ = find(lambda j, s: s.op == OP_MUL_F32 and s.a == s.b
+                       and s.n == total and is_x_minus_mu(s.a))
+            if mSQ is None:
+                continue
+            _, SQ = mSQ
+            mR2 = find(lambda j, s: s.op == OP_REDUCE_SEG and s.a == SQ.dst
+                       and _redseg(s.imm) == (_RSEG_SUM, seg) and s.n == n_out)
+            if mR2 is None:
+                continue
+            _, R2 = mR2
+            mVAR = find(lambda j, s: s.op == OP_DIV_F32 and s.n == n_out
+                        and bcast_src(s.a) == R2.dst
+                        and const_f.get(s.b) == float(seg))
+            if mVAR is None:
+                continue
+            _, VAR = mVAR
+            # var + eps (affine, scale 1) -> ^-0.5 (pow) -> (x-mu)*rsqrt
+            mAFF = find(lambda j, s: s.op == OP_AFFINE_F32 and s.a == VAR.dst
+                        and s.n == n_out and _f32_from_bits(s.imm) == 1.0)
+            if mAFF is None:
+                continue
+            _, AFF = mAFF
+            eps_bits = AFF.imm2
+            mPOW = find(lambda j, s: s.op == OP_POW_F32 and s.a == AFF.dst
+                        and const_f.get(s.b) == -0.5)
+            if mPOW is None:
+                continue
+            _, POW = mPOW
+            mOUT = find(lambda j, s: s.op == OP_MUL_F32 and s.n == total
+                        and is_x_minus_mu(s.a) and bcast_src(s.b) == POW.dst)
+            if mOUT is None:
+                continue
+            oi, OUT = mOUT
+            if OUT.dst in outs and X == OUT.dst:
+                continue
+            instrs[oi] = Instr(OP_LAYERNORM, dst=OUT.dst, a=X, b=X,
+                               n=n_out, imm=seg, imm2=eps_bits)
+            changed = True
+            break
+
+
 def _fuse_matmul_views(ctx: _Ctx) -> None:
     """Access-map fusion for matmul (§13, §14): fold a shape op (transpose/
     reshape/broadcast/slice/reverse — all OP_GATHER_STRIDED) that feeds a
@@ -1464,6 +1647,13 @@ def lower_module(module) -> VMProgram:
     _fuse_matmul_views(ctx)
     _fuse_views(ctx)
     _finalize_matmul_views(ctx)
+    _dce_nops(ctx)
+
+    # Recognize softmax/layernorm reduce→broadcast idioms and collapse each into
+    # one fused local-memory op (§19), then DCE the now-dead intermediates. Runs
+    # on the cleaned stream (after view-fold/affine-compose/DCE) so the idiom is
+    # in its canonical form; before _reuse_arena so liveness sees the fused op.
+    _fuse_norm(ctx)
     _dce_nops(ctx)
 
     # Liveness-reuse: rewrite arena offsets so the arena is bounded by peak

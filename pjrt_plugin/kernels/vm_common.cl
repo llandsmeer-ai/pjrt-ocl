@@ -66,7 +66,12 @@ static ushort vmo_f32_to_bf16(float f)
 enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
        TOP_RED_COMB = 4, TOP_IOTA_DIM = 5, TOP_SCATTER = 6,
        TOP_DYN_GATHER = 7, TOP_DYN_SCATTER = 8, TOP_RED_WINDOW = 9,
-       TOP_RED_SEG = 10 };
+       TOP_RED_SEG = 10,
+       /* Fused segmented norms (§19): one segment per tile, whole workgroup
+        * collaborates in local memory (one global read + one write).
+        * SOFTMAX (p0=n_out, p1=seg); LAYERNORM core (p0=n_out, p1=seg,
+        * p2=as_float eps). Kernels: vmo_softmax_seg / vmo_layernorm_seg. */
+       TOP_SOFTMAX_SEG = 11, TOP_LAYERNORM_SEG = 12 };
 enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,
        SUB_ABS, SUB_FLOOR, SUB_CEIL, SUB_SIGN, SUB_FILL, SUB_IOTA_FLAT,
