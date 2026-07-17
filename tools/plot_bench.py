@@ -1,8 +1,12 @@
 """N-vs-time performance plots: our OpenCL backend vs a reference JAX backend.
 
 Each major op is swept over problem size N on two backends and plotted log-log
-(one panel per op). Because JAX's backend is process-global (chosen at import
-from JAX_PLATFORMS), this script runs each backend in its OWN subprocess:
+(one panel per op). To keep dispatch/launch jitter out of the numbers, every
+benchmarked function applies its op CHAIN (=16) times as a data-dependent chain
+inside ONE jitted call (optimization_barrier between links stops XLA fusing the
+repeats); reported time is per op application, min over rounds. Because JAX's
+backend is process-global (chosen at import from JAX_PLATFORMS), this script
+runs each backend in its OWN subprocess:
 
   driver  (this file, no args)  ->  spawns one worker per backend, collects CSV,
                                     renders tools/bench_plot.png (+ .csv)
@@ -33,11 +37,21 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 # --- op registry: name -> (build(N) -> (jitted_fn, args), sizes, xlabel) ------
 # Sizes are chosen per op: element count for memory-bound ops, matrix side for
 # matmul (O(N^3)). Each build() returns a jitted callable and its device args.
+#
+# Noise control: each jitted fn applies its op CHAIN times as a DATA-DEPENDENT
+# chain (link i consumes link i-1's output), with lax.optimization_barrier
+# between links so XLA cannot fuse/CSE the repeats into fewer kernels (our
+# lowering aliases the barrier away — zero instructions). One timed call thus
+# contains CHAIN real op executions but only ONE host dispatch, so per-call
+# dispatch/launch jitter is amortized by 1/CHAIN in the reported per-op time.
+
+CHAIN = 16
 
 
 def _ops():
     import jax
     import jax.numpy as jnp
+    from jax import lax
 
     rng = np.random.default_rng(0)
     f32 = np.float32
@@ -51,34 +65,60 @@ def _ops():
     MEM = [1 << k for k in range(12, 25)]          # 4K .. 16M elements
     SQ = [128, 256, 384, 512, 768, 1024, 1536, 2048]
 
+    def chain(step, *state):
+        """jit a CHAIN-long data-dependent repetition of `step` over `state`.
+        step maps the state tuple to a same-shape tuple; element 0 is the
+        value being measured and is returned."""
+        def f(*state):
+            for _ in range(CHAIN):
+                state = lax.optimization_barrier(step(*state))
+            return state[0]
+        return jax.jit(f), state
+
     def build_add(n):          # elementwise addition
         a, b = vec(n), vec(n)
-        return jax.jit(lambda x, y: x + y), (a, b)
+        return chain(lambda x, y: (x + y, y), a, b)
 
     def build_mul(n):          # elementwise multiplication
         a, b = vec(n), vec(n)
-        return jax.jit(lambda x, y: x * y), (a, b)
+        return chain(lambda x, y: (x * y, y), a, b)
 
     def build_matvec(n):       # matrix x vector: (n,n) @ (n,1) -> (n,1)
-        a = mat(n)
+        a = mat(n) / np.sqrt(n)  # spectral radius ~1 keeps the chain finite
         v = jnp.asarray(rng.standard_normal((n, 1)).astype(f32))
-        return jax.jit(lambda x, y: x @ y), (a, v)
+        return chain(lambda y, x: (x @ y, x), v, a)
 
     def build_matmat(n):       # matrix x matrix
-        a, b = mat(n), mat(n)
-        return jax.jit(lambda x, y: x @ y), (a, b)
+        a, b = mat(n), mat(n) / np.sqrt(n)
+        return chain(lambda x, y: (x @ y, y), a, b)
 
     def build_gather(n):       # gather via dynamic_slice (runtime offset)
         a = vec(n)
         s = jnp.asarray(np.int32(n // 4))
         half = n // 2
-        return (jax.jit(lambda x, k: jax.lax.dynamic_slice(x, (k,), (half,))),
-                (a, s))
+
+        # Two traps (decisions.md §21) force this shape:
+        # 1. Each link's offset must GENUINELY depend on the previous link's
+        #    data — (y[0] * opaque_zero) is always 0 but fold-proof — or both
+        #    backends DCE the first CHAIN-1 slices and the panel measures
+        #    dispatch floor, not gathers.
+        # 2. y must pass through a barrier BEFORE y[0], or XLA rewrites y[0]
+        #    as a 1-element slice of x directly (slice-of-slice) and the big
+        #    slices are dead again. The barrier forces y materialized.
+        def f(x, k):
+            z = lax.optimization_barrier(jnp.float32(0))
+            y = lax.dynamic_slice(x, (k,), (half,))
+            for _ in range(CHAIN - 1):
+                y, k = lax.optimization_barrier((y, k))
+                k = k + (y[0] * z).astype(jnp.int32)
+                y = lax.dynamic_slice(x, (k,), (half,))
+            return y
+        return jax.jit(f), (a, s)
 
     def build_while(n):        # while loop: 32x elementwise update over vec(n)
         a = vec(n)
-        return (jax.jit(lambda x: jax.lax.fori_loop(
-            0, 32, lambda i, v: v * 1.5 + 1.0, x)), (a,))
+        return chain(lambda v: (lax.fori_loop(
+            0, 32, lambda i, w: w * 1.5 + 1.0, v),), a)
 
     return {
         "elementwise add (a+b)":       (build_add, MEM, "N (elements)"),
@@ -90,12 +130,23 @@ def _ops():
     }
 
 
-def _bench(fn, args, iters=25, warmup=4, rounds=5):
-    """Median-of-rounds seconds per call. Warmup absorbs the first-call compile
-    (for our backend, the lowering subprocess) and cache warmup."""
+def _bench(fn, args, rounds=7, min_round_sec=0.05, max_iters=500):
+    """Seconds per single op application (call time / CHAIN), min over rounds.
+
+    The first call absorbs compile (for our backend, the lowering subprocess);
+    a second timed call calibrates how many iterations a round needs to last
+    >= min_round_sec, so short kernels aren't measured at timer resolution.
+    min-of-rounds estimates the noise-free floor (timeit's rationale): every
+    disturbance — scheduler preemption, clock ramp, GC — only ever adds time.
+    """
     import jax
 
-    for _ in range(warmup):
+    jax.block_until_ready(fn(*args))                 # compile + first touch
+    t0 = time.perf_counter()
+    jax.block_until_ready(fn(*args))
+    once = time.perf_counter() - t0                  # rough steady-state cost
+    iters = int(np.clip(min_round_sec / max(once, 1e-7), 1, max_iters))
+    for _ in range(2):
         jax.block_until_ready(fn(*args))
     times = []
     for _ in range(rounds):
@@ -104,7 +155,7 @@ def _bench(fn, args, iters=25, warmup=4, rounds=5):
             r = fn(*args)
         jax.block_until_ready(r)
         times.append((time.perf_counter() - t) / iters)
-    return float(np.median(times))
+    return float(min(times)) / CHAIN
 
 
 def run_worker(label: str) -> int:
@@ -225,7 +276,7 @@ def plot(ours: dict, ref: dict, ref_label: str, device: str, out: pathlib.Path):
         ax.set_yscale("log")
         ax.set_title(name, fontsize=11)
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("time / call (ms)")
+        ax.set_ylabel("time / op (ms)")
         ax.grid(True, which="both", ls=":", alpha=0.4)
         ax.legend(fontsize=8, loc="lower right")
     for ax in axes[len(names):]:

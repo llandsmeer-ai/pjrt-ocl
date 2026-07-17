@@ -1124,3 +1124,91 @@ scale+softmax):
 **Expected payoff**: layernorm ~7→~2 phases, softmax ~5→~1; on `base` these two ops are ~3.8 ms of
 9.7 ms today, so the ceiling is large. `gelu` is pure-EW (no reduce) and should already chain-fuse
 (§11) — if it doesn't, that's a chain-fusion gap, not a new fused op.
+
+## 20. dynamic_slice start scalars: aux byte offsets must be LOADER-patched (found 2026-07-17)
+
+**Found while** reworking the per-op benchmark (§21): `lax.dynamic_slice(x, (k,), ...)` with a
+runtime `k` passed as a *program input* silently sliced at offset 0 on the real device (both
+engines, PoCL and NVIDIA), and a 16-link chained version segfaulted PoCL. All 240 pytest
+validators passed throughout.
+
+**Root cause — two independent invalidations of the same design.** The dynslice handler recorded
+each start scalar's `arena_byte_offset` into the aux pool at lowering time
+(`idx_byteoff[rank]`, read by `vmo_dyn_base` on device). That value is doomed twice:
+1. `_reuse_arena` (§16) reassigns EVERY buffer's arena offset after handlers run — the docstring
+   premise "byte offset is fixed at allocation time" died when §16 landed. Any arena-resident
+   index scalar could end up read from its pre-reuse offset.
+2. A start scalar that is a program input may be assigned an I/O PORT at load time
+   (`runtime.cc` `assign_port`, zero-copy `cl_mem` — never in the arena at all). The recorded
+   arena offset then points at memory nothing ever wrote (→ base 0 or garbage → OOB segfault
+   under PoCL).
+
+**Why validators never caught it**: the numpy validators address start scalars by BUFFER ID
+(`idx_bufid[rank]`, carried in aux for exactly that purpose) — only the real device consumed
+`idx_byteoff`. This is the same blind spot as the §15 "outputs are I/O ports" trap: anything
+arena-offset-shaped is invisible to arena-based validators; only real-plugin e2e sees it.
+
+**Fix (chosen): patch aux at LOAD time, single source of truth.** The loader already resolves
+buffer id → arena-offset-or-port-handle for task dst/a/b (`elem_off`); it now also walks dyn
+gather/scatter tasks and rewrites `aux[idx_byteoff[d]] = elem_off(aux[idx_bufid[d]])` before
+uploading the aux buffer. The kernels read the scalars through `AP()`, which already resolves
+bit-31 port handles, so ports work with no kernel change. The Python handler writes placeholder
+0s. Rejected alternatives: (a) lowering-side post-pass after `_reuse_arena` — fixes staleness
+but cannot know port assignment without duplicating `assign_port` in Python (silent-corruption
+coupling); (b) copying ported scalars into the arena via an extra 1-element instruction —
+correct but pollutes every dynamic_slice with instruction overhead.
+
+**Rule going forward**: an aux word that names a buffer LOCATION must be patched by the loader
+from a buffer id; lowering-time offsets are only valid for things `_reuse_arena` doesn't move
+(shapes, strides, trip counts). Verified: previously-failing repros + full pytest + PoCL/NVIDIA
+device runs of chained dynamic_slice.
+
+**Unrelated observation recorded while validating** (not a bug): on NVIDIA, f32 matmul runs on
+the tf32 tensor-core WMMA path (`-DVMO_NV_PTX`, §14) — a single 64x64 matmul shows median rel
+error ~8e-4 vs f64 (tf32 mantissa = 10 bits, 2^-11 ≈ 5e-4), where PoCL shows ~1e-7 (true f32
+FMA). Same trade cuBLAS/XLA make by default on Ampere+; worth remembering when comparing
+against references with tight tolerances.
+
+## 21. Per-op benchmark: in-program op chaining to kill dispatch noise (2026-07-17)
+
+`tools/plot_bench.py` timed one op per `jit` call; at small N the measurement was dominated by
+per-call noise (python dispatch, PJRT execute overhead, launch latency — µs-scale, same order
+as the kernels), giving jagged curves and run-to-run swings.
+
+**Rework**: every benchmarked function now applies its op CHAIN=16 times inside ONE jitted
+program as a data-dependent chain (link i consumes link i-1's output; matmul B-matrices scaled
+by 1/sqrt(n) so values stay finite), and the reported time is call_time/CHAIN, min-of-7-rounds
+with iteration counts auto-calibrated so every timed round lasts ≥50 ms (timer resolution).
+Host-side per-call overhead is amortized 16x; both backends execute one program containing 16
+real op instances — for ours that's 16 VM instructions (the megakernel's actual regime), for
+XLA 16 kernels/thunks in one executable.
+
+**The load-bearing detail is `stablehlo.optimization_barrier` between links**: without it XLA
+fuses/CSEs a repeated elementwise chain into far fewer kernels and the CUDA side reads ~16x
+faster than reality. Our lowering now supports the op as pure buffer aliasing (zero
+instructions — we have no cross-op optimizer to fence), so it is free on both sides.
+
+**Trap 1: a barrier stops CSE/fusion but NOT dead-code elimination.** First gather version
+threaded only the (unchanged) offset through the barrier; each link's slice output fed nothing,
+so BOTH backends DCE'd 15 of the 16 slices and the panel read a physically impossible
+2.7-4.3 µs/op at N=16M (>10 TB/s). Sanity-check every chained panel against bandwidth
+arithmetic. Fix: the next offset must GENUINELY depend on the previous slice's data —
+`k += (y[0] * z).astype(int32)` where `z` is an opaque zero (`optimization_barrier(0.0)`
+hoisted out of the loop), which no simplifier can fold.
+
+**Trap 2: XLA looks THROUGH the consumer.** With the data dependency alone, XLA rewrote
+`y[0]` as a 1-element slice of `x` (slice-of-dynamic-slice simplification) — the k-chain then
+ran on tiny kernels and the big slices were dead again (CUDA still ~3 µs/op flat at 16M). Fix:
+pass `y` through `optimization_barrier` BEFORE indexing it; the barrier forces `y` materialized
+and simplifications cannot look through it. After both fixes, CUDA lands at ~12 µs/op at 16M —
+which IS physically sane: `x` is 64 MB and fully L2-resident (128 MB L2 on Blackwell), so the
+~5.4 TB/s effective is L2, not HBM, bandwidth. Ours ~30-50 µs/op (per-instruction floor ~5
+instrs/link, then bandwidth). Corollary: a data-dependent chain makes per-op time honest only
+if the consumed data is (a) genuinely needed and (b) barrier-shielded from producer fusion.
+
+Measured with the rework (NVIDIA, 2026-07-17): run-to-run deviation of ours-column medians
+0.1-0.8% per panel (max 5%); the old one-op-per-call method also carried a ~2x BIAS at small N
+(29-39 µs/call where the op itself is ~15 µs — the rest was python/PJRT dispatch, now /16).
+
+Chaining is also what surfaced the §20 dynslice bug — repetition-within-program is a better
+correctness probe than one-shot calls; keep using it.
