@@ -64,9 +64,39 @@ read; unroll additionally batches phases across iterations (up to 21x):
 can't disable (and CPU-contended rows fluctuate); the primary comparison is
 while/for/unroll on the same backend.
 
-Scan at large n×T is bound by the dynamic_update_slice identity copy (the full
-ys buffer re-materialized per iteration), not loop mechanics — the next scan
-lever is in-place DUS into the loop carry (docs/decisions.md §15).
+## In-place DUS follow-up (2026-07-17)
+
+Scan at large n×T was bound by the dynamic_update_slice identity copy (the
+full ys buffer re-materialized per iteration), not loop mechanics. SHIPPED:
+when the DUS operand is the loop carry itself and nothing else in the body
+reads it, the lowering NOPs the identity copy and scatters the update row
+straight into the carry buffer — per-iteration ys traffic drops from O(T·n)
+to O(n). Re-run of `scan-rnn` (full data: `results_*_inplace_dus.csv`;
+identical `sig` checksums):
+
+| device | n×T | for (before) | for (after) | xla-cpu |
+|---|---|---|---|---|
+| NVIDIA | 4096×512 | 42.2 | **20.4** | 4.8 |
+| NVIDIA | 1M×8     | 1.79 | **1.11** | 1.09 (tied) |
+| NVIDIA | 1M×32    | —    | **4.84** | 4.84 (tied) |
+| PoCL   | 4096×512 | 1734.7 | **205.5** | * |
+| PoCL   | 1M×8     | 270.2  | **60.6**  | * |
+| PoCL   | 1M×32    | 3582.0 | **237.4** | * |
+
+WHILE mode gains too (the fold is mode-independent). Unroll does NOT get the
+fold (unrolled iterations are pure SSA writing fresh buffers), so unroll now
+LOSES to FOR on large scans (PoCL 4096×512: 940 vs 205 ms) — the auto-mode
+arena estimate already steers those to FOR because the per-iteration DUS
+result counts the full (T,n) ys size. The remaining gap to XLA CPU at
+mid-size scans is the per-row dynamic_slice/scatter phase overhead, no longer
+bulk memory traffic.
+
+Scheduler prerequisite: in-place carry commits broke the "program is SSA, WAR
+edges unneeded" assumption — the in-place scatter's runtime-index read of the
+counter carry could share a barrier phase with the counter copy-back (caught
+by the schedule simulator's order-independence check). `_depends` now adds
+WAR edges; they never fire in the SSA bulk (0 extra phases on a
+transformer-ish block), only at carry commit points (python/NOTES.md A2).
 
 ## Decision
 

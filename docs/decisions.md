@@ -934,7 +934,7 @@ unnecessary; only data dependencies between iterations need synchronization.
   this session's passthrough fix).
 - Scan at LARGE n×T is bound by the dynamic_update_slice identity copy (full ys buffer
   re-materialized every iteration — 4096×T512 ≈ 4 GB of traffic dwarfing loop overhead in every
-  mode). **Next lever for scan: in-place DUS into the loop carry**, not loop mechanics.
+  mode). Next lever for scan: in-place DUS into the loop carry — SHIPPED, see §15a.
 
 **Traps hit** (fixes in this branch):
 - Unrolling past ~2 GiB of arena silently misaddresses: buffer offsets are u32 AND bit 31 is
@@ -957,6 +957,40 @@ unnecessary; only data dependencies between iterations need synchronization.
 **Decision**: `auto` is the default (unroll small, OP_FOR the rest, plain WHILE only for genuine
 data-dependent conds). Detection is deliberately narrow (LT/signed, positive const step) —
 widen only when a real program shows a different counted shape.
+
+### 15a. In-place dynamic_update_slice into the loop carry — SHIPPED 2026-07-17
+
+The §15 "next lever". DUS is pure (`ys' = operand with slice replaced`), lowered as an
+identity-gather copy of the WHOLE operand into a fresh buffer + a scatter of the update row —
+so every scan iteration paid O(T·n) traffic for an O(n) write, O(T²·n) per scan.
+
+**Mechanism** (lowering-only; no new opcodes, no kernel/runtime changes): in the while/FOR body
+commit phase, when carry k's return value is produced by exactly that pair, the gather's source
+is carry k's own buffer (verified structurally: row-major contiguous aux, zero offset, full
+length), the DUS out_buf is returned in exactly one slot and never read in the body, and the
+carry is read by NOTHING but the identity gather and written by nothing else — then: NOP the
+gather, retarget the scatter's dst to the carry buffer, skip both snapshot copies. The pure
+semantics collapse to a mutation because no body instr can observe the carry mid-update.
+
+**Measured** (bench poc/12, `results_*_inplace_dus.csv`, identical sig checksums): NVIDIA FOR
+4096×T512 42.2→20.4 ms (2.1×), 1M×T8 1.79→1.11 ms and 1M×T32 4.84 ms — both now TIED with XLA
+CPU. PoCL FOR 4096×T512 1735→205 ms (8.4×), 1M×T32 3582→237 ms (15×). WHILE mode gains equally.
+Unroll does NOT get the fold (unrolled iterations are SSA, each writes a fresh ys) and now
+LOSES to FOR on large scans (PoCL 4096×T512: 940 vs 205 ms); the auto arena gate already
+steers those to FOR since the estimate counts the full (T,n) DUS result per iteration.
+
+**Trap: the scheduler's no-WAR assumption.** `_depends` modeled only RAW+WAW ("the program is
+SSA" — python/NOTES.md A2). Carries are NOT SSA, and it never bit because the ys temp-copy
+always forced a phase break between the scatter and the carry copy-backs. Removing that copy
+let the in-place scatter's runtime-index read (the counter carry, via reads_hint) share a
+barrier phase with the counter copy-back — a genuine cross-lane race, caught immediately by
+the schedule simulator's lane-order-independence check (great validator). Fix: WAR edges in
+`_depends`. They never fire in a program's SSA bulk (verified 0 phase-count change on a
+transformer-ish block; fori/transformer benches unchanged) — only at carry commit points.
+
+**Remaining scan gap vs XLA CPU** (4096×T128: 5.2 vs 1.3 ms) is per-iteration phase overhead
+(dynamic_slice + scatter each barrier per row), no longer bulk traffic. That's barrier-elision
+territory (§12 / megakernel-survey), not copy elimination.
 
 ## 16. Arena is a bump allocator — no liveness reuse (found 2026-07-16, transformer `large`)
 
