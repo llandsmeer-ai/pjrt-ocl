@@ -1311,6 +1311,169 @@ def _finalize_matmul_views(ctx: _Ctx) -> None:
             ctx.instrs[idx] = dataclasses.replace(ins, aux=hdr)
 
 
+def _reuse_arena(ctx: _Ctx, main_len: int) -> None:
+    """Reassign arena byte offsets by live interval (offline linear-scan /
+    register-allocation) so the arena is bounded by PEAK concurrent liveness,
+    not the SUM of every intermediate ever emitted. The old bump allocator
+    (`offset = _arena; _arena += size`) never reused a slot, so a multi-layer
+    transformer's temporaries accumulated past the 2^31 offset cap (§16).
+
+    Buffer IDs are UNCHANGED — only Buffer.arena_byte_offset moves. Everything
+    downstream keys on IDs: the scheduler patches offsets into task fields from
+    the buffer table, the runtime/validators read the table.
+
+    LIVENESS IS MEASURED IN SCHEDULER PHASE TIME, not program-instruction order.
+    The scheduler runs independent ops in parallel across lanes and inserts a
+    global barrier only BETWEEN phases (scheduler._build_levels/_phases). Two
+    buffers may share a slot only when a barrier is GUARANTEED between the last
+    use of one and the first def of the other — i.e. their phase intervals are
+    disjoint. Instruction-order liveness would be UNSAFE: an independent
+    producer/consumer pair in the SAME phase runs concurrently on different
+    lanes, so a recycled slot's write could clobber a still-live read. The
+    scheduler assumes SSA (single-assignment) and adds NO WAR edge for the
+    alias, so phase time is the correct granularity. We recompute the phase
+    partition here from the SAME instrs + fuse flag the real scheduler uses
+    (offsets don't affect it), so it matches the schedule that will execute.
+
+    Correctness pins (an early free = SILENT memory corruption):
+      * inputs  — non-port inputs are copied into the arena before phase 0, so
+                  they are live from phase 0; zero-copy PORTS ignore the arena
+                  offset entirely (runtime overrides with a port handle), so
+                  pinning + not-relocating them is automatic/harmless.
+      * outputs — read out (D2H) after the program ends: live to the very end.
+      * consts  — uploaded once at load into their slot: live the whole program.
+      * regions — a WHILE/FOR's entire sub-list (every iteration, nested regions
+                  included) and its carries collapse to the region op's single
+                  phase, so nothing a region touches is reused within OR across
+                  the region. Conservative but safe (region arenas are tiny).
+      * views   — a folded gather source (§13/§14a) is read by its viewer via the
+                  operand's a/b field, so _reads_of already counts it as a read
+                  of the SOURCE buffer; its interval extends to its last viewer.
+      * in-place — dst==a ops contribute both a read and a write at the same
+                  phase to the one (shared) buffer id; no cross-id aliasing.
+    """
+    from . import scheduler as S
+    instrs = ctx.instrs
+    n_buf = len(ctx.buffers)
+    if n_buf == 0:
+        return
+
+    # --- phase partition (mirror the scheduler: same instrs, same fuse flag;
+    # arena offsets don't affect _build_levels, so this equals the real one) ---
+    class _ProgView:
+        pass
+    pv = _ProgView()
+    pv.instrs = instrs
+    pv.buffers = ctx.buffers
+    pv.main_len = main_len
+    sc = S._Scheduler(pv, S.DeviceConfig.from_env(), 1)
+    levels = sc._build_levels(list(range(main_len)))
+    n_phases = len(levels)
+
+    tphase: dict[int, int] = {}                 # instr idx -> phase number
+    region_ops: list[tuple[int, int]] = []      # (root region op idx, phase)
+    for ph, (kind, payload) in enumerate(levels):
+        if kind == "compute":
+            for idx in payload:
+                tphase[idx] = ph
+        else:                                   # "while": one region op == a phase
+            tphase[payload] = ph
+            region_ops.append((payload, ph))
+
+    def _subranges(ins: Instr) -> list[int]:
+        if ins.op == OP_WHILE:
+            return (list(range(ins.a, ins.a + ins.b))       # cond sub-list
+                    + list(range(ins.n, ins.n + ins.imm)))  # body sub-list
+        if ins.op == OP_FOR:
+            return list(range(ins.n, ins.n + ins.imm))      # body sub-list
+        return []
+
+    # collapse each region's whole (transitively nested) sub-list to its phase
+    for r, ph in region_ops:
+        stack = _subranges(instrs[r])
+        while stack:
+            j = stack.pop()
+            tphase[j] = ph
+            stack.extend(_subranges(instrs[j]))
+
+    # --- per-buffer live interval in phase time ------------------------------
+    INF = n_phases + 1
+    lo = [INF] * n_buf
+    hi = [-1] * n_buf
+
+    def touch(b: int, t: int) -> None:
+        if 0 <= b < n_buf:
+            if t < lo[b]:
+                lo[b] = t
+            if t > hi[b]:
+                hi[b] = t
+
+    for idx, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        t = tphase.get(idx)
+        if t is None:
+            continue                            # dead root instr not in any phase
+        for b in _reads_of(ins):
+            touch(b, t)
+        if ins.op in (OP_WHILE, OP_IF, OP_FOR):
+            if ins.op != OP_FOR and ins.dst:
+                touch(ins.dst, t)               # WHILE cond flag: device-read/iter
+        else:
+            touch(ins.dst, t)                   # data write
+
+    TEND = n_phases                             # strictly after phases 0..n_phases-1
+    for b in set(ctx.inputs):
+        lo[b] = 0                               # copied in before phase 0 (non-port)
+        if hi[b] < 0:
+            hi[b] = 0
+    for b in set(ctx.outputs):
+        if lo[b] == INF:
+            lo[b] = 0
+        hi[b] = TEND                            # read out after the program
+    for b, _data in ctx.consts:
+        lo[b] = 0
+        hi[b] = TEND                            # uploaded once; never overwritten
+
+    # --- offline greedy placement: biggest buffer first, lowest offset whose
+    # [off, off+size) misses every already-placed buffer with an overlapping
+    # phase interval. Inclusive overlap (l..h): buffers sharing a phase never
+    # share a slot. Sizes 64B-aligned -> all offsets stay 64B-aligned. ---------
+    def aligned(size: int) -> int:
+        return -(-size // ARENA_ALIGN) * ARENA_ALIGN
+
+    live = [b for b in range(n_buf) if hi[b] >= 0]
+    live.sort(key=lambda b: (-aligned(ctx.buffers[b].size_bytes),
+                             -(hi[b] - lo[b]), b))
+    placed: list[tuple[int, int, int, int]] = []   # (lo, hi, off, end)
+    arena_end = 0
+    for b in live:
+        size = aligned(ctx.buffers[b].size_bytes)
+        l, h = lo[b], hi[b]
+        conflicts = sorted((off, end) for (pl, ph_, off, end) in placed
+                           if not (h < pl or ph_ < l))
+        off = 0
+        for c0, c1 in conflicts:
+            if off + size <= c0:
+                break                           # fits in the gap before c0
+            if c1 > off:
+                off = c1
+        ctx.buffers[b].arena_byte_offset = off
+        placed.append((l, h, off, off + size))
+        if off + size > arena_end:
+            arena_end = off + size
+
+    # never-referenced buffers (DCE'd dead temps): no task ever touches them, so
+    # any in-range offset is safe. Park at 0 (still counts toward arena_bytes so
+    # the runtime's offset+size <= arena_bytes check passes).
+    for b in range(n_buf):
+        if hi[b] < 0:
+            ctx.buffers[b].arena_byte_offset = 0
+            arena_end = max(arena_end, aligned(ctx.buffers[b].size_bytes))
+
+    ctx._arena = arena_end
+
+
 def lower_module(module) -> VMProgram:
     """Lower a deserialized stablehlo module's public @main to a VMProgram."""
     from jaxlib.mlir import ir
@@ -1358,6 +1521,17 @@ def lower_module(module) -> VMProgram:
     _fuse_views(ctx)
     _finalize_matmul_views(ctx)
     _dce_nops(ctx)
+
+    # Liveness-reuse: rewrite arena offsets so the arena is bounded by peak
+    # concurrent liveness, not the sum of every intermediate (§16). Runs AFTER
+    # fusion/DCE (they NOP out buffers) and BEFORE the cap check (the backstop).
+    _bump_arena = ctx._arena
+    _reuse_arena(ctx, main_len)
+    if os.environ.get("PJRT_OCL_ARENA_DEBUG"):
+        import sys
+        print(f"[pjrt_ocl arena] bump={_bump_arena} "
+              f"({_bump_arena / (1 << 20):.1f} MiB) -> reuse={ctx._arena} "
+              f"({ctx._arena / (1 << 20):.1f} MiB)", file=sys.stderr)
 
     # Arena offsets are patched into u32 task fields and bit 31 is the I/O-port
     # flag (VMO_IO_BIT): an arena >= 2 GiB silently addresses the wrong memory

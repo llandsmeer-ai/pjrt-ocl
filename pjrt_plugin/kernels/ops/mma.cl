@@ -25,8 +25,18 @@
 #define MMA_TDIM 16          /* 16x16 thread grid == 256 threads */
 #define MMA_RM (MMA_TM / MMA_TDIM)   /* 4 */
 #define MMA_RN (MMA_TN / MMA_TDIM)   /* 4 */
+#ifdef VMO_NV_PTX
+/* Pad the TF32 smem leading dim: the wmma A/B fragment loads read 16 rows at
+ * stride LDS; with LDS==16 consecutive rows collide on the same 32 banks (8-way
+ * conflict). LDS=20 makes gcd(20,32)=4 -> 8 distinct bank offsets, conflict-
+ * free-ish. Costs 25% more staging smem; no accumulator registers. */
+#define TC_LDS (MMA_BK + 4)
+#define MMA_ASZ (MMA_TM * TC_LDS)    /* As[m*LDS + k] */
+#define MMA_BSZ (MMA_TN * TC_LDS)    /* Bs[n*LDS + k] col-major, padded */
+#else
 #define MMA_ASZ (MMA_BK * MMA_TM)    /* As[m*BK + k] */
-#define MMA_BSZ (MMA_BK * MMA_TN)    /* Bs[k*TN+n] portable / Bs[n*BK+k] TC */
+#define MMA_BSZ (MMA_BK * MMA_TN)    /* Bs[k*TN+n] portable */
+#endif
 
 #ifdef VMO_NV_PTX
 /* --- inline-PTX WMMA helpers (tf32 m16n16k8, from poc/08 / tc_mma.cl) ------ */
@@ -61,7 +71,22 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
     const uint tiles_m = (M + MMA_TM - 1) / MMA_TM;
     const uint per = tiles_m * tiles_n;
     const uint g = tile / per, loc = tile % per;
-    const uint tr = loc / tiles_n, tc = loc % tiles_n;
+    /* L2-friendly threadblock swizzle (CUTLASS/Triton "group-M"): instead of
+     * row-major (tr=loc/tiles_n), walk GROUP_M row-blocks per column strip so a
+     * wave of co-resident workgroups reuses the same B column panel (and A row
+     * panels) from L2 before moving on. The 64x64 tile has only ~16 FLOP/byte
+     * arithmetic intensity, so at large K it is GLOBAL-BANDWIDTH bound; raising
+     * the L2 hit rate on the re-streamed B is the only knob left without growing
+     * the register tile (which the megakernel occupancy cap forbids, §10c).
+     * Pure index remap — every (tr,tc) still covered exactly once, bit-exact. */
+    const uint GROUP_M = 8u;
+    const uint in_grp = GROUP_M * tiles_n;
+    const uint gid = loc / in_grp;
+    const uint first_m = gid * GROUP_M;
+    const uint gsz_m = min(tiles_m - first_m, GROUP_M);
+    const uint locg = loc % in_grp;
+    const uint tr = first_m + locg % gsz_m;
+    const uint tc = locg / gsz_m;
     const uint row0 = tr * MMA_TM, col0 = tc * MMA_TN;
     const uint lid = get_local_id(0);
     const uint warp = lid >> 5, lane = lid & 31;
@@ -87,7 +112,7 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
             const uint m = idx / MMA_BK, kk = idx % MMA_BK;   /* As row-major */
             const uint gr = row0 + m, gk = k0 + kk;
             const bool in = (gr < M && gk < K);
-            As[m * MMA_BK + kk] = !in ? 0.0f
+            As[m * TC_LDS + kk] = !in ? 0.0f
                 : av ? ba[vmo_view_idx(aux, av - 1u,
                           (uint)((size_t)g * M * K + (size_t)gr * K + gk))]
                      : ga[gr * K + gk];
@@ -96,7 +121,7 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
             const uint n = idx / MMA_BK, kk = idx % MMA_BK;   /* Bs col-major */
             const uint gk = k0 + kk, gc = col0 + n;
             const bool in = (gk < K && gc < N);
-            Bs[n * MMA_BK + kk] = !in ? 0.0f
+            Bs[n * TC_LDS + kk] = !in ? 0.0f
                 : bv ? bb[vmo_view_idx(aux, bv - 1u,
                           (uint)((size_t)g * K * N + (size_t)gk * N + gc))]
                      : gb[gk * N + gc];
@@ -104,11 +129,11 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint ks = 0; ks < TC_KSUB; ks++) {
             uint af[4], bf[TC_TNW][4];
-            __local float *ap = &As[(wm * 16) * MMA_BK + ks * 8];
-            TC_LOAD_A(af, ap, MMA_BK);
+            __local float *ap = &As[(wm * 16) * TC_LDS + ks * 8];
+            TC_LOAD_A(af, ap, TC_LDS);
             for (int j = 0; j < TC_TNW; j++) {
-                __local float *bp = &Bs[(wn * 32 + j * 16) * MMA_BK + ks * 8];
-                TC_LOAD_B(bf[j], bp, MMA_BK);
+                __local float *bp = &Bs[(wn * 32 + j * 16) * TC_LDS + ks * 8];
+                TC_LOAD_B(bf[j], bp, TC_LDS);
             }
             for (int j = 0; j < TC_TNW; j++) TC_MMA(acc[j], af, bf[j]);
         }

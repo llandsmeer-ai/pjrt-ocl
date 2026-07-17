@@ -16,6 +16,8 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = REPO / "pjrt_plugin" / "build" / "libpjrt_ocl.so"
 BODY = pathlib.Path(__file__).parent / "_e2e_body.py"
 WHILE_BODY = pathlib.Path(__file__).parent / "_while_e2e_body.py"
+MATMUL_HOST_BODY = pathlib.Path(__file__).parent / "_matmul_host_e2e_body.py"
+DYNSLICE_BODY = pathlib.Path(__file__).parent / "_dynslice_e2e_body.py"
 
 
 def _run_body(body: pathlib.Path, marker: str, extra_env: dict | None = None
@@ -51,3 +53,26 @@ def test_e2e_host_dispatch():
     device, so this exercises the host-driven frame walk + segment kernel in CI
     regardless of which OpenCL device is present."""
     _run_body(WHILE_BODY, "WHILE E2E PASS", {"PJRT_OCL_ENGINE": "host"})
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_matmul_host_dispatch():
+    """Matmul under the host-dispatch engine — regression for the matmul launch
+    geometry keying on host_dispatch() instead of is_gpu() (§17): a GPU on
+    the host engine used to launch CPU geometry and silently miscompute. On a
+    GPU this exercises the fix; on CPU it just confirms the packed path."""
+    _run_body(MATMUL_HOST_BODY, "MATMUL HOST E2E PASS", {"PJRT_OCL_ENGINE": "host"})
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_dynslice_runtime_offset():
+    """dynamic_slice/update with a runtime INPUT offset (§20): the loader must
+    patch the aux idx_byteoff words from buffer ids — offsets recorded at
+    lowering time are stale (arena reuse) or wrong (I/O ports). Validators
+    address by buffer id and cannot catch this; only a real-plugin run can."""
+    _run_body(DYNSLICE_BODY, "DYNSLICE E2E PASS")
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_dynslice_runtime_offset_host_dispatch():
+    _run_body(DYNSLICE_BODY, "DYNSLICE E2E PASS", {"PJRT_OCL_ENGINE": "host"})
