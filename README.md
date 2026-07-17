@@ -142,6 +142,20 @@ when a CUDA jaxlib is installed, else JAX CPU):
 . ./env.sh && python tools/plot_transformer.py --device <platform substring>
 ```
 
+**Methodology** (docs/decisions.md §21): each op is applied **16× inside one
+jitted program as a data-dependent chain** (`optimization_barrier` between
+links so XLA can't fuse/CSE the repeats — and so dead links can't be
+eliminated); reported time is per op application, min-of-rounds with rounds
+auto-sized to ≥50 ms. This amortizes per-call python/PJRT dispatch (~15–25 µs)
+out of BOTH sides — run-to-run deviation is 0.1–0.8% — and both backends
+execute one program containing 16 real op instances, which is also each
+backend's realistic regime (16 VM instructions for us, 16 kernels in one
+executable for XLA). Ratios below are therefore *device-work* ratios; earlier
+revisions of these plots included the dispatch floor in both columns, which
+flattered whichever side was slower per kernel. The NVIDIA per-op plot uses
+this methodology; the Xe2/PoCL per-op plots predate it (one op per call) and
+will be regenerated on the next bring-up pass for those devices.
+
 ### NVIDIA RTX PRO 6000 (Blackwell) — vs native CUDA
 
 **Testbench: full suite green.** Per-op wall-clock, **our OpenCL backend
@@ -150,44 +164,50 @@ apples-to-apples GPU-vs-GPU comparison of the VM against a production compiler.
 
 ![ours (OpenCL) vs JAX CUDA, per-op N-vs-time](docs/bench_plot.png)
 
-Takeaways (higher = slower; both axes log):
+Takeaways (higher = slower; both axes log; ratios are per-op device work,
+dispatch-free — see methodology above):
 
-- **Elementwise (add / mul) is at parity** — within **~1.3x** of CUDA at 16M
-  elements, and actually *faster* than CUDA across the small-to-mid range. Two
-  optimizations got us here: **zero-copy I/O** (input/output buffers are passed
-  straight to the kernel instead of copied through a staging arena) and a
-  **buffer pool** (reused output allocations, which removed a 3.5x step at 512K
-  caused by NVIDIA's lazy ≥2MB allocation). The kernel itself was already
-  bandwidth-competitive.
-- **`gather` (`dynamic_slice`)** ~1.7x at 16M, faster than CUDA below ~64K.
-- **`matrix × vector`** ~3.9x — memory-bound but routed through the tiled MMA
-  kernel, which wastes most of a tile on a width-1 RHS; a dedicated GEMV kernel
-  would close most of this.
-- **`dot_general`.** Large matmul runs a **standalone SGEMM** (`mm2`, launched
-  outside the megakernel so an 8×4 register tile doesn't inflate the shared
-  register budget). cuBLAS hits **134 TFLOP/s at 4096, above Blackwell's f32
-  peak** — i.e. it is TF32 **tensor-core** bound, which a portable f32 kernel
-  can't reach. So there's now an **NVIDIA-only TF32 tensor-core path** (inline-PTX
-  `wmma` behind the `VMO_NV_PTX` build, portable f32 fallback intact), with a
-  bank-conflict-free staging tile — a pure matmul runs **~21 TFLOP/s at 2048³
-  (~5.0× off cuBLAS)**. It stays short of cuBLAS because the in-kernel tile is
-  **arithmetic-intensity-capped**: it can't grow without dropping below the
-  co-residency the persistent megakernel's cross-workgroup barrier requires. See
-  the end-to-end transformer numbers below for where this lands on a real workload.
-- **`while` loops** went from **~28x to ~1.8x** at 16M elements. Four fixes:
-  (1) an **affine op** `d = a·s + t` that folds scalar-constant scale/bias
-  (`x*1.5+1` was materializing two full-length broadcast buffers per iteration →
-  now one fused pass); (2) **in-place carry updates** so a loop-carried buffer
-  stays L2-resident across iterations instead of being copied twice per step;
-  (3) a **contention-free barrier spin** (coherent `atomic_load` instead of an
-  atomic RMW that ping-ponged the phase cache line across ~376 workgroups); and
-  (4) **fixed-trip counted loops lowered to `OP_FOR`/bytecode-unroll** (the
-  common `fori_loop`/`scan` shape runs the body without a data-dependent
-  device-side condition check per step). The affine folding is a general win for
-  any `x*c`/`x+c`/affine chain.
+- **Elementwise (add / mul): ~1.5x at 4K, ~2.5x at 16M elements.** At 16M we
+  sustain ~1.6 TB/s — real HBM bandwidth — so the large-N gap is CUDA's
+  L2-friendlier scheduling, not kernel quality. In the mid range the gap is our
+  **per-instruction cost (~15 µs: cross-workgroup barrier + instruction
+  dispatch) vs CUDA's ~3.3 µs in-graph kernel launch** — that floor, not
+  bandwidth, is what the VM pays per bytecode step, and it's the number the
+  megakernel design has to beat. (Earlier zero-copy I/O + buffer-pool work
+  still stands; the old "at parity / faster than CUDA" read came from ~20 µs
+  of per-call dispatch masking CUDA's floor.)
+- **`gather` (`dynamic_slice`)** ~4.4x at 16M (ours ~1.3 TB/s); flat
+  ~30 µs/op mid-range = the same per-instruction floor (the chain's offset
+  arithmetic adds a few scalar instructions per link on both sides).
+- **`matrix × vector`** ~46x at 2048 — the honest number for our GEMV kernel:
+  it streams the 16.8 MB matrix at ~90 GB/s while cuBLAS keeps it L2-resident
+  (~4 µs/op ≈ 4 TB/s effective on Blackwell's 128 MB L2). Biggest per-op gap
+  we have; a proper GEMV tile is the known fix.
+- **`dot_general`** ~5.9x at 2048³. Large matmul runs a **standalone SGEMM**
+  (`mm2`, launched outside the megakernel so an 8×4 register tile doesn't
+  inflate the shared register budget). cuBLAS hits **134 TFLOP/s at 4096,
+  above Blackwell's f32 peak** — i.e. it is TF32 **tensor-core** bound, which
+  a portable f32 kernel can't reach. So there's an **NVIDIA-only TF32
+  tensor-core path** (inline-PTX `wmma` behind the `VMO_NV_PTX` build,
+  portable f32 fallback intact; note tf32 means ~1e-3 relative precision on
+  NVIDIA matmul, same trade cuBLAS makes by default). It stays short of cuBLAS
+  because the in-kernel tile is **arithmetic-intensity-capped**: it can't grow
+  without dropping below the co-residency the persistent megakernel's
+  cross-workgroup barrier requires. See the end-to-end transformer numbers
+  below for where this lands on a real workload.
+- **`while` loops: ~80–100x FASTER than CUDA below ~256K elements, ~1.9x
+  slower at 16M.** The counted-loop pipeline (`OP_FOR` + bytecode unroll, §15) plus
+  affine-chain composition folds the 32-step `x*1.5+1` body into a handful of
+  instructions at compile time (~2 µs/op), while XLA GPU runs a real
+  device-synchronized loop (~175 µs/op regardless of N). Past the unroll
+  arena gate (~512K) we run the loop for real too and land at 1.9x — the
+  earlier campaign's fixes (affine op folding, in-place carries,
+  contention-free barrier spin) are what hold that at 2x rather than the 28x
+  it started from.
 
-The remaining end-to-end gap on the closest ops is largely fixed jax→PJRT
-per-dispatch overhead, which amortizes in real fused programs.
+On the ops closest to parity, the residual mid-size gap is the VM's fixed
+per-instruction cost (barrier + dispatch, ~15 µs vs ~3 µs); fusing more work
+into fewer instructions (§19) attacks exactly that.
 
 #### End-to-end: a GPT-style transformer (`tools/bench_transformer.py`)
 
