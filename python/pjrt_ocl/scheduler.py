@@ -33,7 +33,11 @@ from . import opsem
 
 # --- tile-op vocabulary + sentinels (docs/vmprogram.md v2.1 table) ----------
 
-TILE_SIZE = 16384          # EW tile size (TS)
+# EW tile size (TS). The plugin bakes the device-tuned value into the kernels
+# (-DEW_TS, runtime.cc) and advertises it here via env; both sides must agree
+# on the tile -> element-range mapping. Standalone imports (unit tests) get
+# the CPU/default 16384.
+TILE_SIZE = int(os.environ.get("PJRT_OCL_EW_TS", "16384") or "16384")
 MMA_T = 64                 # MMA output tile edge (vm2.cl MMA_TM/MMA_TN)
 
 TILE_EW = 0

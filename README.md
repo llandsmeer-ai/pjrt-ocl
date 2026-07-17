@@ -167,22 +167,27 @@ apples-to-apples GPU-vs-GPU comparison of the VM against a production compiler.
 Takeaways (higher = slower; both axes log; ratios are per-op device work,
 dispatch-free — see methodology above):
 
-- **Elementwise (add / mul): ~1.5x at 4K, ~2.5x at 16M elements.** At 16M we
-  sustain ~1.6 TB/s — real HBM bandwidth — so the large-N gap is CUDA's
-  L2-friendlier scheduling, not kernel quality. In the mid range the gap is our
-  **per-instruction cost (~15 µs: cross-workgroup barrier + instruction
-  dispatch) vs CUDA's ~3.3 µs in-graph kernel launch** — that floor, not
-  bandwidth, is what the VM pays per bytecode step, and it's the number the
-  megakernel design has to beat. (Earlier zero-copy I/O + buffer-pool work
-  still stands; the old "at parity / faster than CUDA" read came from ~20 µs
-  of per-call dispatch masking CUDA's floor.)
-- **`gather` (`dynamic_slice`)** ~4.4x at 16M (ours ~1.3 TB/s); flat
-  ~30 µs/op mid-range = the same per-instruction floor (the chain's offset
-  arithmetic adds a few scalar instructions per link on both sides).
-- **`matrix × vector`** ~46x at 2048 — the honest number for our GEMV kernel:
-  it streams the 16.8 MB matrix at ~90 GB/s while cuBLAS keeps it L2-resident
-  (~4 µs/op ≈ 4 TB/s effective on Blackwell's 128 MB L2). Biggest per-op gap
-  we have; a proper GEMV tile is the known fix.
+- **Elementwise (add / mul): at CUDA parity (0.9–1.2x) from 4K to 1M
+  elements; 2.2–2.7x at 2M–16M.** An earlier flat ~15 µs/op for ANY mid-range
+  N turned out to be the TILE, not the boundary: one 16K-element tile was one
+  workgroup's scalar stride-256 loop — 64 dependent memory round trips per
+  thread — and the fixed tile size capped an op's parallelism at N/16K lanes.
+  The float4+unroll fast path plus a device-tuned tile size (EW_TS 4096 on
+  GPUs, decisions.md §22) removed that floor; per-instruction overhead itself
+  is ~3 µs, at CUDA's in-graph launch floor. At 16M we sustain ~1.7 TB/s —
+  HW bandwidth — and the residual 2.5x is CUDA's chain staying L2-resident
+  where our arena traffic does not; the fusion front (§19) attacks that.
+- **`gather` (`dynamic_slice`)** ~2.3–3.8x (was 2.6–7.8x): the contiguous
+  rank-1 fast path replaced a per-element div/mod chain (§22). The remaining
+  flat ~12 µs/op is the chain's scalar offset arithmetic — several one-element
+  instructions + barrier phases per link — i.e. small-op fusion territory
+  (§19), not the copy itself.
+- **`matrix × vector`** ~1.4–3.5x (was 4.3–46x, the worst table entry): GEMV
+  no longer runs through the 64×64 matmul tile (63/64 of every tile wasted at
+  N=1, serial K loop). `dot_general` with a vector rhs now lowers to the
+  segmented-reduce tile in **dot mode** — one matrix row per tile, the whole
+  workgroup doing a coalesced float4 dot + local tree, M-way parallel
+  (§22.4). 1024²: 101 → 8.2 µs (cuBLAS: 3.7, L2-resident).
 - **`dot_general`** ~5.9x at 2048³. Large matmul runs a **standalone SGEMM**
   (`mm2`, launched outside the megakernel so an 8×4 register tile doesn't
   inflate the shared register budget). cuBLAS hits **134 TFLOP/s at 4096,
@@ -195,15 +200,15 @@ dispatch-free — see methodology above):
   without dropping below the co-residency the persistent megakernel's
   cross-workgroup barrier requires. See the end-to-end transformer numbers
   below for where this lands on a real workload.
-- **`while` loops: ~80–100x FASTER than CUDA below ~256K elements, ~1.9x
-  slower at 16M.** The counted-loop pipeline (`OP_FOR` + bytecode unroll, §15) plus
-  affine-chain composition folds the 32-step `x*1.5+1` body into a handful of
-  instructions at compile time (~2 µs/op), while XLA GPU runs a real
-  device-synchronized loop (~175 µs/op regardless of N). Past the unroll
-  arena gate (~512K) we run the loop for real too and land at 1.9x — the
-  earlier campaign's fixes (affine op folding, in-place carries,
-  contention-free barrier spin) are what hold that at 2x rather than the 28x
-  it started from.
+- **`while` loops: faster than CUDA up to ~1M elements (~100x below 256K,
+  0.7–0.8x at 512K–1M), 1.1–1.4x above.** The counted-loop pipeline (`OP_FOR`
+  + bytecode unroll, §15) plus affine-chain composition folds the 32-step
+  `x*1.5+1` body into a handful of instructions at compile time (~2 µs/op),
+  while XLA GPU runs a real device-synchronized loop (~175 µs/op regardless
+  of N). Past the unroll arena gate (~512K) we run the loop for real — 32
+  in-kernel iterations of a vectorized affine tile + barrier now cost 122 µs
+  vs CUDA's 180 µs of launch-bound iterations (was 466 µs before §22's tile
+  fixes; the megakernel's in-kernel loop is a genuine structural win here).
 - **`lax.scan` (stacked outputs) ties XLA CPU at 1M elements.** The
   dynamic_update_slice that stacks each step's output used to re-copy the
   whole ys buffer every iteration (O(T²·n) traffic); the in-place-DUS fold
@@ -211,9 +216,11 @@ dispatch-free — see methodology above):
   1M×T8: 1.11 ms vs XLA CPU's 1.09; 1M×T32: 4.84 vs 4.84 (FOR mode; 2× over
   the copying path on NVIDIA, up to 15× on PoCL host-dispatch).
 
-On the ops closest to parity, the residual mid-size gap is the VM's fixed
-per-instruction cost (barrier + dispatch, ~15 µs vs ~3 µs); fusing more work
-into fewer instructions (§19) attacks exactly that.
+With the §22 tile fixes in, single big ops are at or near parity and the
+per-instruction overhead (~3 µs) sits at CUDA's launch floor; what remains
+expensive is *chains of small ops* (scalar index arithmetic, layernorm/softmax
+idioms) — many instructions and barrier phases where XLA emits one fused
+kernel. Fusing more work into fewer instructions (§19) attacks exactly that.
 
 #### End-to-end: a GPT-style transformer (`tools/bench_transformer.py`)
 
@@ -228,13 +235,14 @@ NVIDIA (TF32 tensor cores on), vs native JAX CUDA on the same GPU
 
 | config (D, ff, layers) | ours | native CUDA | gap | ours throughput |
 |------------------------|------|-------------|-----|-----------------|
-| base (512, 2048, 6)    | 9.7 ms | 0.44 ms | 22.3× | 2.2 TFLOP/s |
-| large_l1 (1024, 4096, 1) | 5.5 ms | 0.57 ms | 9.8× | 10.1 TFLOP/s |
-| large (1024, 4096, 6)  | 33.5 ms | 3.7 ms | **9.1×** | **10.0 TFLOP/s** |
+| base (512, 2048, 6)    | 6.8 ms | 0.43 ms | 15.7× | 3.1 TFLOP/s |
+| large_l1 (1024, 4096, 1) | 5.1 ms | 0.57 ms | 8.9× | 11.0 TFLOP/s |
+| large (1024, 4096, 6)  | 30.9 ms | 3.7 ms | **8.3×** | **10.8 TFLOP/s** |
 
-The gap **more than halves as the model gets compute-bound** (and holds at full
-depth): `base`'s 22× is small-op/overhead-bound, not a matmul deficit — on
-compute-heavy work we sustain **~10 TFLOP/s within ~9× of cuBLAS**. Getting here
+(§22's tile/GEMV fixes took `base` 9.7 → 6.8 ms and `large` 33.5 → 30.9 ms.)
+The gap **halves as the model gets compute-bound** (and holds at full
+depth): `base`'s 16× is small-op/overhead-bound, not a matmul deficit — on
+compute-heavy work we sustain **~11 TFLOP/s within ~8× of cuBLAS**. Getting here
 took a campaign of general mechanisms, each of which helps any workload:
 segmented (workgroup-collaborative) reductions for softmax/layernorm; an
 **access-map fusion** pass that folds transposes/reshapes/broadcasts into the

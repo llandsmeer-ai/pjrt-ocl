@@ -348,6 +348,20 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   if (!rt->info_.is_gpu)
     for (auto& v : variants)
       v.opts += v.opts.empty() ? "-DVMO_CPU_TILES" : " -DVMO_CPU_TILES";
+  // Device-tuned EW tile size, baked into the kernels here and advertised to
+  // the python scheduler via PJRT_OCL_EW_TS (plugin.cc) — the two must agree.
+  // GPUs: 4096. One tile is one workgroup's serial grid-stride chain, so at
+  // 16384 any op smaller than ~lanes*16K elems ran latency-bound on a handful
+  // of lanes (flat ~15 us/op for N in 16K..2M, chained bench). 4096 quadruples
+  // lane parallelism at equal total work; per-tile dispatch is sub-us. CPUs
+  // keep 16384: PoCL pays ~300 us/tile host overhead, more tiles = pure loss.
+  rt->ew_ts_ = rt->info_.is_gpu ? 4096 : 16384;
+  if (const char* e = std::getenv("PJRT_OCL_EW_TS"); e && e[0])
+    rt->ew_ts_ = std::max(256, std::atoi(e));
+  rt->ew_ts_ = (rt->ew_ts_ + 7u) & ~7u;  // float8 CPU path needs 8-alignment
+  for (auto& v : variants)
+    v.opts += (v.opts.empty() ? "-DEW_TS=" : " -DEW_TS=") +
+              std::to_string(rt->ew_ts_) + "u";
   std::string build_log;
   bool built = false;
   for (const auto& v : variants) {
@@ -1504,6 +1518,7 @@ constexpr uint32_t kEwSubMul = 1, kEwSubFill = 18;
 // then `tiles` tiles of the measured op.
 class CalBuilder {
  public:
+  explicit CalBuilder(uint32_t ew_tile) : ew_tile_(ew_tile) {}
   uint32_t Buf(uint64_t elems) {
     prog_.buffers.push_back({arena_, elems * 4, kDtF32});
     arena_ += (elems * 4 + 63) & ~uint64_t{63};
@@ -1512,7 +1527,7 @@ class CalBuilder {
   void Fill(uint32_t buf, uint64_t elems) {
     const uint32_t one = 0x3f800000u;  // 1.0f
     Op({kTopEw, buf, 0, 0, kEwSubFill, static_cast<uint32_t>(elems), one, 0},
-       static_cast<uint32_t>((elems + kEwTile - 1) / kEwTile));
+       static_cast<uint32_t>((elems + ew_tile_ - 1) / ew_tile_));
   }
   void Op(VmTask t, uint32_t tiles) {
     prog_.tasks.push_back(t);
@@ -1531,18 +1546,19 @@ class CalBuilder {
     prog_.entries = entries_;
     return std::move(prog_);
   }
-  static constexpr uint32_t kEwTile = 16384;  // scheduler TILE_SIZE
+  uint32_t ew_tile() const { return ew_tile_; }  // scheduler TILE_SIZE
   std::vector<int32_t>* aux() { return &prog_.aux; }
 
  private:
   VmProgram prog_;
   uint64_t arena_ = 0;
   std::vector<VmEntry> entries_;
+  uint32_t ew_tile_;
 };
 
-VmProgram BuildCalProgram(uint32_t family, uint32_t tiles) {
-  CalBuilder b;
-  const uint64_t kEw = CalBuilder::kEwTile;
+VmProgram BuildCalProgram(uint32_t family, uint32_t tiles, uint32_t ew_tile) {
+  CalBuilder b(ew_tile);
+  const uint64_t kEw = ew_tile;
   switch (family) {
     case kTopEw: {
       const uint64_t n = tiles * kEw;
@@ -1592,7 +1608,7 @@ VmProgram BuildCalProgram(uint32_t family, uint32_t tiles) {
 double TimeCalProgram(OclRuntime* rt, uint32_t family, uint32_t tiles,
                       std::string* err) {
   std::unique_ptr<LoadedProgram> lp =
-      LoadedProgram::Load(rt, BuildCalProgram(family, tiles), err);
+      LoadedProgram::Load(rt, BuildCalProgram(family, tiles, rt->ew_ts()), err);
   if (!lp) return -1.0;
   std::vector<std::vector<uint8_t>> outs;
   if (!lp->Execute({}, &outs, err)) return -1.0;  // warmup

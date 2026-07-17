@@ -173,14 +173,43 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
         if (lid == 0 && valid) AP(int, t.dst)[o] = Ai[0];
     } else {
         __global const float *a = AP(const float, t.a);
+        /* p3 = dot mode (GEMV routing, ops/dot.py): the segment is a matrix
+         * row, multiplied by the shared vector at t.b while accumulating. */
+        __global const float *bv =
+            t.p3 ? AP(const float, t.b) : (__global const float *)0;
         float acc = kind == 0 ? 0.0f : kind == 1 ? -INFINITY
                   : kind == 2 ? INFINITY : 1.0f;
+#ifdef VMO_CPU_TILES
+        /* CPU: single flat accumulate loop — PoCL 5.0's parallel-region
+         * formation asserts (region_entry_barrier != NULL) on branchier CFG
+         * shapes ahead of the tree barriers below (same class as the early-
+         * return trap above). The ternary keeps the CFG loop-shaped. */
         if (valid)
+            for (uint j = lid; j < seg; j += lsz) {
+                const float v = t.p3 ? a[base + j] * bv[j] : a[base + j];
+                acc = kind == 0 ? acc + v : kind == 1 ? fmax(acc, v)
+                    : kind == 2 ? fmin(acc, v) : acc * v;
+            }
+#else
+        if (valid) {
+            if (t.p3) {
+                uint j = lid;
+                if (!((seg & 3u) | (uint)((uintptr_t)(a + base) & 15u) |
+                      (uint)((uintptr_t)bv & 15u))) {
+                    const uint seg4 = seg >> 2;
+                    for (uint v = lid; v < seg4; v += lsz)
+                        acc += dot(vload4(v, a + base), vload4(v, bv));
+                    j = seg;
+                }
+                for (; j < seg; j += lsz) acc += a[base + j] * bv[j];
+            } else
             for (uint j = lid; j < seg; j += lsz) {
                 const float v = a[base + j];
                 acc = kind == 0 ? acc + v : kind == 1 ? fmax(acc, v)
                     : kind == 2 ? fmin(acc, v) : acc * v;
             }
+        }
+#endif
         As[lid] = acc;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint s = lsz / 2; s > 0; s >>= 1) {

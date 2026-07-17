@@ -169,6 +169,44 @@ static uint vmo_view_idx(__global const int *aux, uint off, uint i)
     return (uint)o;
 }
 
+/* float4 twins of vmo_ew_bin/un for the GPU vector fast path — every builtin
+ * used has a vector overload; SUB_SIGN spelled with select() as in the float8
+ * CPU twins. */
+static float4 vmo_ew_bin4(const uint sub, const float4 x, const float4 y)
+{
+    switch (sub) {
+    case SUB_ADD: return x + y;   case SUB_MUL: return x * y;
+    case SUB_SUB: return x - y;   case SUB_DIV: return x / y;
+    case SUB_MAX: return fmax(x, y); case SUB_MIN: return fmin(x, y);
+    case SUB_POW: return pow(x, y);
+    case SUB_ATAN2: return atan2(x, y);
+    case SUB_REMAINDER: return fmod(x, y);
+    default: return (float4)(0.0f);
+    }
+}
+static float4 vmo_ew_un4(const uint sub, const float4 x)
+{
+    switch (sub) {
+    case SUB_COPY: return x;      case SUB_NEG: return -x;
+    case SUB_EXP: return exp(x);  case SUB_LOG: return log(x);
+    case SUB_SQRT: return sqrt(x); case SUB_RSQRT: return rsqrt(x);
+    case SUB_TANH: return tanh(x); case SUB_ABS: return fabs(x);
+    case SUB_FLOOR: return floor(x); case SUB_CEIL: return ceil(x);
+    case SUB_SIGN: return select(select((float4)(1.0f), (float4)(-1.0f),
+                                        x < (float4)(0.0f)),
+                                 x, x == (float4)(0.0f) | isnan(x));
+    case SUB_LOG1P: return log1p(x);
+    case SUB_EXPM1: return expm1(x);
+    case SUB_CBRT: return cbrt(x);
+    case SUB_SIN: return sin(x);
+    case SUB_COS: return cos(x);
+    case SUB_TAN: return tan(x);
+    case SUB_RINT: return rint(x);
+    case SUB_ROUND: return round(x);
+    default: return (float4)(0.0f);
+    }
+}
+
 static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop,
                         __global const int *aux, const task_t t, uint tile,
                         uint lid, uint lsz)
@@ -223,6 +261,63 @@ static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop,
     }
     else if (sub == SUB_LTS) { if (lid == 0 && lo == 0) d[0] = (a[0] < b[0]) ? 1.0f : 0.0f; }
 #else
+    /* GPU shape: the plain stride-lsz scalar loop is LATENCY-bound — a 16K
+     * tile = 64 dependent iterations/thread ~= 15 us on Blackwell (13 GB/s
+     * per lane). float4 lanes + 2x manual unroll cut that to 8 wider, more
+     * independent memory round trips per thread. Applies when all resolved
+     * operand pointers are 16B-aligned (arena allocs and IO ports are; tile
+     * origin lo is a multiple of EW_TS); the last tile's non-multiple-of-4
+     * remainder runs the scalar tail below. Aliasing (SUB_AFFINE in-place
+     * carry) stays safe: each work item reads then writes only its own
+     * elements. */
+    const int isb = vmo_ew_is_bin(sub), isu = vmo_ew_is_un(sub);
+    const uintptr_t amask = (uintptr_t)d |
+        (sub == SUB_FILL ? (uintptr_t)0 : (uintptr_t)a) |
+        (isb ? (uintptr_t)b : (uintptr_t)0);
+    const int vec4 = (isb | isu | (sub == SUB_AFFINE) | (sub == SUB_FILL)) &&
+        !(amask & (uintptr_t)15);
+    if (vec4) {
+        __global float4 *d4 = (__global float4 *)d;
+        __global const float4 *a4 = (__global const float4 *)a;
+        __global const float4 *b4 = (__global const float4 *)b;
+        const uint lo4 = lo >> 2, hi4 = lo4 + ((hi - lo) >> 2);
+        uint i = lo4 + lid;
+        if (isb) {
+            for (; i + lsz < hi4; i += 2u * lsz) {
+                const float4 x0 = a4[i], y0 = b4[i];
+                const float4 x1 = a4[i + lsz], y1 = b4[i + lsz];
+                d4[i] = vmo_ew_bin4(sub, x0, y0);
+                d4[i + lsz] = vmo_ew_bin4(sub, x1, y1);
+            }
+            if (i < hi4) d4[i] = vmo_ew_bin4(sub, a4[i], b4[i]);
+        } else if (isu) {
+            for (; i + lsz < hi4; i += 2u * lsz) {
+                const float4 x0 = a4[i], x1 = a4[i + lsz];
+                d4[i] = vmo_ew_un4(sub, x0);
+                d4[i + lsz] = vmo_ew_un4(sub, x1);
+            }
+            if (i < hi4) d4[i] = vmo_ew_un4(sub, a4[i]);
+        } else if (sub == SUB_AFFINE) {
+            const float4 s4 = (float4)(as_float(t.p2));
+            const float4 t4 = (float4)(as_float(t.p3));
+            for (; i + lsz < hi4; i += 2u * lsz) {
+                const float4 x0 = a4[i], x1 = a4[i + lsz];
+                d4[i] = mad(x0, s4, t4);
+                d4[i + lsz] = mad(x1, s4, t4);
+            }
+            if (i < hi4) d4[i] = mad(a4[i], s4, t4);
+        } else { /* SUB_FILL */
+            const float4 v4 = (float4)(as_float(t.p2));
+            for (; i < hi4; i += lsz) d4[i] = v4;
+        }
+        /* scalar tail: elements past the last full float4 of this tile */
+        for (uint j = lo + ((hi - lo) & ~3u) + lid; j < hi; j += lsz)
+            d[j] = isb ? vmo_ew_bin(sub, a[j], b[j])
+                 : isu ? vmo_ew_un(sub, a[j])
+                 : sub == SUB_AFFINE ? mad(a[j], as_float(t.p2), as_float(t.p3))
+                 : as_float(t.p2);
+        return;
+    }
     if (vmo_ew_is_bin(sub))
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = vmo_ew_bin(sub, a[i], b[i]);
     else if (vmo_ew_is_un(sub))

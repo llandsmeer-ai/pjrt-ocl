@@ -152,6 +152,9 @@ class OclRuntime {
   // failed. PJRT_OCL_CALIBRATE=1 forces re-measurement past the cache.
   const std::string& cost_table_path() const { return cost_table_path_; }
   cl_uint ngroups() const { return ngroups_; }
+  // EW tile size (elements): compiled into the kernels (-DEW_TS) and
+  // advertised to the python scheduler (PJRT_OCL_EW_TS); the two MUST agree.
+  cl_uint ew_ts() const { return ew_ts_; }
   size_t local_size() const { return local_size_; }
   // Host-dispatch engine: the host drives control flow and enforces the
   // cross-workgroup barrier via clFinish between per-phase launches (no
@@ -219,6 +222,7 @@ class OclRuntime {
   std::string cost_table_path_;        // measured cost JSON ("" = unit costs)
   cl_mem dummy_buf_ = nullptr;         // placeholder for unused I/O ports
   cl_uint ngroups_ = 0;    // co-resident workgroups (GPUs: measured, poc/08)
+  cl_uint ew_ts_ = 16384;  // EW tile elements (GPU: 4096; see ew_ts())
   size_t local_size_ = 64;
   bool host_dispatch_ = false;
   std::mutex mu_;  // serializes execute (single in-order queue)

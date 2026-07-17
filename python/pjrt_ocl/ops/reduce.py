@@ -303,12 +303,16 @@ def _reduce_np_axis(arr, kind):
 
 
 def _redseg_sim(task, entry, rt):
-    # one segment per tile: entry covers segments [tile_lo, tile_hi)
+    # one segment per tile: entry covers segments [tile_lo, tile_hi).
+    # p3=1 is dot mode (GEMV routing, ops/dot.py): each segment is a matrix
+    # row multiplied elementwise by the shared vector at task.b while reducing.
     n_out, seg, kind = task.p0, task.p1, task.p2
     src = rt.view(task.a)
     out = rt.view(task.dst)
+    vec = rt.view(task.b)[:seg] if task.p3 else None
     for o in range(entry.tile_lo, min(entry.tile_hi, n_out)):
-        out[o] = _reduce_np(src[o * seg:(o + 1) * seg], kind)
+        row = src[o * seg:(o + 1) * seg]
+        out[o] = (row * vec).sum() if task.p3 else _reduce_np(row, kind)
 
 
 opsem.register(L.OP_REDUCE_SEG, to_task=_redseg_to_task, interp=_redseg_interp,

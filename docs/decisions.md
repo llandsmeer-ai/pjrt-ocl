@@ -1246,3 +1246,44 @@ Measured with the rework (NVIDIA, 2026-07-17): run-to-run deviation of ours-colu
 
 Chaining is also what surfaced the §20 dynslice bug — repetition-within-program is a better
 correctness probe than one-shot calls; keep using it.
+
+## 22. Per-tile execution was latency-bound, not dispatch-bound (2026-07-17, chained-bench fallout)
+
+The §21 noise-reduced bench showed severe flat gaps vs CUDA: EW add/mul ~15 µs/op for ANY
+N in 16K..2M (CUDA flat ~3.3 µs), gather ~30 µs, matvec 27-46x, while-loop 2.6x above 512K.
+Diagnosis (probe: per-op time scales with per-thread loop trip count, not N): the megakernel's
+per-INSTRUCTION cost was fine (~3-5 µs at 1 tile — near CUDA's launch floor), but one EW tile =
+one workgroup running a scalar stride-256 loop → 64 dependent global-memory round trips per
+thread (~230 ns each ≈ 15 µs, 13 GB/s per lane), and TILE_SIZE=16384 caps an op's parallelism
+at N/16K workgroups — a 2M-element op used 128 of 376 lanes; mid-size ops used a handful.
+Bytecode dispatch itself was NOT the problem — don't optimize the interpreter loop for this.
+
+Fixes (all shipped, all portable core-OpenCL):
+1. **f32 EW vector fast path** (ew.cl): float4 lanes + 2x manual unroll (8 independent wide
+   round trips instead of 64 serial scalar ones) for bin/un/affine/fill when all operand
+   pointers are 16B-aligned; scalar tail covers the last tile. GPU-only (#else of
+   VMO_CPU_TILES); the CPU float8 chunk path is untouched. add 16K..262K: 15.1 → 3.1 µs
+   (CUDA 3.3); while-loop 1M: 466 → 141 µs — now BEATS CUDA (181, launch-bound) at every N.
+2. **Device-tuned EW tile size**: EW_TS is now a -D at program build chosen in runtime.cc
+   (GPU 4096, CPU 16384) and advertised to the scheduler via PJRT_OCL_EW_TS (plugin.cc env,
+   scheduler.TILE_SIZE reads it) — kernel and host tiling MUST agree; CalBuilder takes it as a
+   parameter. 4x lane parallelism at equal work; PoCL keeps 16384 (~300 µs/tile host overhead
+   makes more tiles pure loss there).
+3. **dynamic_slice/update contiguous GPU fast path** (dynslice.cl): the generic body pays a
+   ~20-cycle serial div/mod chain PER ELEMENT even for rank-1 stride-1 slices; added the
+   4-wide 2x-unrolled copy twin of the existing CPU float8 path (vloadn tolerates the
+   runtime-odd base). Static gather.cl got the same rank-1 fast path. gather bench 29 → 12-16 µs;
+   the remaining 3x vs CUDA is the per-link scalar-index chain (tiny ops + barrier phases) —
+   that is survey R1/R2 (scoreboard/fusion) territory, not tile code.
+4. **GEMV routing** (ops/dot.py _dot_to_task): dot_general with N==1, G==1, no folded views
+   now emits TILE_RED_SEG in dot mode (p3=1, vector operand in t.b; out[o] = dot(row o, x))
+   instead of TILE_MMA — the 64x64 MMA tile wasted 63/64 of its work at N=1 and serialized
+   the K loop. One row per tile, whole-workgroup coalesced loads (float4 + dot() on GPU),
+   M-way parallel. matvec 1024: 101 → 8.2 µs (12x; CUDA 3.7). CPU keeps a FLAT single-loop
+   accumulate body: the branchier vectorized CFG re-triggered the §18 PoCL 5.0
+   region_entry_barrier assert — dot mode folds into the existing loop via ternary there.
+
+Verified: 252/252 pytest on NVIDIA AND PoCL; chained bench + transformer rerun (see README).
+Residual gaps after this: matmul tile ceiling (survey R3), small-op/barrier-chain overhead
+(survey R1/R2). EW at 2M sits ~2x off CUDA's L2-resident chain speed (7.7 vs 3.5 µs) — a
+deeper unroll may close some; diminishing returns vs R2 fusion.

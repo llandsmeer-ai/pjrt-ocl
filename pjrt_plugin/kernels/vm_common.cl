@@ -22,7 +22,15 @@
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #endif
 
+/* EW tile size (elements). Overridden per device via -DEW_TS at program build
+ * (runtime.cc chooses it; the python scheduler reads the same value from
+ * PJRT_OCL_EW_TS so host tiling and kernel tile->range mapping agree). GPUs
+ * use a smaller tile: a 16K tile is one workgroup's serial latency chain, so
+ * ops < ~lanes*EW_TS elements leave most lanes idle and each lane
+ * latency-bound (measured flat 15 us/op for any N in 16K..2M on Blackwell). */
+#ifndef EW_TS
 #define EW_TS 16384u
+#endif
 
 /* Buffer addressing. A buffer's 32-bit `base` is EITHER an arena byte offset
  * (intermediates, consts) OR — with bit 31 set — an I/O PORT: the low bits index
