@@ -1399,9 +1399,14 @@ measured ~2.3× off CUDA at base sizes. Two ways to fix, both LOGGED for later:
 **Decision: don't hand-write OP_GELU yet** — let the general region-op (§23, being implemented) subsume
 it; only add a dedicated OP_GELU if the general mechanism stalls or gelu needs to ship sooner.
 
-## 24. Fused map-region tile-op — DESIGN + PoC gate (2026-07-19, poc/13)
+## 24. Fused map-region tile-op — DESIGN + PoC gate → SPECCED, NOT BUILT (2026-07-19, poc/13)
 
-Implements §23 / ideas-for-v2 Idea A: a **fused map-region tile-op** that keeps a run of
+**Outcome up front:** the PoC gate (poc/13) says GO-but-size-dependent, and the megakernel
+integration analysis says the *general interpreted* region-op is the wrong near-term lever — ship
+dedicated fused opcodes (OP_GELU) instead, and defer the general op to the R3 VM-split. Design +
+evidence below; "Integration findings" at the end is the decision.
+
+Specs §23 / ideas-for-v2 Idea A: a **fused map-region tile-op** that keeps a run of
 pure-map ops' intermediates ON-CHIP (one global load per region input + one store per output)
 instead of round-tripping every EW intermediate through the arena. This is the memory-traffic
 lever §11 chain fusion left on the table (it killed the barrier, not the round-trips).
@@ -1477,3 +1482,49 @@ untouched. `PJRT_OCL_FUSE_REGION=0` reverts. Multi-output regions (residual fork
 
 **Validators.** vmreader numpy interp (execute the micro sub-list over ndarrays) + the schedule-sim,
 per the §19 dual-validator net; add region tests (fires / FUSE_REGION=0 fallback / n_slots>8 fallback).
+
+### Integration findings — STOP on the general op, ship dedicated fused ops instead (2026-07-19)
+
+Designing the megakernel integration surfaced two things the standalone PoC (full occupancy, no VM
+dispatch) hides, and they flip the near-term decision. **The general interpreted region-op is NOT
+built; hard gate stays a design.** Reasons, measured:
+
+1. **At base size the interpreted region is only 1.3×, but a DEDICATED fused op is ~4×.** The PoC's
+   `gelu_hard` (hardcoded, fully inlined, float4 — i.e. a §19-style dedicated `OP_GELU`) hit
+   **0.0036 ms @base vs the chain's 0.0149 (4.1×)**, where the *interpreted* region managed only
+   1.3× (its per-op dispatch + runtime-slot indexing eats the round-trip saving at L2-resident
+   sizes). So for the base regime, **dedicated fused opcodes beat the general interpreter** — which
+   INVERTS §19b's "let the general region-op subsume OP_GELU": at base sizes the interpreter's
+   overhead is the very thing that makes the general op lose to the one-off. The general op's value
+   is *generality* + the *HBM-bound 3×*, not base-size speed.
+2. **Megakernel integration has an occupancy/register-pressure cost that regresses ALL ops.** A
+   float4 local-staging region scratch (8 slots × 256 lanes × 16 B = 32 KB SLM) blows the local
+   budget — and §10c already measured the TF32 megakernel sitting *exactly at* the 376-lane
+   residency boundary (MMA_ASZ/BSZ ≈ 10 KB each), so ANY added SLM pushes residency below the cap
+   and shrinks every other op's lane count. The register-switch variant (region_reg4, zero SLM,
+   fastest on NVIDIA at large N) sidesteps SLM but adds ~32 vector registers to the *shared*
+   translation unit → raises the whole megakernel's register count → same occupancy hit by a
+   different door (CLAUDE.md's "watch register pressure as the op library grows; split the VM by op
+   family"). Either way the monolithic-megakernel integration is **entangled with the R3 "split VM
+   by op family" architecture** (megakernel-survey) — a much bigger, riskier change than the
+   standalone PoC implies. Local staging is only free of this on the **host-dispatch (CPU) engine**
+   (no spin-barrier, no co-residency) — where the PoC already shows local > registers (2.85×).
+
+**Decision (this session): do NOT ship the general interpreted region-op now.** Per §14a
+("don't build the general mechanism on a false premise") and CLAUDE.md's measure-don't-assume /
+correctness-first rules, the PoC gate did its job — it revealed that at the *target* (base) regime
+the general op wins only 1.3× AND carries a broad-occupancy-regression risk, while the cheaper,
+lower-risk lever (dedicated fused opcodes, §19/§19b recipe) wins ~4× at base with near-zero risk.
+
+**Recommended sequence instead:**
+- **Near-term (low-risk, base-regime): dedicated fused opcodes for the hot map-idioms** — `OP_GELU`
+  first (§19b, exactly the PoC's `gelu_hard` as one EW-unary case + a recognizer), then any other
+  measured idiom. One extra dispatch case each, no SLM, negligible register cost, ~4× on its
+  component at base. This is the §19 methodology, now PoC-justified over the general op for base.
+- **Later (the general interpreted region-op): pursue together with R3 (split the megakernel by op
+  family)** so the region interpreter gets its own kernel + register/SLM budget without taxing the
+  EW/MMA path, and target it at the **HBM-bound / `large`** regime where the PoC shows 3×+. On the
+  **CPU host-dispatch engine** it can use local staging and land sooner (no co-residency bind).
+
+poc/13 + this section are the decision basis; the recognizer/region-op/VM-loop remain specced-but-
+unbuilt above for when R3 makes the integration cheap.
