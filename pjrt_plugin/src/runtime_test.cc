@@ -129,8 +129,13 @@ int main() {
   int fails = 0;
 
   {  // ---- A: c = (a+b)*a, 4 lanes, 2 levels ----
-    const uint32_t N = 1 << 16, LANES = 4;
-    const uint32_t TILES = (N + 16383) / 16384;  // 4
+    // Size N to exactly LANES tiles at the device's ACTUAL EW tile size
+    // (GPU 4096, CPU 16384 since decisions.md §22) — one tile per lane. A
+    // hardcoded 16384 here left 3/4 of N uncovered on GPUs (EW_TS=4096).
+    const uint32_t LANES = 4;
+    const uint32_t EW_TS = rt->ew_ts();
+    const uint32_t N = LANES * EW_TS;
+    const uint32_t TILES = LANES;
     Builder b(LANES);
     uint32_t ba = b.buf(N), bb = b.buf(N), bt = b.buf(N), bc = b.buf(N);
     b.inputs = {ba, bb};
@@ -160,7 +165,9 @@ int main() {
   }
 
   {  // ---- B: while (i < 10) { x += x; i += 1 } on 2 lanes ----
-    const uint32_t N = 1 << 15, LANES = 2;  // 2 tiles
+    // N = LANES tiles at the device's actual EW tile size (see block A).
+    const uint32_t LANES = 2;
+    const uint32_t N = LANES * rt->ew_ts();  // 2 tiles, one per lane
     Builder b(LANES);
     uint32_t bx = b.buf(N), bi = b.buf(1), bk = b.buf(1), bone = b.buf(1),
              bcond = b.buf(1);
