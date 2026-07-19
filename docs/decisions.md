@@ -1399,6 +1399,135 @@ measured ~2.3× off CUDA at base sizes. Two ways to fix, both LOGGED for later:
 **Decision: don't hand-write OP_GELU yet** — let the general region-op (§23, being implemented) subsume
 it; only add a dedicated OP_GELU if the general mechanism stalls or gelu needs to ship sooner.
 
+## 24. Fused map-region tile-op — DESIGN + PoC gate → SPECCED, NOT BUILT (2026-07-19, poc/14)
+
+**Outcome up front:** the PoC gate (poc/14) says GO-but-size-dependent, and the megakernel
+integration analysis says the *general interpreted* region-op is the wrong near-term lever — ship
+dedicated fused opcodes (OP_GELU) instead, and defer the general op to the R3 VM-split. Design +
+evidence below; "Integration findings" at the end is the decision.
+
+Specs §23 / ideas-for-v2 Idea A: a **fused map-region tile-op** that keeps a run of
+pure-map ops' intermediates ON-CHIP (one global load per region input + one store per output)
+instead of round-tripping every EW intermediate through the arena. This is the memory-traffic
+lever §11 chain fusion left on the table (it killed the barrier, not the round-trips).
+
+### PoC gate (poc/14-map-region) — GO, size-dependent
+
+Hand-emitted the GELU tail (tanh approx, **9 pure-map micro-ops reusing x 4× — a real DAG**) as a
+single region interpreted over on-chip scratch, vs the faithful "today" path (9 **vectorized**
+float4 EW passes in ONE launch = §11 chain, round-tripping each plane through global). Same
+micro-op program, numerically identical (maxerr 2.95e-7, pure f32). Fair delta =
+float4-vectorized fused region vs vectorized 1-launch chain:
+
+| n (f32)        | regime            | NVIDIA fused speedup | note |
+|----------------|-------------------|----------------------|------|
+| 262 144 (1 MiB)| overhead-bound    | ~1.0× (wash)         | too small; dispatch-bound |
+| 1 048 576 (4 MiB) = **base FFN GELU** | **L2-resident** | **1.3×** | 4 MiB fits the 128 MB L2 |
+| 16 777 216 (64 MiB) | HBM-bound    | **3.1–3.5×**         | round-trips now hit HBM |
+| 67 108 864 (256 MiB)| HBM-bound    | **3.2×**             | reg variant ≈ hardcoded gelu ceiling |
+
+PoCL CPU @1 MiB: **2.85×** (round-trips bite even at base size — cache pressure).
+
+**Four findings that shape the design:**
+1. **GO, but the base-size win is modest (1.3×) because base is L2-resident on this GPU; the
+   dramatic 3×+ is HBM-bound.** The microbench also UNDERSTATES the real win — it has zero VM
+   per-instruction dispatch overhead, whereas the real megakernel pays bytecode-dispatch +
+   grid-stride setup for EACH of the 9 EW ops (§22: ~3–5 µs/instr); collapsing 9→1 banks that too.
+   So the end-to-end base-transformer gain will be real but single-digit-% on the EW component;
+   the big payoff is larger/HBM-bound workloads (`large`, big batch) and the phase/instr-count drop.
+   Per §14a: keep only if it moves the needle end-to-end — MEASURE on the real model before ON-by-default.
+2. **Vectorization is load-bearing.** The *scalar* interpreter is a wash even vs the multi-launch
+   chain (dispatch-bound). The region tile-op's inner loop MUST be float4-vectorized (float4 scratch
+   slots, 4 elems/iter) — that alone turns the wash into the win.
+3. **Local-staging is the portable default (step 1).** Switch-addressed registers (step 2) slightly
+   edge local on NVIDIA at large N but LOSE on PoCL CPU (switch dispatch is costly there); `__local`
+   wins or ties everywhere and is simpler. Registers are a per-device tuning, not needed to bank it.
+4. **Interpreter ceiling is adequate** — reg variant reaches hardcoded-gelu speed at 256 MiB. The
+   bottleneck is memory traffic, not interpretation. No JIT / device-compile needed.
+
+### Design (as specced; single-output v1)
+
+**Opcode.** `OP_MAP_REGION` (56) in lowering; `TILE_MAP_REGION` (13) in scheduler/kernel. The
+region is variable-length ⇒ its descriptor lives in the **aux pool** (Instr.aux word offset); the
+32-B Instr carries `dst` (region output buf), `n` (element count → n_tiles), `aux` (descriptor off).
+Input buffer ids ride in `Instr.reads_hint` (non-serialized) so the scheduler's dep analysis sees
+them without parsing aux (precedent: dynamic_slice start scalars, §20).
+
+**Aux descriptor layout** (u32 words):
+```
+[0]=n_inputs  [1]=n_micro  [2]=n_slots
+n_inputs × { buf_id, view_aux_off(+1; 0=direct), dst_slot }   # prologue loads (view = §13 access-map)
+n_micro  × { kind, dst_slot, a_slot, b_slot, s_bits, t_bits } # straight-line SSA sub-block
+[last]   = out_slot                                            # epilogue store → Instr.dst
+```
+Operands INSIDE the region reference **scratch slots**, not arena ids (the §23 reason a per-opcode
+"chain flag" can't work — real regions are DAGs, GELU reuses x 4× / binary ops need 2 live inputs).
+`kind` = the vmo_ew micro-op (MUL/ADD/SUB/DIV/…/AFFINE a*s+t/TANH/EXP/…). n_slots bounds region
+width; gate `n_slots ≤ 8` (register-file bound, PoC-validated) + n_inputs small.
+
+**Kernel** `vmo_map_region` (new ops/region.cl): float4-vectorized grid-stride tile loop; per
+float4 index — load each region input into its slot (`R[slot][lid]`, applying the §13 view address
+for broadcast/transpose leaves), interpret the micro sub-list over `__local float4 R[NSLOTS][WG]`,
+store `R[out_slot]` to `Instr.dst`. **No cross-workgroup barrier** (pure map — element i independent),
+so §18/§19a PoCL barrier rules DON'T bite here (no barrier at all); works on host-dispatch engine
+unchanged. On-chip scratch = NSLOTS×WG×16 B (8×256×16 = 32 KB local) — sits within occupancy for the
+spin-barrier (§10c): measure residency, shrink WG/NSLOTS if it drops below the barrier's need.
+
+**Recognizer** `_fuse_region` (lowering, after `_fuse_views`/`_fuse_norm`, before `_reuse_arena`):
+find maximal connected runs of viewable-f32-EW instrs (the §11 chain set) with a SINGLE
+externally-live output; encode the micro-program (topo order = SSA order), map leaves→input slots
+(carrying any folded view aux-off), NOP the members, emit one OP_MAP_REGION. **Gated HARD** (all-f32,
+n_slots≤8, single output, no cmp/select/convert/fill/dynamic index); any mismatch → decomposed path
+untouched. `PJRT_OCL_FUSE_REGION=0` reverts. Multi-output regions (residual forks) = a future step.
+
+**Validators.** vmreader numpy interp (execute the micro sub-list over ndarrays) + the schedule-sim,
+per the §19 dual-validator net; add region tests (fires / FUSE_REGION=0 fallback / n_slots>8 fallback).
+
+### Integration findings — STOP on the general op, ship dedicated fused ops instead (2026-07-19)
+
+Designing the megakernel integration surfaced two things the standalone PoC (full occupancy, no VM
+dispatch) hides, and they flip the near-term decision. **The general interpreted region-op is NOT
+built; hard gate stays a design.** Reasons, measured:
+
+1. **At base size the interpreted region is only 1.3×, but a DEDICATED fused op is ~4×.** The PoC's
+   `gelu_hard` (hardcoded, fully inlined, float4 — i.e. a §19-style dedicated `OP_GELU`) hit
+   **0.0036 ms @base vs the chain's 0.0149 (4.1×)**, where the *interpreted* region managed only
+   1.3× (its per-op dispatch + runtime-slot indexing eats the round-trip saving at L2-resident
+   sizes). So for the base regime, **dedicated fused opcodes beat the general interpreter** — which
+   INVERTS §19b's "let the general region-op subsume OP_GELU": at base sizes the interpreter's
+   overhead is the very thing that makes the general op lose to the one-off. The general op's value
+   is *generality* + the *HBM-bound 3×*, not base-size speed.
+2. **Megakernel integration has an occupancy/register-pressure cost that regresses ALL ops.** A
+   float4 local-staging region scratch (8 slots × 256 lanes × 16 B = 32 KB SLM) blows the local
+   budget — and §10c already measured the TF32 megakernel sitting *exactly at* the 376-lane
+   residency boundary (MMA_ASZ/BSZ ≈ 10 KB each), so ANY added SLM pushes residency below the cap
+   and shrinks every other op's lane count. The register-switch variant (region_reg4, zero SLM,
+   fastest on NVIDIA at large N) sidesteps SLM but adds ~32 vector registers to the *shared*
+   translation unit → raises the whole megakernel's register count → same occupancy hit by a
+   different door (CLAUDE.md's "watch register pressure as the op library grows; split the VM by op
+   family"). Either way the monolithic-megakernel integration is **entangled with the R3 "split VM
+   by op family" architecture** (megakernel-survey) — a much bigger, riskier change than the
+   standalone PoC implies. Local staging is only free of this on the **host-dispatch (CPU) engine**
+   (no spin-barrier, no co-residency) — where the PoC already shows local > registers (2.85×).
+
+**Decision (this session): do NOT ship the general interpreted region-op now.** Per §14a
+("don't build the general mechanism on a false premise") and CLAUDE.md's measure-don't-assume /
+correctness-first rules, the PoC gate did its job — it revealed that at the *target* (base) regime
+the general op wins only 1.3× AND carries a broad-occupancy-regression risk, while the cheaper,
+lower-risk lever (dedicated fused opcodes, §19/§19b recipe) wins ~4× at base with near-zero risk.
+
+**Recommended sequence instead:**
+- **Near-term (low-risk, base-regime): dedicated fused opcodes for the hot map-idioms** — `OP_GELU`
+  first (§19b, exactly the PoC's `gelu_hard` as one EW-unary case + a recognizer), then any other
+  measured idiom. One extra dispatch case each, no SLM, negligible register cost, ~4× on its
+  component at base. This is the §19 methodology, now PoC-justified over the general op for base.
+- **Later (the general interpreted region-op): pursue together with R3 (split the megakernel by op
+  family)** so the region interpreter gets its own kernel + register/SLM budget without taxing the
+  EW/MMA path, and target it at the **HBM-bound / `large`** regime where the PoC shows 3×+. On the
+  **CPU host-dispatch engine** it can use local staging and land sooner (no co-residency bind).
+
+poc/14 + this section are the decision basis; the recognizer/region-op/VM-loop remain specced-but-
+unbuilt above for when R3 makes the integration cheap.
 ## 25. Async / prefetched DRAM loads to hide tile latency — EXPLORED (2026-07-19, poc/13)
 
 §22 diagnosed per-tile execution as latency-bound (a tile = one workgroup grid-striding a loop of
