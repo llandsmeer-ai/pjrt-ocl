@@ -1398,3 +1398,63 @@ measured ~2.3× off CUDA at base sizes. Two ways to fix, both LOGGED for later:
 
 **Decision: don't hand-write OP_GELU yet** — let the general region-op (§23, being implemented) subsume
 it; only add a dedicated OP_GELU if the general mechanism stalls or gelu needs to ship sooner.
+
+## 25. Async / prefetched DRAM loads to hide tile latency — EXPLORED (2026-07-19, poc/13)
+
+§22 diagnosed per-tile execution as latency-bound (a tile = one workgroup grid-striding a loop of
+dependent global round-trips). The textbook fix is async/prefetched loads: issue tile N+1's loads
+while computing tile N. poc/13 tests this measure-first on the two representative loop shapes, three
+variants each, on NVIDIA + PoCL. All variants bit-exact (`maxerr=0`). Verdict: **a verified
+near-negative — register double-buffering is a small real lever, `async_work_group_copy` is a
+portability trap; do NOT add async to the VM.**
+
+**Loops:** (A) streaming EW `d=a*s+t` (§22 headline, no reuse); (B) matmul K-loop global→local stage
+(64×64 tile, BK=16, 256 lanes, 4×4 microtile — mirrors the shipped `vmo_mma_tile`, 8 KB As/Bs).
+**Variants:** (a) baseline direct loads; (b) manual double-buffer = prefetch next tile's globals into
+**registers** while computing current; (c) `async_work_group_copy` into `__local` + `wait_group_events`.
+Persistent-grid faithful (grid = 2·CU, grid-stride). EW GB/s are L2-resident (buffers ≤64 MB reused
+across reps) → read as a *relative* ranking, not HBM bandwidth.
+
+**NVIDIA RTX PRO 6000 Blackwell (188 CU, grid 376):**
+- EW (GB/s): scalar → **reg-DB** → async. 256K 203→**256**→184; 1M 799→**925**→699;
+  4M 2061→**2544**→1570; 16M 3212→**4641**→2321. reg-DB is **1.25–1.45×**; async is a **~30 % loss**.
+- MMA (GFLOP/s), single / reg-DB / async: 512³ 1601/**1831**/249; 1024³ 3676/**3874**/896;
+  2048³ 4954/**5226**/1197. reg-DB is a consistent **5–14 %**; **async is 4–15× SLOWER**.
+- Occupancy (poc/08 handshake): 8 KB and 16 KB `__local` BOTH → 752 co-resident groups (≫ 376 cap).
+  Local footprint isn't the binding constraint; and the winning reg-DB uses **no extra local** (regs
+  are the 2nd buffer) — only ~8 extra registers.
+
+**PoCL (Ryzen 3900X CPU, 24 CU, cap 48):** async is the *opposite* — fastest for EW (lowers to
+`memcpy`: 1M 10.5→30.9 GB/s, 4M 14.1→26.5), a wash/slight-loss for MMA (10–20 % slower). Occupancy
+24 groups at both footprints (512 KB local).
+
+**What worked / no-op'd / regressed:**
+- `async_work_group_copy`: **device-polar.** NVIDIA's OpenCL runtime has no async DMA engine — it
+  emulates the copy serially, so the chained per-row/col staging (TM+TN=128 calls) collapses matmul to
+  0.25 TFLOP/s. PoCL lowers it to `memcpy` and wins. A core-path feature that is 15× faster on one
+  device and 15× slower on another is **unusable portably** (violates the "no vendor-poison in core"
+  rule, like the §9 `2×CU` heuristic and §18 barrier placement).
+- Register double-buffering: the real lever. For EW it IS **already shipped** — the §22 float4+2×-unroll
+  fast path is exactly register-level prefetch (8 in-flight loads); nothing more to do for streaming.
+  For the MMA K-loop a reg-prefetch double-buffer is a genuine but modest 5–14 %.
+- `prefetch()` builtin: not separately benchmarked — it's a hint the NVIDIA ICD ignores and PoCL treats
+  as a no-op; the reg-DB variant already realizes the same "loads in flight early" effect explicitly.
+
+**Occupancy/§10c note:** doubling `__local` 8→16 KB did NOT drop co-residency below the 376 cap here,
+so a *local*-based double buffer would be affordable on this GPU — but the better design (reg-DB) needs
+no local at all. The caveat that matters at integration: §10c's TF32 `vmo_mma_tile` already sits AT the
+376 boundary, so adding rA/rB registers there could tip it — must re-measure on the real kernel.
+
+**Recommendation (for later integration, not now):**
+1. **Do not add `async_work_group_copy` / async staging to the VM.** Verified regression on NVIDIA.
+2. EW async lever is **already banked** (§22 float4 path). No action.
+3. The MMA K-loop reg-prefetch double-buffer (5–14 %, no local cost) is the only new candidate. Fold it
+   into `vmo_mma_tile` **only on the portable non-TF32 path**, and only after re-checking register
+   pressure against the §10c 376-lane boundary. It is not a headline: §14b shows base is overhead-bound,
+   not matmul-bound, so 5–14 % on matmul ≈ ~1.05× on compute-bound `large`, negligible on `base`.
+4. It **composes with the §23 region-op**: "async-load the region's inputs" is the same reg-prefetch
+   idea (load region inputs into registers once, compute the sub-list, store once) — so the register
+   double-buffer belongs *inside* the region-op work, not as a standalone async mechanism.
+
+**Verified:** poc/13 builds (`make`) and runs clean on NVIDIA + PoCL; all 3×(4 EW + 5 MMA) variants
+bit-exact vs host/baseline (`maxerr=0`). Data: `poc/13-async-prefetch/results_{nvidia,pocl}.csv`.

@@ -1,0 +1,30 @@
+kind,variant,size,ms,throughput,maxerr,cmp
+ew,scalar,262144,0.2221,9.4,0.00e+00
+ew,regdb,262144,0.1367,15.3,0.00e+00
+ew,async,262144,0.1365,15.4,0.00e+00
+ew,scalar,1048576,0.7958,10.5,0.00e+00
+ew,regdb,1048576,0.6579,12.8,0.00e+00
+ew,async,1048576,0.2715,30.9,0.00e+00
+ew,scalar,4194304,2.3862,14.1,0.00e+00
+ew,regdb,4194304,1.9714,17.0,0.00e+00
+ew,async,4194304,1.2685,26.5,0.00e+00
+ew,scalar,16777216,17.7842,7.5,0.00e+00
+ew,regdb,16777216,17.7012,7.6,0.00e+00
+ew,async,16777216,14.6943,9.1,0.00e+00
+mma,single,512x512x512,23.9899,11.2,0.00e+00,vs-host
+mma,double,512x512x512,32.1424,8.4,0.00e+00,vs-host
+mma,async,512x512x512,33.1007,8.1,0.00e+00,vs-host
+mma,single,512x2048x512,95.9208,11.2,0.00e+00,vs-host
+mma,double,512x2048x512,93.4171,11.5,0.00e+00,vs-host
+mma,async,512x2048x512,116.0933,9.2,0.00e+00,vs-host
+mma,single,1024x1024x1024,179.7993,11.9,0.00e+00,base
+mma,double,1024x1024x1024,192.4525,11.2,0.00e+00,vs-single
+mma,async,1024x1024x1024,232.1001,9.3,0.00e+00,vs-single
+mma,single,512x512x2048,105.7906,10.1,0.00e+00,vs-host
+mma,double,512x512x2048,102.0113,10.5,0.00e+00,vs-host
+mma,async,512x512x2048,130.2642,8.2,0.00e+00,vs-host
+mma,single,2048x2048x2048,1437.1258,12.0,0.00e+00,base
+mma,double,2048x2048x2048,1485.7308,11.6,0.00e+00,vs-single
+mma,async,2048x2048x2048,1827.9092,9.4,0.00e+00,vs-single
+occ,8KB,-, -,24,-,-
+occ,16KB,-, -,24,-,-
