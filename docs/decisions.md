@@ -1398,3 +1398,82 @@ measured ~2.3× off CUDA at base sizes. Two ways to fix, both LOGGED for later:
 
 **Decision: don't hand-write OP_GELU yet** — let the general region-op (§23, being implemented) subsume
 it; only add a dedicated OP_GELU if the general mechanism stalls or gelu needs to ship sooner.
+
+## 24. Fused map-region tile-op — DESIGN + PoC gate (2026-07-19, poc/13)
+
+Implements §23 / ideas-for-v2 Idea A: a **fused map-region tile-op** that keeps a run of
+pure-map ops' intermediates ON-CHIP (one global load per region input + one store per output)
+instead of round-tripping every EW intermediate through the arena. This is the memory-traffic
+lever §11 chain fusion left on the table (it killed the barrier, not the round-trips).
+
+### PoC gate (poc/13-map-region) — GO, size-dependent
+
+Hand-emitted the GELU tail (tanh approx, **9 pure-map micro-ops reusing x 4× — a real DAG**) as a
+single region interpreted over on-chip scratch, vs the faithful "today" path (9 **vectorized**
+float4 EW passes in ONE launch = §11 chain, round-tripping each plane through global). Same
+micro-op program, numerically identical (maxerr 2.95e-7, pure f32). Fair delta =
+float4-vectorized fused region vs vectorized 1-launch chain:
+
+| n (f32)        | regime            | NVIDIA fused speedup | note |
+|----------------|-------------------|----------------------|------|
+| 262 144 (1 MiB)| overhead-bound    | ~1.0× (wash)         | too small; dispatch-bound |
+| 1 048 576 (4 MiB) = **base FFN GELU** | **L2-resident** | **1.3×** | 4 MiB fits the 128 MB L2 |
+| 16 777 216 (64 MiB) | HBM-bound    | **3.1–3.5×**         | round-trips now hit HBM |
+| 67 108 864 (256 MiB)| HBM-bound    | **3.2×**             | reg variant ≈ hardcoded gelu ceiling |
+
+PoCL CPU @1 MiB: **2.85×** (round-trips bite even at base size — cache pressure).
+
+**Four findings that shape the design:**
+1. **GO, but the base-size win is modest (1.3×) because base is L2-resident on this GPU; the
+   dramatic 3×+ is HBM-bound.** The microbench also UNDERSTATES the real win — it has zero VM
+   per-instruction dispatch overhead, whereas the real megakernel pays bytecode-dispatch +
+   grid-stride setup for EACH of the 9 EW ops (§22: ~3–5 µs/instr); collapsing 9→1 banks that too.
+   So the end-to-end base-transformer gain will be real but single-digit-% on the EW component;
+   the big payoff is larger/HBM-bound workloads (`large`, big batch) and the phase/instr-count drop.
+   Per §14a: keep only if it moves the needle end-to-end — MEASURE on the real model before ON-by-default.
+2. **Vectorization is load-bearing.** The *scalar* interpreter is a wash even vs the multi-launch
+   chain (dispatch-bound). The region tile-op's inner loop MUST be float4-vectorized (float4 scratch
+   slots, 4 elems/iter) — that alone turns the wash into the win.
+3. **Local-staging is the portable default (step 1).** Switch-addressed registers (step 2) slightly
+   edge local on NVIDIA at large N but LOSE on PoCL CPU (switch dispatch is costly there); `__local`
+   wins or ties everywhere and is simpler. Registers are a per-device tuning, not needed to bank it.
+4. **Interpreter ceiling is adequate** — reg variant reaches hardcoded-gelu speed at 256 MiB. The
+   bottleneck is memory traffic, not interpretation. No JIT / device-compile needed.
+
+### Design (as specced; single-output v1)
+
+**Opcode.** `OP_MAP_REGION` (56) in lowering; `TILE_MAP_REGION` (13) in scheduler/kernel. The
+region is variable-length ⇒ its descriptor lives in the **aux pool** (Instr.aux word offset); the
+32-B Instr carries `dst` (region output buf), `n` (element count → n_tiles), `aux` (descriptor off).
+Input buffer ids ride in `Instr.reads_hint` (non-serialized) so the scheduler's dep analysis sees
+them without parsing aux (precedent: dynamic_slice start scalars, §20).
+
+**Aux descriptor layout** (u32 words):
+```
+[0]=n_inputs  [1]=n_micro  [2]=n_slots
+n_inputs × { buf_id, view_aux_off(+1; 0=direct), dst_slot }   # prologue loads (view = §13 access-map)
+n_micro  × { kind, dst_slot, a_slot, b_slot, s_bits, t_bits } # straight-line SSA sub-block
+[last]   = out_slot                                            # epilogue store → Instr.dst
+```
+Operands INSIDE the region reference **scratch slots**, not arena ids (the §23 reason a per-opcode
+"chain flag" can't work — real regions are DAGs, GELU reuses x 4× / binary ops need 2 live inputs).
+`kind` = the vmo_ew micro-op (MUL/ADD/SUB/DIV/…/AFFINE a*s+t/TANH/EXP/…). n_slots bounds region
+width; gate `n_slots ≤ 8` (register-file bound, PoC-validated) + n_inputs small.
+
+**Kernel** `vmo_map_region` (new ops/region.cl): float4-vectorized grid-stride tile loop; per
+float4 index — load each region input into its slot (`R[slot][lid]`, applying the §13 view address
+for broadcast/transpose leaves), interpret the micro sub-list over `__local float4 R[NSLOTS][WG]`,
+store `R[out_slot]` to `Instr.dst`. **No cross-workgroup barrier** (pure map — element i independent),
+so §18/§19a PoCL barrier rules DON'T bite here (no barrier at all); works on host-dispatch engine
+unchanged. On-chip scratch = NSLOTS×WG×16 B (8×256×16 = 32 KB local) — sits within occupancy for the
+spin-barrier (§10c): measure residency, shrink WG/NSLOTS if it drops below the barrier's need.
+
+**Recognizer** `_fuse_region` (lowering, after `_fuse_views`/`_fuse_norm`, before `_reuse_arena`):
+find maximal connected runs of viewable-f32-EW instrs (the §11 chain set) with a SINGLE
+externally-live output; encode the micro-program (topo order = SSA order), map leaves→input slots
+(carrying any folded view aux-off), NOP the members, emit one OP_MAP_REGION. **Gated HARD** (all-f32,
+n_slots≤8, single output, no cmp/select/convert/fill/dynamic index); any mismatch → decomposed path
+untouched. `PJRT_OCL_FUSE_REGION=0` reverts. Multi-output regions (residual forks) = a future step.
+
+**Validators.** vmreader numpy interp (execute the micro sub-list over ndarrays) + the schedule-sim,
+per the §19 dual-validator net; add region tests (fires / FUSE_REGION=0 fallback / n_slots>8 fallback).
