@@ -1383,3 +1383,18 @@ tile-executor in the megakernel). Divergent/data-dependent-index ops can't join 
 **Status: not started — this is the documented next major architecture project** for the base
 (overhead/memory-bound) regime, distinct from the matmul intensity-cap lever (§10c, large regime).
 Measurement-first when taken up: rank the 107 phases by cost, fuse the fattest map-regions first.
+
+## 19b. LOGGED FOLLOW-UP — OP_GELU as a dedicated fused opcode (implement later)
+
+`gelu` is pure-elementwise (`0.5*x*(1+tanh(0.7978*(x+0.044715*x³)))`, ~6 map-ops) — no reduce, so it
+does NOT need the §19 collaborative-reduce treatment; §11 chain fusion already runs it barrier-free.
+BUT (§23 finding) those 6 ops still each round-trip their intermediate through global memory, so gelu
+measured ~2.3× off CUDA at base sizes. Two ways to fix, both LOGGED for later:
+- **Dedicated `OP_GELU`** (§19-style): recognize the gelu idiom → one opcode that computes the whole
+  tanh-approx in registers per element, one global read + one write. Trivial once the recognizer
+  pattern is written; guaranteed win; but one-off.
+- **Falls out of the general map-region fusion (§23 / Idea A)** for free — gelu is exactly a pure-map
+  region. If the region-op lands, a dedicated OP_GELU is redundant.
+
+**Decision: don't hand-write OP_GELU yet** — let the general region-op (§23, being implemented) subsume
+it; only add a dedicated OP_GELU if the general mechanism stalls or gelu needs to ship sooner.
