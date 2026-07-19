@@ -4,6 +4,18 @@
  * (compare: operands adt -> bool result; select: bool pred -> operands dt).
  * bool is 1-byte (uchar 0/1), matching jax PRED. */
 
+/* GELU tanh-approx (§19b/§24): 0.5*x*(1+tanh(0.7978845608*(x+0.044715*x^3))).
+ * One scalar + float8/float4 twin so it rides all three EW paths (scalar tail,
+ * CPU float8 chunk, GPU float4 fast path). Matches python _gelu_np exactly. */
+#define VMO_GELU_BODY(x) \
+    ((float)0.5f * (x) * ((float)1.0f + \
+        tanh((float)0.7978845608f * ((x) + (float)0.044715f * (x) * (x) * (x)))))
+static float  vmo_gelu1(const float  x) { return VMO_GELU_BODY(x); }
+static float8 vmo_gelu8(const float8 x)
+{ return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x))); }
+static float4 vmo_gelu4(const float4 x)
+{ return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x))); }
+
 static float vmo_ew_bin(const uint sub, const float x, const float y)
 {
     switch (sub) {
@@ -33,6 +45,7 @@ static float vmo_ew_un(const uint sub, const float x)
     case SUB_TAN: return tan(x);
     case SUB_RINT: return rint(x);    /* round to nearest, ties to even */
     case SUB_ROUND: return round(x);  /* round to nearest, ties away from 0 */
+    case SUB_GELU: return vmo_gelu1(x);
     default: return 0.0f;
     }
 }
@@ -46,7 +59,8 @@ static int vmo_ew_is_bin(const uint sub)
 static int vmo_ew_is_un(const uint sub)
 {
     return (sub >= SUB_COPY && sub <= SUB_SIGN) ||
-           (sub >= SUB_LOG1P && sub <= SUB_ROUND);
+           (sub >= SUB_LOG1P && sub <= SUB_ROUND) ||
+           sub == SUB_GELU;
 }
 #define CMP(p, x, y) ((p)==0?(x)==(y):(p)==1?(x)!=(y):(p)==2?(x)<(y): \
                       (p)==3?(x)<=(y):(p)==4?(x)>(y):(x)>=(y))
@@ -146,6 +160,7 @@ static float8 vmo_ew_un8(const uint sub, const float8 x)
     case SUB_TAN: return tan(x);
     case SUB_RINT: return rint(x);
     case SUB_ROUND: return round(x);
+    case SUB_GELU: return vmo_gelu8(x);
     default: return (float8)(0.0f);
     }
 }
@@ -203,6 +218,7 @@ static float4 vmo_ew_un4(const uint sub, const float4 x)
     case SUB_TAN: return tan(x);
     case SUB_RINT: return rint(x);
     case SUB_ROUND: return round(x);
+    case SUB_GELU: return vmo_gelu4(x);
     default: return (float4)(0.0f);
     }
 }

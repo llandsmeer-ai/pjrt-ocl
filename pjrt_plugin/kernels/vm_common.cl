@@ -98,7 +98,12 @@ enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        /* fused affine: d = a*s + t, s=as_float(p2), t=as_float(p3). Folds a
         * scalar-const scale/bias (and composed chains) into one in-place pass;
         * see python lowering _fold_scalar / _compose_affines. */
-       SUB_AFFINE };
+       SUB_AFFINE,
+       /* fused GELU tanh-approx unary (§19b/§24): computes the whole
+        * 0.5*x*(1+tanh(0.7978845608*(x+0.044715*x^3))) per element in registers,
+        * one global read + one write. Routed as a unary subop (vmo_ew_is_un()
+        * range-extended) so it rides the existing TILE_EW float4 fast path. */
+       SUB_GELU };
 
 #define ENT_NOP     0xFFFFFFFFu
 #define ENT_BARRIER 0xFFFFFFFEu

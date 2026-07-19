@@ -265,6 +265,49 @@ opsem.register(L.OP_AFFINE_F32, to_task=_affine_to_task, interp=_affine_interp,
 opsem.register_ew_sim(SUB_AFFINE, _affine_ew_sim)
 
 
+# --- fused GELU tanh-approx (§19b/§24) --------------------------------------
+# Dedicated unary EW op emitted ONLY by lowering's `_fuse_gelu` recognizer (no
+# stablehlo op — jax.nn.gelu(approximate=True) lowers to a mul/affine/tanh
+# chain that the recognizer collapses into this one op). Rides the existing
+# TILE_EW unary path with subop SUB_GELU; one global read + one write. The numpy
+# formula MUST match ops/ew.cl's VMO_GELU_BODY so both validators agree with the
+# device on the re-parsed bytecode.
+SUB_GELU = 41       # must match vm_common.cl's SUB_GELU enum value
+
+
+def _gelu_np(x):
+    x = x.astype(np.float32)
+    inner = np.float32(0.7978845608) * (
+        x + np.float32(0.044715) * x * x * x)
+    return (np.float32(0.5) * x * (np.float32(1.0) + np.tanh(inner))).astype(
+        np.float32)
+
+
+def _gelu_to_task(ins) -> Task:
+    # unary convention: b self-aliases a; p2 = a's view aux-offset (0 = direct,
+    # the recognizer always emits a direct read), p3 unused.
+    return Task(TILE_EW, dst=ins.dst, a=ins.a, b=ins.a,
+                p0=SUB_GELU, p1=ins.n, p2=ins.imm, p3=0)
+
+
+def _gelu_interp(ins, rt) -> None:
+    a = rt.viewed(ins.a, ins.n, ins.imm)
+    rt.view(ins.dst, ins.n)[:] = _gelu_np(a)
+
+
+def _gelu_reads(ins) -> set:
+    return {ins.a}
+
+
+def _gelu_ew_sim(a, b, task, rt, lo, hi):
+    return _gelu_np(a)
+
+
+opsem.register(L.OP_GELU, to_task=_gelu_to_task, interp=_gelu_interp,
+               reads=_gelu_reads)
+opsem.register_ew_sim(SUB_GELU, _gelu_ew_sim)
+
+
 # --- compare -----------------------------------------------------------
 
 @L.handles("stablehlo.compare")

@@ -142,6 +142,7 @@ OP_REDUCE_SEG = 52       # segmented reduce over the innermost `seg` elems; imm 
 OP_FOR = 53              # fixed-trip loop: body = instrs [n, n+imm), b = trip count
 OP_SOFTMAX = 54          # fused softmax over the innermost `seg` elems; imm = seg (§19)
 OP_LAYERNORM = 55        # fused layernorm core over innermost `seg`; imm = seg, imm2 = eps bits
+OP_GELU = 56             # fused GELU tanh-approx unary EW op (§19b/§24); a = input, no imm
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -170,6 +171,7 @@ OP_NAMES = {
     OP_FOR: "for",
     OP_SOFTMAX: "softmax",
     OP_LAYERNORM: "layernorm",
+    OP_GELU: "gelu",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
@@ -1411,6 +1413,158 @@ def _fuse_norm(ctx: _Ctx) -> None:
             break
 
 
+# GPT-2 tanh-approx GELU constants, compared as f32 (jax folds these exact
+# literals into OP_AFFINE_F32 scales; see _fuse_gelu).
+_GELU_C_CUBE = float(np.float32(0.044715))      # inner cubic coefficient
+_GELU_C_SQRT = float(np.float32(0.7978845608))  # sqrt(2/pi)
+
+
+def _capprox(v, ref: float, rtol: float = 1e-6) -> bool:
+    return v is not None and abs(v - ref) <= rtol * abs(ref) + 1e-12
+
+
+def _fuse_gelu(ctx: _Ctx) -> None:
+    """Recognize the GPT-2 tanh-approx GELU idiom
+    `0.5*x*(1+tanh(0.7978845608*(x + 0.044715*x^3)))` in OUR lowered VM-instr
+    stream and collapse it into a SINGLE dedicated unary op (OP_GELU) that
+    computes the whole thing per element in registers — one global read + one
+    write instead of ~8 EW ops each round-tripping an intermediate through the
+    arena (§19b/§24: dedicated OP_GELU ~4× on its component at base, where the
+    general region-op manages only 1.3×).
+
+    Pure elementwise (no reduce/segment): this is a plain EW-unary subop on the
+    existing TILE_EW path — no new SLM, no tile-op family.
+
+    Both spellings of the idiom reach us with an identical backbone (all ops
+    reuse the input buffer X):
+        x2  = x*x                        (MUL, a==b==X)
+        x3  = x2*x                       (MUL, {x2, X})
+        c   = 0.044715 * x3              (AFFINE s=0.044715, t=0)
+        s   = x + c                      (ADD, {X, c})
+        i   = 0.7978845608 * s           (AFFINE s=0.7978845608, t=0)
+        t   = tanh(i)                    (TANH)
+    …and differ ONLY in how the `0.5*x*(1+tanh)` tail is factored:
+      - jax.nn.gelu:      out = x * (0.5*t + 0.5)      (TF s=t=0.5;  x direct)
+      - manual `0.5*x*(1+tanh)`: out = (0.5*x) * (1*t + 1)  (TF s=t=1; XF s=0.5)
+    Generalize the tail: the final MUL is `(s_x·X) · (s_t·(t+1))` where the tanh
+    factor is an affine with bias==scale (= k·(tanh+1)) and the x factor is X
+    directly (s_x=1) or `affine(X, s_x, 0)`, gated on `s_x·s_t == 0.5`. This
+    matches any mathematically-equivalent factoring (correctness rests on the
+    algebra, not a specific spelling), while the backbone constants
+    0.044715 / 0.7978845608 stay exact-checked and X stays reused throughout.
+
+    GATED HARD on every op kind + the exact backbone constants + producer→
+    consumer linkage + the reused-X thread + the tail scale product; ANY
+    mismatch leaves the decomposed chain untouched (never wrong, only
+    sometimes-unfused). PJRT_OCL_FUSE_GELU=0 disables it. Runs after _fuse_norm
+    on the cleaned stream (post view-fold / affine-compose / DCE); the following
+    _dce_nops removes the dead chain."""
+    if os.environ.get("PJRT_OCL_FUSE_GELU", "1") == "0":
+        return
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+
+    def _writer_map() -> dict:
+        seen: dict = {}
+        multi: set = set()
+        for idx, ins in enumerate(instrs):
+            if ins.op == OP_NOP:
+                continue
+            d = ins.dst
+            if d in seen or d in multi:
+                seen.pop(d, None)
+                multi.add(d)
+            else:
+                seen[d] = idx
+        return seen
+
+    changed = True
+    while changed:
+        changed = False
+        writers = _writer_map()
+
+        def producer(buf: int, op: int):
+            """The unique writer of `buf` if it is `op`, else None."""
+            w = writers.get(buf)
+            return None if w is None else (instrs[w] if instrs[w].op == op else None)
+
+        def affine_c(buf: int, s_ref: float, t_ref: float):
+            """producer of `buf` iff OP_AFFINE_F32 with matching scale/bias."""
+            a = producer(buf, OP_AFFINE_F32)
+            if a is None or not _capprox(_f32_from_bits(a.imm), s_ref):
+                return None
+            return a if _capprox(_f32_from_bits(a.imm2), t_ref) else None
+
+        def backbone(tanh_in: int, total: int):
+            """Verify tanh_in = 0.7978845608*(X + 0.044715*X^3) and return X,
+            else None. Tries both add-operand orderings to locate X."""
+            AFFI = affine_c(tanh_in, _GELU_C_SQRT, 0.0)
+            if AFFI is None or AFFI.n != total:
+                return None
+            ADD = producer(AFFI.a, OP_ADD_F32)
+            if ADD is None or ADD.n != total or ADD.imm or ADD.imm2:
+                return None
+            for X, cbuf in ((ADD.a, ADD.b), (ADD.b, ADD.a)):
+                AFFC = affine_c(cbuf, _GELU_C_CUBE, 0.0)
+                if AFFC is None or AFFC.n != total:
+                    continue
+                MUL3 = producer(AFFC.a, OP_MUL_F32)
+                if MUL3 is None or MUL3.n != total or MUL3.imm or MUL3.imm2:
+                    continue
+                x2 = (MUL3.b if MUL3.a == X else
+                      MUL3.a if MUL3.b == X else None)
+                if x2 is None:
+                    continue
+                MUL2 = producer(x2, OP_MUL_F32)
+                if (MUL2 is None or MUL2.n != total or MUL2.imm or MUL2.imm2
+                        or MUL2.a != X or MUL2.b != X):
+                    continue
+                return X
+            return None
+
+        for oi, OUT in enumerate(instrs):
+            # anchor: the final `out = (s_x·x) · (s_t·(1+tanh))`
+            if OUT.op != OP_MUL_F32 or OUT.imm or OUT.imm2:
+                continue          # a direct (unviewed) multiply only
+            total = OUT.n
+            done = False
+            # one operand is the tanh factor, the other the x factor
+            for tf_buf, xf_buf in ((OUT.a, OUT.b), (OUT.b, OUT.a)):
+                # tanh factor: affine(tanh, s_t, t_t) with t_t == s_t (= k*(1+t))
+                TF = producer(tf_buf, OP_AFFINE_F32)
+                if TF is None or TF.n != total:
+                    continue
+                s_t = _f32_from_bits(TF.imm)
+                if not _capprox(_f32_from_bits(TF.imm2), s_t):
+                    continue
+                TANH = producer(TF.a, OP_TANH_F32)
+                if TANH is None or TANH.n != total:
+                    continue
+                X = backbone(TANH.a, total)
+                if X is None:
+                    continue
+                # x factor: X directly (s_x=1) or affine(X, s_x, 0)
+                if xf_buf == X:
+                    s_x = 1.0
+                else:
+                    XF = producer(xf_buf, OP_AFFINE_F32)
+                    if (XF is None or XF.a != X or XF.n != total
+                            or not _capprox(_f32_from_bits(XF.imm2), 0.0)):
+                        continue
+                    s_x = _f32_from_bits(XF.imm)
+                # combined scale must be exactly 0.5: (s_x·X)·(s_t·(1+t))
+                if not _capprox(s_x * s_t, 0.5):
+                    continue
+                # in-place self-write guard (mirror _fuse_norm).
+                if OUT.dst in outs and X == OUT.dst:
+                    continue
+                instrs[oi] = Instr(OP_GELU, dst=OUT.dst, a=X, b=X, n=total)
+                changed = done = True
+                break
+            if done:
+                break
+
+
 def _fuse_matmul_views(ctx: _Ctx) -> None:
     """Access-map fusion for matmul (§13, §14): fold a shape op (transpose/
     reshape/broadcast/slice/reverse — all OP_GATHER_STRIDED) that feeds a
@@ -1710,6 +1864,7 @@ def lower_module(module) -> VMProgram:
     # on the cleaned stream (after view-fold/affine-compose/DCE) so the idiom is
     # in its canonical form; before _reuse_arena so liveness sees the fused op.
     _fuse_norm(ctx)
+    _fuse_gelu(ctx)
     _dce_nops(ctx)
 
     # Liveness-reuse: rewrite arena offsets so the arena is bounded by peak

@@ -1398,6 +1398,9 @@ measured ~2.3× off CUDA at base sizes. Two ways to fix, both LOGGED for later:
 
 **Decision: don't hand-write OP_GELU yet** — let the general region-op (§23, being implemented) subsume
 it; only add a dedicated OP_GELU if the general mechanism stalls or gelu needs to ship sooner.
+**UPDATE (§24, then SHIPPED §26):** the poc/14 gate INVERTED this — at base the general op wins only
+1.3× and carries an occupancy-regression risk, so the dedicated OP_GELU was the right near-term lever.
+Shipped 2026-07-19; see §26.
 
 ## 24. Fused map-region tile-op — DESIGN + PoC gate → SPECCED, NOT BUILT (2026-07-19, poc/14)
 
@@ -1587,3 +1590,70 @@ no local at all. The caveat that matters at integration: §10c's TF32 `vmo_mma_t
 
 **Verified:** poc/13 builds (`make`) and runs clean on NVIDIA + PoCL; all 3×(4 EW + 5 MMA) variants
 bit-exact vs host/baseline (`maxerr=0`). Data: `poc/13-async-prefetch/results_{nvidia,pocl}.csv`.
+
+## 26. SHIPPED 2026-07-19: OP_GELU — dedicated fused elementwise opcode (§19b/§24)
+
+Implemented the §24 near-term recommendation (dedicated fused opcode over the general
+interpreted region-op). **Kept ON by default; `PJRT_OCL_FUSE_GELU=0` reverts.** GELU is
+**pure elementwise** (no reduce/segment), so unlike softmax/layernorm (§19a) this is NOT a new
+segmented tile-op family — it is one extra **EW-unary subop** riding the existing TILE_EW float4
+fast path (one global read + one write per element, whole tanh-approx computed in registers).
+
+- **Opcode/subop**: `OP_GELU`(56) in lowering.py → `to_task` maps it to `TILE_EW` with
+  `SUB_GELU`(41, appended after SUB_AFFINE) in vm_common.cl. Kernel: `vmo_gelu1/8/4` +
+  `case SUB_GELU` in `vmo_ew_un/un8/un4` and `vmo_ew_is_un()` range-extended (ops/ew.cl). Numpy
+  `_gelu_np` (validators) matches the kernel's `VMO_GELU_BODY` exactly. No new SLM, no barriers,
+  negligible register cost — sidesteps the §24-finding-2 occupancy risk that killed the *general*
+  region-op for the base regime.
+- **Recognizer** `_fuse_gelu` (lowering.py, runs right after `_fuse_norm`, before `_reuse_arena`;
+  the following `_dce_nops` drops the dead chain). Post-lowering peephole on OUR instr stream,
+  anchored on the final `MUL`. **Two spellings reach us with an identical backbone**
+  (x²=x·x, x³=x²·x, `0.044715·x³`, `x+·`, `0.7978845608··`, `tanh`) and differ ONLY in the
+  `0.5·x·(1+tanh)` tail factoring: `jax.nn.gelu` → `x·(0.5·tanh+0.5)`; the transformer's manual
+  `0.5*x*(1+tanh(...))` → `(0.5·x)·(1·tanh+1)`. **First cut matched only the jax.nn form and MISSED
+  the transformer** (the real target) — generalized the tail to `(s_x·X)·(s_t·(tanh+1))` gated on
+  the tanh-factor bias==scale AND `s_x·s_t == 0.5`, matching any algebraically-equivalent factoring
+  while the backbone constants (0.044715 / 0.7978845608) stay exact-checked and X stays reused
+  throughout. **Gated hard**: any op-kind / constant / linkage / reused-X mismatch → decomposed
+  chain untouched (never wrong, only sometimes-unfused). Lookalikes (wrong consts, non-reused arg)
+  correctly do NOT fire. The exact **erf** variant (`approximate=False`) can't even VHLO-serialize
+  in jaxlib 0.10.2 — nothing to match; documented follow-up.
+
+**Surprised by: fused OP_GELU is MORE accurate than the decomposed chain, not just faster.** At true
+f32 (`PJRT_OCL_MEGA_TC=0`) base is `max_abs 2.4e-6` fused vs `1.2e-3` decomposed — the single-expression
+kernel matches XLA-CPU's in-register/FMA gelu, whereas our decomposed path round-trips each
+intermediate (exactly the §23 "we removed the barrier, not the round-trips" point, now visible in
+*accuracy* too).
+
+**Before/after (this machine; A/B via `PJRT_OCL_FUSE_GELU` on the SAME build, NVIDIA):**
+
+| metric                                       | fused OFF | fused ON | note |
+|----------------------------------------------|-----------|----------|------|
+| standalone gelu (4,128,2048)=4 MiB, L2-res   | 0.0428 ms | **0.0278**| 1.54×; **beats** CUDA 0.0349 |
+| standalone gelu 64 MiB (HBM-bound)           | 0.749 ms  | **0.121** | **6.2×**; CUDA 0.089 (gap 8.5×→1.37×) |
+| base transformer ms/iter (TF32)              | 5.80      | **5.33**  | 1.09×; GFLOP/s 3610→3930 |
+| base gap vs native CUDA (0.4385 ms)          | 13.2×     | **12.2×** | |
+| large transformer ms/iter (TF32)             | 28.24     | **26.83** | 1.05× |
+
+The base end-to-end win (1.09×) is single-digit-% as §24 predicted (base FFN gelu is L2-resident →
+memory win is modest; the big 6.2× is HBM-bound), but it *does* move the base needle (§14a) AND
+collapses 8 VM instrs→1 per layer. Consistent with §24: dedicated opcode banks the base regime
+cheaply; the general region-op (deferred to R3) is for the HBM-bound/`large` regime.
+
+**Correctness (all PASS):** 275 pytest + 1 skip (was 262+1; +13 `tests/test_ops_gelu.py`: both
+spellings fire, lookalikes don't, dual validators agree, `FUSE_GELU=0` fallback). runtime_test
+NVIDIA + PoCL PASS. transformer `--check`: NVIDIA TF32 tiny/small/base/large; NVIDIA
+`PJRT_OCL_MEGA_TC=0` base **2.4e-6** / large **1.2e-5** f32-exact; PoCL Portable tiny/base
+**2.3e-6** f32-exact.
+
+**Pre-existing issue surfaced (NOT gelu-caused), two of them:**
+1. **runtime_test was stale.** Its two EW/while tests hardcoded a 16384-element tile size; since
+   §22 gave GPUs `EW_TS=4096`, a *fresh* build computes only 4×4096 of 65536 elements → deterministic
+   `48956 = 49152 − 196` bad on NVIDIA (PoCL's 16384 masked it; main's binary was pre-§22 stale).
+   Fixed: both tests now size `N = LANES · rt->ew_ts()` (one tile/lane at the device's real tile
+   size). PASS on both devices. The transformer `--check` passing throughout proved the *kernel* was
+   always fine — only the test's tiling assumption was wrong.
+2. **PoCL fused-norm intermittent (§19a) still flickers.** PoCL base occasionally reads `~1.3e-3`
+   instead of `~2.4e-6` (~1 in 6 runs), reproduced on **pristine main** (no OP_GELU) → it lives in
+   the fused softmax/layernorm barrier path, not gelu (gelu is barrier-free and stable). Logged for a
+   future §19a follow-up; unrelated to this change.
