@@ -1348,3 +1348,38 @@ Verified: 252/252 pytest on NVIDIA AND PoCL; chained bench + transformer rerun (
 Residual gaps after this: matmul tile ceiling (survey R3), small-op/barrier-chain overhead
 (survey R1/R2). EW at 2M sits ~2x off CUDA's L2-resident chain speed (7.7 vs 3.5 µs) — a
 deeper unroll may close some; diminishing returns vs R2 fusion.
+
+## 23. FUTURE DIRECTION — register-resident map-region fusion (the base 13× lever)
+
+**The gap that remains** (§14b/§19 profiling): `base` runs **107 serial barrier-phases** for 192 VM
+ops; ~5.8 ms, 13.4× off native. Per-op kernels are competitive/faster than CUDA *standalone* — but
+the whole is far behind because CUDA fuses a layer into a handful of pipelined on-chip kernels while
+we run ~100 discrete phases, each with a cross-workgroup barrier AND a global-memory round-trip.
+
+**Key finding (2026-07-19):** our current "fusion" removes the *barrier*, not the *round-trips*.
+Every EW tile-op still does `AP(t.a)` → compute → `AP(t.dst)` — global in, global out. §11 chain
+fusion just lets a chain `[tid0,tid1,…]` run barrier-free on one lane; each op STILL materializes its
+full intermediate to the arena. A 6-op GELU chain = 6 global writes + 6 reads. We eliminated the
+sync, not the DRAM traffic — which is exactly why per-op wins don't compound.
+
+**The lever (user idea, 2026-07-19): make bytecode ops pass intermediates in REGISTERS and work on
+much smaller sets.** A general "fused map-region" tile-op:
+- Lowering/scheduler finds maximal **map-regions** — contiguous runs of ops whose output tile depends
+  only on the input tile at a static position (elementwise, broadcast-reads, transpose/reshape views).
+  Boundaries = genuinely cross-lane ops (reduce, matmul, gather/scatter, dynamic index).
+- Each region → ONE tile-op run as a **per-tile register pipeline**: load the region's inputs into
+  registers/local ONCE, interpret the region's op sub-list on that scratch (a straight-line
+  mini-opcode loop, like `while` w/o branch), store outputs ONCE. Intermediates never leave registers.
+- K ops + K round-trips + K−1 barriers → **1 load + 1 store, 1 phase**. Most of the 107 base phases
+  are exactly these map-ops. This is XLA's kLoop/kInput fusion, done inside our VM, and it GENERALIZES
+  the hand-fusions we already ship (§11 barrier, §13 views, §19 norm) into one mechanism.
+
+**Constraints (honest):** only map-ops fuse into the pipeline (reduce/matmul/gather stay boundaries,
+though a reduce can fuse its *surrounding* EW as §19 does); register pressure bounds tile-size ×
+chain-length (tile size becomes a tuning knob — spills kill it); the VM gains a "region" opcode
+whose operand is a straight-line sub-list interpreted over a local tile buffer (a small fusing
+tile-executor in the megakernel). Divergent/data-dependent-index ops can't join the pipeline.
+
+**Status: not started — this is the documented next major architecture project** for the base
+(overhead/memory-bound) regime, distinct from the matmul intensity-cap lever (§10c, large regime).
+Measurement-first when taken up: rank the 107 phases by cost, fuse the fattest map-regions first.
