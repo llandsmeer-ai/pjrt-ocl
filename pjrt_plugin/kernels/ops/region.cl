@@ -1,29 +1,32 @@
-/* §27 register-resident map-region tile-op (INVESTIGATION PoC, off by default).
+/* §27/§28 register-resident fused map-region tile-op (TOP_MAP_REGION).
  *
- * Guarded by -DVMO_REGION_POC so the shipped megakernel is byte-identical unless
- * the flag is set. Proves the megakernel-native form of the §23/§24 fused
- * map-region: a run of pure-map micro-ops whose intermediates never leave the
- * lane — one global load per region input, interpret the straight-line sub-list
- * over per-thread float4 slots, one global store. No cross-workgroup barrier
- * (pure map: element i independent), so it composes with both engines.
+ * The megakernel-native form of the §23/§24 fused map-region: a run of pure-map
+ * micro-ops whose intermediates never leave the lane. One global load per region
+ * input, interpret the straight-line micro sub-list over per-thread float4 slots,
+ * one global store. No cross-workgroup barrier (pure map: element i independent),
+ * so it composes with both engines (spin-barrier + host-dispatch) unchanged and
+ * §18/§19a PoCL barrier rules never bite (there is no barrier).
  *
- * The whole point of §27 is OCCUPANCY: does this case fit under the megakernel's
- * co-residency register budget (≤128 regs/thread ⇒ 2 workgroups/SM ⇒ 376 lanes
- * on this 188-SM part)?  The slots live in a fixed float4[REGION_NSLOTS] array
- * scoped INSIDE the switch case, so its registers overlap the mutually-exclusive
- * matmul/reduce cases' registers (max-not-sum). Dynamic slot indexing lands the
- * array in per-thread local (stack) memory, which does not consume the register
- * file or SLM at all — occupancy-neutral by construction; the switch-addressed
- * register variant is measured separately (poc/15 case 99).
+ * OCCUPANCY (§27, measured — GO): the slots live in a fixed float4[REGION_NSLOTS]
+ * array scoped INSIDE the switch case, so its registers overlap the
+ * mutually-exclusive matmul/reduce cases' registers (max-not-sum). Dynamic slot
+ * indexing lands the array in per-thread local (stack) memory, which consumes
+ * neither the register file nor SLM — the whole-kernel register max is unchanged
+ * (88 regs, still 2 WG/SM = 376 lanes on the RTX PRO 6000). No __local declared
+ * here: the shared As/Bs stay byte-identical to baseline.
  *
  * Region inputs ride the task's own dst/a/b handles (loader-resolved like any op
  * — no aux handle patching, §20). Descriptor (int words at t.p0):
  *   [0]=in0_slot  [1]=in1_slot (0xFFFF = unused)  [2]=n_micro  [3]=out_slot
  *   n_micro × { kind, dst_slot, a_slot, b_slot, s_bits, t_bits }
- * t.p1 = element count n. Single-output v1. */
-#ifdef VMO_REGION_POC
+ * t.p1 = element count n. Single-output v1 (the lowering recognizer splits
+ * over-budget / multi-output regions into single-output on-chip sub-regions).
+ *
+ * `kind` is a vmo_ew SUB_* opcode (a subset: the pure-map ALU the recognizer
+ * emits). The builtins MUST match ops/ew.cl so the fused region is numerically
+ * identical to the decomposed EW chain it replaces. */
 #ifndef REGION_NSLOTS
-#define REGION_NSLOTS 8       /* §24 gate: n_slots ≤ 8 (register-file bound) */
+#define REGION_NSLOTS 8       /* §24/§27 gate: n_slots ≤ 8 (register-file bound) */
 #endif
 #define REGION_NONE 0xFFFFu
 
@@ -35,8 +38,15 @@ static float4 vmo_region_micro(const uint kind, const float4 x, const float4 y,
     case SUB_MUL:    return x * y;
     case SUB_SUB:    return x - y;
     case SUB_DIV:    return x / y;
-    case SUB_TANH:   return tanh(x);
+    case SUB_MAX:    return fmax(x, y);
+    case SUB_MIN:    return fmin(x, y);
+    case SUB_NEG:    return -x;
     case SUB_EXP:    return exp(x);
+    case SUB_LOG:    return log(x);
+    case SUB_SQRT:   return sqrt(x);
+    case SUB_RSQRT:  return rsqrt(x);
+    case SUB_TANH:   return tanh(x);
+    case SUB_ABS:    return fabs(x);
     case SUB_AFFINE: return mad(x, (float4)(s), (float4)(t));  /* x*s + t */
     default:         return x;
     }
@@ -96,4 +106,3 @@ static void vmo_map_region(__global uchar *arena, __global uchar **iop,
         d[j] = R1[out_slot];
     }
 }
-#endif  /* VMO_REGION_POC */

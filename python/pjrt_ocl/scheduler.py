@@ -53,6 +53,7 @@ TILE_RED_WINDOW = 9   # windowed reduction (pooling)
 TILE_RED_SEG = 10     # segmented reduce: out[o] = reduce(in[o*seg : (o+1)*seg])
 TILE_SOFTMAX_SEG = 11    # fused softmax over the innermost seg elems (§19)
 TILE_LAYERNORM_SEG = 12  # fused layernorm core over the innermost seg elems (§19)
+TILE_MAP_REGION = 13     # §27/§28 register-resident fused map-region (one phase)
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -157,7 +158,8 @@ class Task:
 
     def n_tiles(self) -> int:
         if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM, TILE_SCATTER,
-                             TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW):
+                             TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW,
+                             TILE_MAP_REGION):
             return max(1, math.ceil(self.p1 / TILE_SIZE))
         if self.tile_op == TILE_MMA:
             return (math.ceil(self.p0 / MMA_T) * math.ceil(self.p1 / MMA_T)

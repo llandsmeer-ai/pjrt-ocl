@@ -1766,3 +1766,81 @@ stands — the general region-op's payoff is the HBM-bound/`large` regime and th
 collapse, not base-size speed. The value of §27 is that the general op no longer has to wait for the
 R3 split-VM: it can ship in the one megakernel whenever its end-to-end perf is shown to move the
 needle (measure-first, §14a). GO on feasibility; perf gating unchanged.
+
+## 28. SHIPPED 2026-07-20: OP_MAP_REGION — register-resident map-region fusion, real (§23/§27)
+
+The culmination of the §23/§24/§27 arc: the proven §27 PoC is now a real
+recognizer-driven op. A maximal run of pure-map f32 EW ops collapses into ONE
+`OP_MAP_REGION` (tensor opcode 57) → `TILE_MAP_REGION` (tile op 13) whose
+intermediates never leave the lane — one global load per input, interpret the
+straight-line micro-program over per-thread `float4 R[8]` slots, one store. The
+`#ifdef VMO_REGION_POC` guard is REMOVED: the case ships in the default megakernel
+and is correct there. `PJRT_OCL_FUSE_REGION=0` reverts the recognizer.
+
+### What was built
+- **Kernel** (`ops/region.cl`, un-gated): interpreter over an arbitrary map
+  micro-program (`{kind,dst,a,b,s,t}` over slots); micro-op ALU extended to the
+  EW set (add/mul/sub/div/max/min/neg/exp/log/sqrt/rsqrt/tanh/abs/affine), builtins
+  byte-matching `ops/ew.cl` so a region is numerically identical to the chain it
+  replaces. float4-vectorized grid-stride tile loop + scalar tail, no `__local`,
+  no cross-workgroup barrier. Inputs ride the task's own dst/a/b handles (≤2
+  inputs, no aux-handle patching — §20 avoided per §27).
+- **Recognizer** `lowering._fuse_region` (after the other fusion passes, so
+  OP_SOFTMAX/LAYERNORM/GELU are single ops = region boundaries): finds
+  **within-phase** connected runs of eligible map ops (phase computed exactly like
+  `_reuse_arena`, so a dependency that threads the whole program — the residual
+  stream, whose links sit in different phases across the attention/FFN/norm
+  boundaries — is NOT wrongly grouped), does linear-scan slot allocation, encodes
+  the micro-program into aux, emits `OP_MAP_REGION`. **Over-budget / long chains
+  SPLIT** into budget-sized single-output on-chip sub-regions (still one kernel;
+  the boundary tensor is a real arena buffer read by the next sub-region).
+- **Gated HARD**: co-scheduled in one phase, single externally-live output, ≤2
+  inputs per (sub)region, ≤8 slots, all-f32, no viewed operands, splits that
+  yield only singletons rejected (no op-count win). Any mismatch → decomposed
+  chain untouched. `PJRT_OCL_REGION_SLOTS=<n>` lowers the budget (forces the
+  split in tests).
+- **Scheduler**: `OP_MAP_REGION` → one `TILE_MAP_REGION` task, n_tiles like EW.
+- **Validators** (`ops/region.py` + `tests/test_ops_region.py`, 14 tests): numpy
+  micro-program interp (validator a) + schedule-sim (validator b), matching the
+  kernel; fires/doesn't-fire cases + the over-budget split.
+
+### Occupancy re-verified — the region case is FREE in the default build
+`regprobe` on the shipped kernel (region case now always compiled): **vm2 = 88
+registers** (portable, 8196 smem) / **88** (TF32, 10244 smem), 320-byte stack, 0
+spill — identical to §27's gated-PoC measurement and LOWER than the pre-region
+baseline (92/94). 88 < 128 ⇒ 2 WG/SM ⇒ the §10c 376-lane floor holds. So the
+whole point of §27 is confirmed end-to-end: register-resident region fusion lives
+in the ONE megakernel, no VM split, no relaunch, +0 registers to the kernel max.
+
+### Honest measurement (§14a) — moves the needle on its target class; transformer flat
+- **Transformer (base + large): fires on 0 regions; phases 107 → 107; base/large
+  ms identical REGION on/off (5.48 / 26.84 ms TF32).** Measured reason: the
+  dedicated OP_GELU/SOFTMAX/LAYERNORM already absorbed every ≤2-input map chain,
+  so the ONLY remaining within-phase multi-op map chains are the 12 layernorm
+  affines `x·γ+β` — **3 inputs** (x + broadcast γ + broadcast β), which exceed the
+  2-input design; the residual-stream adds are single ops per phase (boundaries
+  between them). So on THIS model the general op is inert — no win, **no
+  regression** (a valid §14a outcome).
+- **Its target class (≤2-input map chains): a large, monotone win.** A 24-op
+  1-input chain (`t=tanh(t·0.5+a)`×8) through the real plugin, NVIDIA, REGION on
+  vs off: 256K **1.25×**, 1M **1.32×**, 4M **1.79×**, 16M (64 MiB, HBM-bound)
+  **3.82×** (0.590 vs 2.254 ms) — exactly §24's "1.3× at L2, 3×+ at HBM"
+  prediction, now with the memory-traffic saving realised (24 arena round-trips →
+  1 load + 1 store; §23's "we removed the barrier, not the round-trips" finally
+  closed). Correct to **1.79e-7** vs numpy on BOTH NVIDIA and PoCL; region GELU
+  through `runtime_test` **5.96e-8** on both engines.
+
+### Decision: KEEP, default ON
+Correct everywhere (289 pytest + 1 skip; TF32 tiny/small/base/large; MEGA_TC=0
+base/large f32-exact 2.4e-6/1.2e-5; PoCL tiny/base 4.8e-7/2.3e-6; runtime_test
+both devices), occupancy-free, and a 1.25–3.82× win on the map-chain class with
+zero transformer regression. Defaulting ON matches the §26 gelu precedent.
+
+### Next step to make it fire on the transformer (the 3-input `x·γ+β` idiom)
+Support **>2 inputs + broadcast-view loads**: carry the 3rd/4th input handle in a
+free task field (p2/p3, loader-patched like dst/a/b — a small localized change, no
+aux-handle patching) and add strided/broadcast load addressing (§13 access-maps)
+so γ/β broadcasts read in place. That captures the 12 layernorm affines
+(107 → ~95 phases + 12 removed intermediate round-trips) and any `scale·x+bias`
+per-channel idiom. Deferred: measured here as the concrete lever, low-risk but
+out of this session's 2-input scope.

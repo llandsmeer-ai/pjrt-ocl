@@ -56,10 +56,17 @@ def test_gelu_fuses_various_shapes():
 
 def test_no_fire_wrong_cubic_const():
     # 0.05 instead of 0.044715 -> gate rejects; decomposed chain kept.
+    # FUSE_REGION=0 isolates the gelu recognizer: with region fusion ON the
+    # (still-correct) 1-input map chain would be collapsed into OP_MAP_REGION,
+    # which would also remove OP_TANH_F32 — a different, legitimate pass.
     def f(x):
         inner = 0.7978845608 * (x + 0.05 * x ** 3)
         return 0.5 * x * (1.0 + jnp.tanh(inner))
-    ops = _lowered_ops(f, farr(4, 32))
+    os.environ["PJRT_OCL_FUSE_REGION"] = "0"
+    try:
+        ops = _lowered_ops(f, farr(4, 32))
+    finally:
+        del os.environ["PJRT_OCL_FUSE_REGION"]
     assert L.OP_GELU not in ops
     assert L.OP_TANH_F32 in ops
 
@@ -126,7 +133,11 @@ def test_gelu_negative():
 # --- the FUSE_GELU=0 revert lever -------------------------------------------
 
 def test_fuse_gelu_off_falls_back():
+    # FUSE_GELU=0 disables the dedicated OP_GELU; FUSE_REGION=0 additionally
+    # keeps the general map-region pass from collapsing the (correct) decomposed
+    # 1-input chain, so this asserts the pre-fusion structure in isolation.
     os.environ["PJRT_OCL_FUSE_GELU"] = "0"
+    os.environ["PJRT_OCL_FUSE_REGION"] = "0"
     try:
         ops = _lowered_ops(_gelu, farr(4, 32))
         assert L.OP_GELU not in ops
@@ -134,6 +145,7 @@ def test_fuse_gelu_off_falls_back():
         check(_gelu, farr(4, 32), atol=1e-5)
     finally:
         del os.environ["PJRT_OCL_FUSE_GELU"]
+        del os.environ["PJRT_OCL_FUSE_REGION"]
 
 
 def test_fused_matches_decomposed():

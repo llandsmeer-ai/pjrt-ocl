@@ -80,9 +80,11 @@ enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
         * SOFTMAX (p0=n_out, p1=seg); LAYERNORM core (p0=n_out, p1=seg,
         * p2=as_float eps). Kernels: vmo_softmax_seg / vmo_layernorm_seg. */
        TOP_SOFTMAX_SEG = 11, TOP_LAYERNORM_SEG = 12,
-       /* §27 register-resident fused map-region (investigation PoC, dispatched
-        * only when the kernel is built -DVMO_REGION_POC). p0=aux descriptor
-        * word-offset, p1=n. Kernel: vmo_map_region (ops/region.cl). */
+       /* §27/§28 register-resident fused map-region: a run of pure-map EW
+        * micro-ops interpreted over per-thread float4 slots (one global load per
+        * input, one store), collapsing a K-op EW chain into one barrier-free
+        * phase. p0=aux descriptor word-offset, p1=n. Kernel: vmo_map_region
+        * (ops/region.cl); recognizer: lowering _fuse_region. */
        TOP_MAP_REGION = 13 };
 enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,

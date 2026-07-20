@@ -214,9 +214,11 @@ int main() {
     fails += bad != 0;
   }
 
-  if (std::getenv("REGION_POC")) {  // ---- C: §27 register-resident GELU region ----
-    // Requires the kernel built with PJRT_OCL_EXTRA_BUILD=-DVMO_REGION_POC;
-    // otherwise TOP_MAP_REGION falls to the default no-op case (skipped here).
+  if (std::getenv("REGION_POC")) {  // ---- C: §27/§28 register-resident GELU region ----
+    // The TOP_MAP_REGION case ships in the default build (§28: recognizer-driven
+    // OP_MAP_REGION). This device test hand-emits a GELU micro-program to check
+    // the interpreter end-to-end; kept behind REGION_POC=1 to keep the default
+    // runtime_test set small.
     auto fb = [](float f) { int32_t i; std::memcpy(&i, &f, 4); return i; };
     const uint32_t LANES = 8;
     const uint32_t EW_TS = rt->ew_ts();

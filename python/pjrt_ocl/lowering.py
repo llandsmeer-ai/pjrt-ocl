@@ -143,6 +143,8 @@ OP_FOR = 53              # fixed-trip loop: body = instrs [n, n+imm), b = trip c
 OP_SOFTMAX = 54          # fused softmax over the innermost `seg` elems; imm = seg (§19)
 OP_LAYERNORM = 55        # fused layernorm core over innermost `seg`; imm = seg, imm2 = eps bits
 OP_GELU = 56             # fused GELU tanh-approx unary EW op (§19b/§24); a = input, no imm
+OP_MAP_REGION = 57       # §27/§28 register-resident fused map-region: a=in0, b=in1,
+                         # n=elems, aux=descriptor word-offset (slots + micro-program)
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -172,6 +174,7 @@ OP_NAMES = {
     OP_SOFTMAX: "softmax",
     OP_LAYERNORM: "layernorm",
     OP_GELU: "gelu",
+    OP_MAP_REGION: "map_region",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
@@ -1565,6 +1568,371 @@ def _fuse_gelu(ctx: _Ctx) -> None:
                 break
 
 
+# --- general register-resident map-region fusion (§23/§27/§28) ---------------
+#
+# The culmination of the §23 arc: collapse a maximal run of pure-map f32 EW ops
+# whose intermediates round-trip through the arena into ONE register-resident
+# OP_MAP_REGION. K ops + K−1 barrier phases + K global round-trips → 1 phase, 1
+# load per input + 1 store, intermediates kept in per-thread float4 slots. This
+# GENERALIZES the hand-fusions (§11 chain, §19 norms, §26 gelu) into one
+# mechanism; the dedicated OP_SOFTMAX/LAYERNORM/GELU are single ops = REGION
+# BOUNDARIES (not in _REGION_KIND), as are all cross-lane ops (reduce, matmul,
+# gather/scatter, dynamic index) — the region is bounded by anything non-map.
+#
+# Occupancy is FREE inside the one megakernel (§27, measured): per-thread float4
+# slots overlap the matmul case's registers (max-not-sum), no SLM. So no VM
+# split, no relaunch.
+
+# tensor opcode -> (region micro-op SUB_* kind, arity). SUB_* MUST match
+# vm_common.cl / ops/region.cl (the kernel switches on these). arity picks how
+# operand/imm fields map to the {a_slot,b_slot,s,t} micro-op word.
+_RSUB_ADD, _RSUB_MUL, _RSUB_SUB, _RSUB_DIV, _RSUB_MAX, _RSUB_MIN = 0, 1, 2, 3, 4, 5
+_RSUB_NEG, _RSUB_EXP, _RSUB_LOG, _RSUB_SQRT, _RSUB_RSQRT = 8, 9, 10, 11, 12
+_RSUB_TANH, _RSUB_ABS, _RSUB_AFFINE = 13, 14, 40
+_REGION_NONE = 0xFFFF
+
+_REGION_KIND = {
+    OP_ADD_F32: (_RSUB_ADD, "bin"), OP_SUB_F32: (_RSUB_SUB, "bin"),
+    OP_MUL_F32: (_RSUB_MUL, "bin"), OP_DIV_F32: (_RSUB_DIV, "bin"),
+    OP_MAX_F32: (_RSUB_MAX, "bin"), OP_MIN_F32: (_RSUB_MIN, "bin"),
+    OP_NEG_F32: (_RSUB_NEG, "un"), OP_EXP_F32: (_RSUB_EXP, "un"),
+    OP_LOG_F32: (_RSUB_LOG, "un"), OP_SQRT_F32: (_RSUB_SQRT, "un"),
+    OP_RSQRT_F32: (_RSUB_RSQRT, "un"), OP_TANH_F32: (_RSUB_TANH, "un"),
+    OP_ABS_F32: (_RSUB_ABS, "un"), OP_AFFINE_F32: (_RSUB_AFFINE, "affine"),
+}
+
+# Kernel per-thread slot budget (ops/region.cl REGION_NSLOTS). The recognizer's
+# budget may be set lower via env to force the over-budget split in tests.
+_REGION_NSLOTS = 8
+
+
+def _region_budget() -> int:
+    try:
+        b = int(os.environ.get("PJRT_OCL_REGION_SLOTS", str(_REGION_NSLOTS)))
+    except ValueError:
+        b = _REGION_NSLOTS
+    return max(2, min(b, _REGION_NSLOTS))
+
+
+def _region_operands(ins: Instr) -> tuple[int, ...]:
+    """Ordered (a[, b]) operand buffers of an eligible EW instr — the values the
+    micro-op reads. Binary reads a,b; unary/affine read a only."""
+    _, arity = _REGION_KIND[ins.op]
+    return (ins.a,) if arity != "bin" else (ins.a, ins.b)
+
+
+def _region_eligible(ctx: _Ctx, ins: Instr) -> bool:
+    """A pure-map f32 EW op the region interpreter can execute. Gated HARD:
+    result + every operand f32, and (for viewable binary/unary ops) operands
+    read DIRECTLY — a folded strided VIEW (imm/imm2 != 0) is not fused in v1
+    (the kernel reads region inputs contiguously). Affine's imm/imm2 are its
+    s/t immediates, not views, so it is always direct."""
+    kind = _REGION_KIND.get(ins.op)
+    if kind is None:
+        return False
+    if ctx.buffers[ins.dst].dtype != DT_F32:
+        return False
+    for b in _region_operands(ins):
+        if b >= len(ctx.buffers) or ctx.buffers[b].dtype != DT_F32:
+            return False
+    if kind[1] != "affine" and (ins.imm != 0 or ins.imm2 != 0):
+        return False                    # viewed operand — not fused in v1
+    return True
+
+
+def _region_slots(members: list[int], instrs, inputs: list[int],
+                  out_buf: int) -> dict[int, int] | None:
+    """Linear-scan slot allocation over a region (members in SSA order). Values =
+    external `inputs` (live from the start) + each member's dst. Returns
+    {buffer_id: slot} whose max slot < budget, or None if it needs more slots
+    than the budget allows. `out_buf` lives past the region (used at the end)."""
+    budget = _region_budget()
+    k = len(members)
+    produced = {instrs[m].dst for m in members}   # region-internal buffer ids
+    in_set = set(inputs)
+    # last use position of each value (member index that last reads it); out_buf
+    # is read at the end (k). Inputs/temps: last member reading them.
+    last: dict[int, int] = {}
+    for i, m in enumerate(members):
+        for b in _reads_of(instrs[m]):
+            if b in produced or b in in_set:
+                last[b] = max(last.get(b, -1), i)
+    for b in (*inputs, *produced):
+        last.setdefault(b, -1)
+    last[out_buf] = k                    # externally live: survives the region
+
+    active: dict[int, int] = {}          # value -> slot
+    free: list[int] = []
+    nxt = [0]
+
+    def alloc() -> int:
+        if free:
+            return free.pop()
+        s = nxt[0]
+        nxt[0] += 1
+        return s
+
+    slot: dict[int, int] = {}
+    for b in inputs:                     # inputs live from step 0
+        slot[b] = alloc()
+        active[b] = slot[b]
+    for i, m in enumerate(members):
+        # expire strictly-dead values (last use < i) so their slots free up
+        for v in [v for v in list(active) if last.get(v, -1) < i]:
+            free.append(active.pop(v))
+        d = instrs[m].dst
+        s = alloc()
+        slot[d] = s
+        active[d] = s
+        if nxt[0] > budget:
+            return None                  # peak distinct slots exceeds budget
+    return slot if nxt[0] <= budget else None
+
+
+def _region_phase_map(ctx: _Ctx, main_len: int) -> dict[int, int]:
+    """Instr index -> scheduler phase number (only for root compute instrs).
+    Mirrors _reuse_arena: two ops fuse into a region ONLY if the scheduler
+    co-locates them in one barrier phase, so a lane-local map chain fuses but a
+    dependency threading the whole program (the residual stream, whose links sit
+    in different phases separated by the attention/FFN/norm boundaries between
+    them) never does."""
+    from . import scheduler as S
+
+    class _PV:
+        pass
+    pv = _PV()
+    pv.instrs = ctx.instrs
+    pv.buffers = ctx.buffers
+    pv.main_len = main_len
+    sc = S._Scheduler(pv, S.DeviceConfig.from_env(), 1)
+    levels = sc._build_levels(list(range(main_len)))
+    tphase: dict[int, int] = {}
+    for ph, (kind, payload) in enumerate(levels):
+        if kind == "compute":
+            for idx in payload:
+                tphase[idx] = ph
+    return tphase
+
+
+def _fuse_region(ctx: _Ctx, main_len: int) -> None:
+    """Recognize maximal map-regions — WITHIN-PHASE connected runs of pure-map
+    f32 EW ops (elementwise + affine) bounded by cross-lane ops and the
+    dedicated fused ops — and collapse each single-output region into ONE
+    OP_MAP_REGION whose aux descriptor carries a slot map + straight-line
+    micro-program (one global load per input, one store; intermediates stay in
+    per-thread float4 registers). Over-budget or >2-input regions are SPLIT into
+    budget-sized single-output sub-regions (still one kernel; each sub-region's
+    boundary tensor is materialized in the arena and read by the next). GATED
+    HARD: co-scheduled in one phase, single externally-live output, ≤2 inputs
+    per (sub)region, ≤budget slots, all-f32, no viewed operands; any mismatch
+    leaves the decomposed chain untouched. A split that yields only singletons
+    (no op-count reduction) is skipped. PJRT_OCL_FUSE_REGION=0 reverts. Runs
+    after the other fusion passes; the following _dce_nops drops the now-dead
+    members."""
+    if os.environ.get("PJRT_OCL_FUSE_REGION", "1") == "0":
+        return
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+    budget = _region_budget()
+    phase = _region_phase_map(ctx, main_len)
+
+    # unique writer of each buffer (multi-write buffers, e.g. loop carries, are
+    # excluded from regions — the fused reads must see one definition).
+    writer: dict[int, int] = {}
+    multi: set[int] = set()
+    for idx, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        if ins.dst in writer or ins.dst in multi:
+            writer.pop(ins.dst, None)
+            multi.add(ins.dst)
+        else:
+            writer[ins.dst] = idx
+
+    elig = [idx for idx, ins in enumerate(instrs)
+            if _region_eligible(ctx, ins) and ins.dst not in multi
+            and idx in phase]
+    if len(elig) < 2:
+        return
+    eset = set(elig)
+
+    # union-find: connect two eligible members in the SAME phase when one reads
+    # the other's dst (a lane-local map dep — the scheduler runs them on one lane
+    # already; the region additionally keeps the intermediate off the arena).
+    parent = {i: i for i in elig}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for j in elig:
+        for b in _reads_of(instrs[j]):
+            w = writer.get(b)
+            if (w is not None and w in eset and phase[w] == phase[j]
+                    and find(w) != find(j)):
+                parent[find(w)] = find(j)
+
+    comps: dict[int, list[int]] = {}
+    for i in elig:
+        comps.setdefault(find(i), []).append(i)
+
+    for members in comps.values():
+        if len(members) < 2:
+            continue
+        members = sorted(members)                 # SSA (topological) order
+        mset = set(members)
+        n = instrs[members[0]].n
+        if any(instrs[m].n != n for m in members):
+            continue                              # all one element count
+        produced = {instrs[m].dst for m in members}
+        # externally-live members: dst is a program output, or read by a
+        # non-member live instr, or written more than once.
+        readers_out: dict[int, int] = {}          # member dst -> external reads
+        for j, ins in enumerate(instrs):
+            if ins.op == OP_NOP or j in mset:
+                continue
+            for b in _reads_of(ins):
+                if b in produced:
+                    readers_out[b] = readers_out.get(b, 0) + 1
+        live_outs = [m for m in members
+                     if instrs[m].dst in outs or readers_out.get(instrs[m].dst)]
+        live_bufs = {instrs[m].dst for m in live_outs}
+        if len(live_bufs) != 1:
+            continue                              # single-output v1 gate
+        out_buf = next(iter(live_bufs))
+        subregions = _split_region(instrs, members, out_buf, budget)
+        if subregions is None:
+            continue                              # can't fit/split → leave decomposed
+        # a split into only singletons replaces plain EW ops with regions 1:1 —
+        # no phase/round-trip win; leave the decomposed chain untouched.
+        if max(len(s) for s, _ in subregions) < 2:
+            continue
+        for sub_members, sub_out in subregions:
+            _emit_region(ctx, sub_members, sub_out)
+
+
+def _split_region(instrs, members: list[int], out_buf: int, budget: int):
+    """Partition `members` (SSA order) into consecutive single-output sub-regions
+    each ≤2 inputs / ≤budget slots. Returns [(sub_members, out_buf), ...] in
+    order, or None if it cannot be split cleanly (→ fall back to decomposed).
+    A sub-region's output is the member whose dst is read outside the sub-region
+    (later members or externally); a clean cut needs exactly one such value."""
+    produced_here: set[int] = set()      # boundary buffers already emitted
+    later_reads: list[set[int]] = []     # reads by members strictly after i
+    acc: set[int] = set()
+    for m in reversed(members):
+        later_reads.append(set(acc))
+        for b in _reads_of(instrs[m]):
+            acc.add(b)
+    later_reads.reverse()                # later_reads[i] = reads of members[i+1:]
+
+    def analyze(sub: list[int]):
+        prod = {instrs[m].dst for m in sub}
+        inputs = []
+        seen = set()
+        for m in sub:
+            for b in _region_operands(instrs[m]):
+                if b not in prod and b not in seen:
+                    seen.add(b)
+                    inputs.append(b)
+        return prod, inputs
+
+    subs: list[tuple[list[int], int]] = []
+    cur: list[int] = []
+    for i, m in enumerate(members):
+        trial = cur + [m]
+        _, inputs = analyze(trial)
+        slot = _region_slots(trial, instrs, inputs, out_buf)
+        fits = len(inputs) <= 2 and slot is not None
+        if fits:
+            cur = trial
+            continue
+        if not cur:
+            return None                  # a single op doesn't fit → give up
+        cut = _finalize_sub(instrs, cur, members, i, out_buf)
+        if cut is None:
+            return None
+        subs.append(cut)
+        produced_here.add(cut[1])
+        cur = [m]
+        _, inputs = analyze(cur)
+        if len(inputs) > 2 or _region_slots(cur, instrs, inputs, out_buf) is None:
+            return None
+    if cur:
+        subs.append((cur, out_buf))
+    # a single sub covering everything is the no-split case (still valid).
+    return subs
+
+
+def _finalize_sub(instrs, sub: list[int], members: list[int], next_i: int,
+                  out_buf: int):
+    """Close a sub-region `sub` (a prefix of `members`, members[next_i:] remain).
+    Its output = the single member dst read by a later member or externally;
+    returns (sub, out_buf) or None if the live-out is not exactly one value."""
+    subset = set(sub)
+    later = set(members[next_i:])
+    live: set[int] = set()
+    for m in sub:
+        d = instrs[m].dst
+        # read by a member NOT in this sub (later member or the whole-region out)
+        read_later = any(d in _reads_of(instrs[o]) for o in later)
+        if read_later or d == out_buf:
+            live.add(d)
+    if len(live) != 1:
+        return None
+    return (sub, next(iter(live)))
+
+
+def _emit_region(ctx: _Ctx, members: list[int], out_buf: int) -> None:
+    """Encode one single-output sub-region into the aux pool + emit OP_MAP_REGION
+    at the output-producing member's index; NOP the rest. members: SSA order,
+    ≤2 external inputs, fits the slot budget (guaranteed by _split_region)."""
+    instrs = ctx.instrs
+    produced = {instrs[m].dst for m in members}
+    inputs: list[int] = []
+    seen: set[int] = set()
+    for m in members:
+        for b in _region_operands(instrs[m]):
+            if b not in produced and b not in seen:
+                seen.add(b)
+                inputs.append(b)
+    slot = _region_slots(members, instrs, inputs, out_buf)
+    assert slot is not None and len(inputs) <= 2
+
+    in0 = inputs[0]
+    in1 = inputs[1] if len(inputs) == 2 else None
+    n = instrs[members[0]].n
+    # descriptor: [in0_slot, in1_slot, n_micro, out_slot] + n_micro×6 words
+    desc = [slot[in0],
+            slot[in1] if in1 is not None else _REGION_NONE,
+            len(members),
+            slot[out_buf]]
+    for m in members:
+        ins = instrs[m]
+        kind, arity = _REGION_KIND[ins.op]
+        a_slot = slot[ins.a]
+        if arity == "bin":
+            b_slot = slot[ins.b]
+            s_bits, t_bits = 0, 0
+        elif arity == "affine":
+            b_slot = a_slot
+            s_bits, t_bits = ins.imm, ins.imm2
+        else:                            # unary
+            b_slot = a_slot
+            s_bits, t_bits = 0, 0
+        desc += [kind, slot[ins.dst], a_slot, b_slot, s_bits, t_bits]
+    aux_off = ctx.add_aux(desc)
+
+    out_idx = max(m for m in members if instrs[m].dst == out_buf)
+    b_field = in1 if in1 is not None else in0
+    for m in members:
+        instrs[m] = Instr(OP_NOP)
+    instrs[out_idx] = Instr(OP_MAP_REGION, dst=out_buf, a=in0, b=b_field, n=n,
+                            aux=aux_off)
+
+
 def _fuse_matmul_views(ctx: _Ctx) -> None:
     """Access-map fusion for matmul (§13, §14): fold a shape op (transpose/
     reshape/broadcast/slice/reverse — all OP_GATHER_STRIDED) that feeds a
@@ -1865,6 +2233,11 @@ def lower_module(module) -> VMProgram:
     # in its canonical form; before _reuse_arena so liveness sees the fused op.
     _fuse_norm(ctx)
     _fuse_gelu(ctx)
+    # General register-resident map-region fusion (§23/§27/§28): collapse the
+    # remaining pure-map EW chains (bounded by the dedicated fused ops above and
+    # all cross-lane ops) into one OP_MAP_REGION each — K phases → 1. Runs last
+    # so softmax/layernorm/gelu are already single ops (= region boundaries).
+    _fuse_region(ctx, main_len)
     _dce_nops(ctx)
 
     # Liveness-reuse: rewrite arena offsets so the arena is bounded by peak
