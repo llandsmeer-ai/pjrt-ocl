@@ -47,7 +47,8 @@ enum TileOp : uint32_t {
   kTopIotaDim = 5, kTopScatter = 6, kTopDynGather = 7, kTopDynScatter = 8,
   kTopRedWindow = 9, kTopRedSeg = 10,
   kTopSoftmaxSeg = 11, kTopLayernormSeg = 12,  // fused segmented norms (§19)
-  kMaxTileOp = kTopLayernormSeg,
+  kTopMapRegion = 13,  // §27 register-resident map-region (PoC; -DVMO_REGION_POC)
+  kMaxTileOp = kTopMapRegion,
 };
 // dtype packed in tile_op bits 8-15 (matches python DT_* / vm_common.cl).
 enum VmDtype : uint32_t {

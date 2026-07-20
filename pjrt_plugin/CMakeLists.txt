@@ -20,6 +20,7 @@ set(VM_CL_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/scatter.cl
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/dynslice.cl
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/reduce_window.cl
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/region.cl
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vm_main.cl)
 set(VM_CL_OUT ${CMAKE_CURRENT_BINARY_DIR}/vm_cl_source.h)
 # Join with | so the list survives as ONE argument to the -P script (a bare

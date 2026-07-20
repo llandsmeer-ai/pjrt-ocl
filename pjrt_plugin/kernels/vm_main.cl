@@ -31,6 +31,37 @@ static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
         case TOP_RED_SEG:  vmo_redseg_tile(arena, iop, t, tile, dt, As, lid, lsz); break;
         case TOP_SOFTMAX_SEG:   vmo_softmax_seg(arena, iop, t, tile, As, Bs, lid, lsz); break;
         case TOP_LAYERNORM_SEG: vmo_layernorm_seg(arena, iop, t, tile, As, Bs, lid, lsz); break;
+#ifdef VMO_REGION_POC
+        case TOP_MAP_REGION: vmo_map_region(arena, iop, aux, t, tile, lid, lsz); break;
+#endif
+#ifdef VMO_PROBE_REGS
+        /* §27 register-budget probe. VMO_PROBE_REGS float accumulators kept
+         * SIMULTANEOUSLY live across the k-loop, seeded from and reduced back to
+         * arena so ptxas cannot DCE them. Scoped INSIDE this case → measures
+         * whether the megakernel's whole-kernel register count is
+         * max-over-mutually-exclusive-cases (disjoint live ranges) or a sum.
+         * Never emitted by lowering (op id 99 is unused); build-flag only. */
+        case 99: {
+            __global float *d = (__global float *)(arena + t.dst);
+            const uint n = t.p0;
+            float acc[VMO_PROBE_REGS];
+            #pragma unroll
+            for (int i = 0; i < VMO_PROBE_REGS; ++i)
+                acc[i] = (float)(lid + i) + d[i & 63];
+            for (uint k = lid; k < n; k += lsz) {
+                const float s = d[k & 255];
+                #pragma unroll
+                for (int i = 0; i < VMO_PROBE_REGS; ++i)
+                    acc[i] = fma(acc[i], s, (float)i);
+            }
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < VMO_PROBE_REGS; ++i)
+                sum += acc[i];
+            d[lid & 255] = sum;
+            break;
+        }
+#endif
         default: break;
         }
     }

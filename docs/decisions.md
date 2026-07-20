@@ -1657,3 +1657,112 @@ NVIDIA + PoCL PASS. transformer `--check`: NVIDIA TF32 tiny/small/base/large; NV
    instead of `~2.4e-6` (~1 in 6 runs), reproduced on **pristine main** (no OP_GELU) → it lives in
    the fused softmax/layernorm barrier path, not gelu (gelu is barrier-free and stable). Logged for a
    future §19a follow-up; unrelated to this change.
+
+## 27. Register-resident map-region fusion IS free inside the one megakernel — GO (2026-07-20, poc/15)
+
+**Verdict up front: GO.** §24 finding-2 ("the general interpreted region-op is entangled with the
+R3 split-VM; any added register/SLM pressure regresses ALL ops because the TF32 megakernel sits
+*exactly at* the 376-lane boundary") was **too pessimistic — it reasoned about occupancy instead of
+measuring it.** Measured: a register-resident `TOP_MAP_REGION` case added to the real `vm2` costs
+**+0 registers to the whole-kernel max, +0 SLM, and holds co-residency at 376 (the §10c floor)**,
+while computing GELU f32-exact. Region fusion can live in the single megakernel with NO split, NO
+relaunch. (poc/15-region-budget; NVIDIA RTX PRO 6000 Blackwell, 188 SM, sm_120.)
+
+### The instrument (deterministic, unlike the spin-probe)
+
+The occupancy discovery probe (`vmo_discover`) is **bimodal 376/752** run-to-run (backfill
+over-counts co-residency), so it can't resolve a fine register→occupancy curve. Instead, poc/15's
+`regprobe` builds the real `kVmClSource` with **`-cl-nv-verbose`** and reads ptxas's exact per-kernel
+**register / smem / stack / spill**. Two build-flag knobs on the real megakernel (never emitted by
+lowering): `-DVMO_PROBE_REGS=N` (a switch case holding N per-thread float accumulators
+simultaneously live, scoped in-case) and `-DVMO_REGION_POC` (the real interpreted region case). A new
+`PJRT_OCL_EXTRA_BUILD` env injects either flag into the runtime's kernel build so the *actual*
+residency + GELU correctness can be measured end-to-end through `runtime_test`.
+
+### The occupancy model, anchored to hardware and validated both ends
+
+188 SM × 65536 regs/SM; 256 threads/WG (8 warps). WG/SM = floor(65536 / (roundup(R)·256)), capped at
+the ~4-WG/SM hardware ceiling. Cliffs: **R ≤ 128 → 2 WG/SM = 376; R ≥ 129 → 1 WG/SM = 188.** Measured:
+
+| build (vm2)                 | regs | smem  | stack | WG/SM | co-resident (spin-probe) |
+|-----------------------------|------|-------|-------|-------|--------------------------|
+| baseline portable           | 92   | 8196  | 240   | 2     | 376 / 752 (bimodal)      |
+| baseline TF32 (`VMO_NV_PTX`)| 94   | 10244 | 240   | 2     | 376 / 752 (bimodal)      |
+| **region PoC portable**     | **88** | 8196 | 320  | 2     | **376 / 752 (bimodal)**  |
+| **region PoC TF32**         | **88** | 10244| 320  | 2     | **376 / 752 (bimodal)**  |
+| +64 switch-regs (op 99)     | 95   | —     | —     | 2     | (95 < 128 ⇒ 2 WG/SM)     |
+| +80 switch-regs             | 182  | —     | —     | 1     | 188                      |
+| +96 switch-regs             | 197  | —     | —     | 1     | **188 (always)**         |
+
+The spin-probe reads 376 *or* 752 for every in-budget build (≤128 regs) and never 188; the
+over-budget 197-reg build reads **188, always** — the unambiguous occupancy discriminator. So the
+region case (88 regs) is in the SAME occupancy class as the baseline (92–94 regs) and can never fall
+to the 188 that a >128-reg kernel forces; the launch caps at `min(2·CU=376, measured)` = 376 either
+way. The deterministic regcount is the truth; the 752 blips are the discovery protocol counting
+backfilled groups. The cliff itself is sharp and reproducible: 197-reg build → 188 (×2). So
+**baseline has 34–36 registers of headroom before the 128-reg cliff** — the TF32 megakernel at 94
+regs is in the *middle* of the 2-WG/SM shelf (81–128), NOT at its edge. §24's "exactly at the
+boundary" conflated "at the 376 lane cap" with "at the register cliff"; they are 34 registers apart.
+
+### Reconciling 752 (poc/13) vs 376 (§10c)
+
+Not a contradiction — different kernels, different binding resource. poc/13's EW/MMA microkernels use
+~8–24 regs and hit the **4-WG/SM hardware ceiling (752)**; the 92–94-reg megakernel is
+**register-limited to 2 WG/SM (376)**. The 752→376 gap is *entirely* the megakernel's register
+pressure. §10c's earlier "portable 564" (3 WG/SM ⇒ R ≤ 80) was before the op library grew
+(GELU/softmax_seg/layernorm_seg pushed portable to 92 regs ⇒ 2 WG/SM); both variants now sit at 376.
+
+### The three hypotheses — all confirmed
+
+1. **Registers are MAX-not-SUM across mutually-exclusive switch cases.** N = 8, 16, 24, 32, 48, 64
+   in-case float accumulators ALL held vm2 at ~95–96 regs (+3–4 over the 92 baseline) — the region
+   case reuses the matmul case's physical registers (disjoint live ranges). Only at N=80 (182 regs)
+   does the case become the new max and blow past 128. So a switch-addressed-register region using
+   **≤ ~64 float (16 float4 slots)** costs ~0. §24's "adds ~32 vector registers to the whole
+   megakernel" is false: 32 in-case float regs cost +0 to the kernel max.
+2. **Local (SLM) is shared and need not grow.** `vm_main.cl` declares ONE `As`/`Bs` scratch and
+   passes it to every family; the region case declares NO `__local` → smem stays 8196 (portable) /
+   10244 (TF32), byte-identical to baseline. Hypothesis 2 confirmed structurally + by measurement.
+3. **poc/14's "hit" was an impl choice, not an architectural limit.** §24 finding-2's 32 KB SLM =
+   `8 slots × 256 lanes × 16 B` — i.e. a per-**workgroup** `__local float4 R[NSLOTS][WG]` staging
+   tile. Using per-**thread** slots (`float4 R[NSLOTS]` private) removes it: dynamic slot indexing
+   lands the array in per-thread LOCAL/stack memory (+80 bytes stack frame, 0 spill), which consumes
+   neither the register file nor SLM, so occupancy is untouched (88 regs, 376 lanes). The
+   switch-addressed-register alternative (slots stay in registers, faster) also fits — 16 float4
+   slots is inside the 34–64-reg headroom. Either structuring is occupancy-free; §24 assumed the
+   worst of both (SLM tile AND additive registers) and never measured the megakernel.
+
+### The megakernel-native region-op design (fits the fixed budget)
+
+Per-lane budget that keeps ≥ 2 WG/SM = 376 on this part: **≤128 registers/thread** and the shared
+~10 KB `As`/`Bs` SLM (well under the 48 KB/WG SLM limit at 2 WG/SM). The region op:
+- **Per-thread slots, never a per-workgroup SLM tile.** `float4 R[NSLOTS]` scoped in the switch case;
+  intermediates never leave the lane. Reuse the shared `As`/`Bs` only as an explicit spill target if
+  a region ever needs it — the default touches zero SLM.
+- **float4-vectorized single grid-strided tile loop, no cross-workgroup barrier** (pure map: element
+  i independent) — so §18/§19a PoCL barrier rules don't bite and it runs on both engines unchanged.
+- **Inputs ride the task's own dst/a/b handles** (loader-resolved, no aux-handle patching, §20); the
+  aux descriptor carries only the straight-line micro-program (`{kind,dst,a,b,s,t}` over slots) +
+  slot map. Real DAGs / input reuse work (GELU reuses slot0 = x 4×).
+- **Recognizer-splitting for over-budget regions.** A region wider than NSLOTS (or a chain that would
+  push the case past the register headroom) is split by the recognizer into budget-sized on-chip
+  sub-regions, materializing one boundary tensor between them — still ONE kernel, no relaunch
+  (register-tiling, done in the bytecode). Gate `n_slots ≤ 8` (design A) / `≤ 16` (register variant).
+
+### Evidence / correctness
+
+`regprobe` builds clean on NVIDIA; register table above. GELU region (8 pure-map micro-ops over 2
+float4 slots, slot0 reused 4×) through `runtime_test`: **PASS, maxerr 5.96e-08** (f32-exact) on BOTH
+the TF32 and portable (`MEGA_TC=0`) builds; residency in the same 376/752 class as baseline on the
+TF32 (binding) build. **PoCL host-dispatch (CPU) runs the identical region case unchanged — GELU
+PASS, maxerr 5.96e-08** (no barrier, no vendor code → portable across both engines).
+Product code untouched unless `-DVMO_REGION_POC` is set (the case is `#ifdef`-guarded; op 13 reserved
+in the enum + parser; `PJRT_OCL_EXTRA_BUILD` env is inert unless set). Not yet wired into lowering /
+the scheduler recognizer — that is the follow-up now that the occupancy blocker is measured away.
+
+**Caveat (out of scope here): performance.** This settles the *occupancy* GO/NO-GO only. §24's
+finding-1 (at L2-resident base sizes a dedicated fused opcode beats the interpreter ~4× vs 1.3×)
+stands — the general region-op's payoff is the HBM-bound/`large` regime and the phase/instr-count
+collapse, not base-size speed. The value of §27 is that the general op no longer has to wait for the
+R3 split-VM: it can ship in the one megakernel whenever its end-to-end perf is shown to move the
+needle (measure-first, §14a). GO on feasibility; perf gating unchanged.

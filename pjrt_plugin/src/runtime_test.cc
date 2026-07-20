@@ -5,6 +5,8 @@
 // B: while-loop doubling (scalar cond, on-device control entries), 2 lanes.
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <cmath>
 #include <vector>
 
 #include "runtime.h"
@@ -34,6 +36,7 @@ struct Builder {
   std::vector<uint32_t> inputs, outputs;
   std::vector<std::vector<uint64_t>> in_dims, out_dims;
   std::vector<std::pair<uint32_t, std::vector<float>>> consts;
+  std::vector<int32_t> aux;
   std::vector<VmTask> tasks;
   std::vector<std::vector<VmEntry>> lanes;
   std::vector<uint32_t> root_lens;  // 0 = whole stream (no control flow)
@@ -60,7 +63,7 @@ struct Builder {
     p.U32(0x314D5056u); p.U32(3);
     p.U32(bufs.size()); p.U32(0); p.U32(consts.size()); p.U32(0);
     p.U32(inputs.size()); p.U32(outputs.size());
-    p.U32(0); p.U32(0);              // n_aux, pad
+    p.U32(aux.size()); p.U32(0);     // n_aux, pad
     p.U64(arena);
     for (auto [o, s] : bufs) { p.U64(o); p.U64(s); p.U32(0); p.U32(0); }
     for (uint32_t i : inputs) p.U32(i);
@@ -77,6 +80,8 @@ struct Builder {
       for (uint64_t v : d) p.U64(v);
       p.Align8();
     }
+    if (!aux.empty()) p.Raw(aux.data(), aux.size() * 4);
+    p.Align8();
     for (auto& [id, vals] : consts) {
       p.U32(id); p.U32(vals.size() * 4);
       p.Raw(vals.data(), vals.size() * 4);
@@ -206,6 +211,56 @@ int main() {
       if (xo[i] != x[i] * 1024.0f) bad++;
     std::printf("B on-device while (2 lanes): %s (%d bad)\n",
                 bad ? "FAIL" : "PASS", bad);
+    fails += bad != 0;
+  }
+
+  if (std::getenv("REGION_POC")) {  // ---- C: §27 register-resident GELU region ----
+    // Requires the kernel built with PJRT_OCL_EXTRA_BUILD=-DVMO_REGION_POC;
+    // otherwise TOP_MAP_REGION falls to the default no-op case (skipped here).
+    auto fb = [](float f) { int32_t i; std::memcpy(&i, &f, 4); return i; };
+    const uint32_t LANES = 8;
+    const uint32_t EW_TS = rt->ew_ts();
+    const uint32_t N = LANES * EW_TS;
+    Builder b(LANES);
+    uint32_t bx = b.buf(N), by = b.buf(N);
+    b.inputs = {bx};
+    b.outputs = {by};
+    b.in_dims = {{N}};
+    b.out_dims = {{N}};
+    // GELU tail as a pure-map micro-DAG over float4 slots (slot0=x reused 4×):
+    //   {kind, dst, a, b, s_bits, t_bits}; AFFINE = a*s+t.
+    const int32_t MUL = 1, ADD = 0, TANH = 13, AFF = 40;
+    b.aux = {
+        /*in0*/ 0, /*in1*/ (int32_t)0xFFFF, /*n_micro*/ 8, /*out*/ 0,
+        MUL, 1, 0, 0, 0, 0,                          // s1 = x*x
+        MUL, 1, 1, 0, 0, 0,                          // s1 = x^3
+        AFF, 1, 1, 0, fb(0.044715f), fb(0.0f),       // s1 = 0.044715*x^3
+        ADD, 1, 1, 0, 0, 0,                          // s1 = x + 0.044715*x^3
+        AFF, 1, 1, 0, fb(0.7978845608f), fb(0.0f),   // s1 = 0.79788*(...)
+        TANH, 1, 1, 0, 0, 0,                         // s1 = tanh(...)
+        AFF, 1, 1, 0, fb(0.5f), fb(0.5f),            // s1 = 0.5*(1+tanh)
+        MUL, 0, 0, 1, 0, 0,                          // s0 = x * 0.5*(1+tanh)
+    };
+    uint32_t treg = b.task({13 /*kTopMapRegion*/, by, bx, bx, 0 /*desc off*/, N, 0, 0});
+    for (uint32_t l = 0; l < LANES; ++l)
+      b.ent(l, {treg, l, l + 1, FLAGN, 0, FLAGN, 0, 0});
+
+    std::vector<float> x(N);
+    for (uint32_t i = 0; i < N; ++i) x[i] = -4.0f + 8.0f * (float)(i % 101) / 100.0f;
+    std::vector<std::vector<uint8_t>> outs;
+    if (RunProg(rt.get(), b, {x.data()}, &outs)) return 1;
+    const float* yo = reinterpret_cast<const float*>(outs[0].data());
+    int bad = 0; float maxerr = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+      const float xx = x[i];
+      const float g = 0.5f * xx * (1.0f + std::tanh(0.7978845608f *
+                        (xx + 0.044715f * xx * xx * xx)));
+      const float e = std::fabs(yo[i] - g);
+      if (e > maxerr) maxerr = e;
+      if (e > 1e-5f) bad++;
+    }
+    std::printf("C region GELU (8 lanes, %u elems): %s (%d bad, maxerr %.2e)\n",
+                N, bad ? "FAIL" : "PASS", bad, maxerr);
     fails += bad != 0;
   }
 

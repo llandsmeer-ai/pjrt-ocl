@@ -362,6 +362,12 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   for (auto& v : variants)
     v.opts += (v.opts.empty() ? "-DEW_TS=" : " -DEW_TS=") +
               std::to_string(rt->ew_ts_) + "u";
+  // Investigation hook (§27 register-budget PoC): append arbitrary build defines
+  // to every variant, e.g. PJRT_OCL_EXTRA_BUILD="-DVMO_PROBE_REGS=64" or
+  // "-DVMO_REGION_POC". Off unless set; never used by the shipped path.
+  if (const char* e = std::getenv("PJRT_OCL_EXTRA_BUILD"); e && e[0])
+    for (auto& v : variants)
+      v.opts += std::string(v.opts.empty() ? "" : " ") + e;
   std::string build_log;
   bool built = false;
   for (const auto& v : variants) {

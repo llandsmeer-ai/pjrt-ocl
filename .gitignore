@@ -15,3 +15,5 @@ poc/09-cpu-kernels/poc09
 poc/10-cpu-sgemm/poc10
 tools/bench_plot.png
 tools/bench_plot.csv
+build-dev/
+pjrt_plugin/build-dev/
