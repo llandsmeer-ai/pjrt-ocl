@@ -2106,3 +2106,94 @@ a 128×128 double-buffered register tile, §29/§10d).
 **Reproduce:** `cd poc/16-scoreboard && make && PJRT_OCL_DEVICE=NVIDIA ./poc16`
 (mechanism gate); `CFG=base .venv/bin/python poc/16-scoreboard/critical_path.py`
 (overlap ceiling on the real schedule).
+
+## 31. Megakernel-native matmul package (R1 + go-to-188 + P3) — MEASURED, all three a WASH, kept behind flags (2026-07-20)
+
+**Goal.** Attack the base 84%/large matmul gap (§29/§10d) with three coupled,
+staged, individually-verified changes, measured end-to-end, default OFF: **R1**
+(per-tile scoreboard replacing the grid barrier), **go-to-188** (128×128 in-
+megakernel TF32 tile, relaunched at 1 WG/SM via the existing occupancy
+discovery), **P3** (double-buffered K-loop). Hardware: RTX PRO 6000 Blackwell
+(188 SM), TF32 megakernel; CUDA ref = JAX-on-cuda (cuBLAS).
+
+### What shipped as opt-in infrastructure (default byte-identical)
+- **128×128 tile**: `-DVMO_MEGA_BIGTILE` (env `PJRT_OCL_MEGA_BIGTILE=1`) widens
+  the WMMA `vmo_mma_tile` from 64×64 (TC_RF=1,TC_TNW=2) to 128×128
+  (TC_RF=2,TC_TNW=4, 64 f32 accumulators/thread), generalising the warp→fragment
+  map and the m16n16k8 D-fragment masked store. Scheduler `MMA_T` is env-driven
+  (`PJRT_OCL_MMA_T`, runtime advertises 128 only when the big-tile TF32 program
+  actually builds); cost-cal MMA geometry + cache key track the edge.
+- **P3 pipeline**: `-DVMO_MMA_PIPE` (env `PJRT_OCL_MEGA_PIPE=1`) double-buffers
+  the K-loop staging (two smem panels, prefetch next K-block while the tensor
+  cores consume the current — the mm2 pattern, register/smem prefetch, NOT
+  async_work_group_copy §25). Independent of tile size.
+- Both only enter the NVIDIA `-DVMO_NV_PTX` program; portable/PoCL untouched.
+
+### go-to-188 works mechanically — and is a WASH-to-REGRESSION
+Occupancy discovery INDEPENDENTLY measures the drop (not just computed):
+`PJRT_OCL_INFO` reports `lanes=188 measured-residency=188` with the big tile
+(vs 376 default) — the 64-accumulator tile crosses the 128-reg cliff (§27), all
+188 co-resident, barrier stays safe. Correct at TF32 (base --check max_abs
+4.6e-3 PASS, large_l1 4.2e-3 PASS; non-tile-multiple 256×320×192 rel 9e-4). But:
+
+| in-megakernel matmul (PJRT_OCL_MM_KERNEL=0) | 64-tile | 128-tile | +P3(64) | +P3(128) | cuBLAS |
+|---------------------------------------------|---------|----------|---------|----------|--------|
+| N=2048 TFLOP/s                              | **19.1**| 14.1     | 18.6    | 14.1     | 116.5  |
+| N=4096 TFLOP/s                              | **18.3**| 13.9     | 18.4    | 14.1     | 133.3  |
+
+The 128×128 tile is **strictly slower** in-megakernel: halving occupancy
+(376→188) removes more latency-hiding than the doubled per-tile intensity buys,
+because the large matmul was never occupancy-starved (it already fills the grid)
+and the WMMA tile is **smem-bandwidth bound, not intensity/occupancy bound**
+(§10d, re-confirmed). P3 is a **complete wash** on top (18.6/18.4 ≈ 19.1/18.3):
+double-buffering hides *global-load* latency, which was not the bottleneck —
+exactly §10d's earlier double-buffer-is-a-wash finding, now re-derived at 188.
+
+### End-to-end transformer (iters 30; CUDA ref cuBLAS)
+| config    | default 64-tile | big-tile 188 | pipe-only | big+pipe | CUDA   |
+|-----------|-----------------|--------------|-----------|----------|--------|
+| base ms   | **5.37** (12.4×)| 10.10 (23×)  | 5.49      | 10.16    | 0.434  |
+| base util | **0.311**       | 0.184        | —         | —        | —      |
+| large_l1 ms| **4.39** (7.9×)| 5.15 (9.2×)  | —         | 5.11     | 0.557  |
+| large_l1 util| **0.718**    | 0.720        | —         | —        | —      |
+
+The big tile makes **base ~1.9× WORSE** (its 512×512 / 128×64-attention matmuls
+are small: at 128×128/188 lanes they cover FEWER tiles over FEWER lanes → util
+0.311→0.184, the occupancy-bound regime §29 predicted). large_l1 is 1.17× worse
+and its util is unchanged (0.72) — the bigger tile did not raise grid-fill because
+large already fills it; it only removed occupancy. Pipe-only is a wash (5.49 vs
+5.37). Every gate green: default 289/1 pytest, runtime_test PASS, --check
+tiny/small/base/large_l1 PASS (TF32), portable MEGA_TC=0 f32-exact (2.4e-6), PoCL
+f32-exact + flags correctly no-op (host engine, portable path).
+
+### R1 scoreboard — NOT rewired into production (proven 0×, §30 + §14a)
+§30 already proved the scoreboard mechanism is race-free (poc/16) but buys **0×
+on this serial-block transformer** (critical path / total = 1.000× on
+tiny…large): there is no independent phase-level work to overlap, so removing the
+grid barrier cannot recover the 3.36 ms of measured lane-idle — an early-finishing
+lane's NEXT op is RAW-dependent on the straggler it "skipped", so a point-to-point
+WAIT stalls it identically. The barrier PRIMITIVE costs only ~0.18 ms (§29); the
+tax is inherent imbalance, which a scoreboard does not touch without independent
+work. R1's stated §31 job ("be the sync the 188-lane big-tile runs under") is
+**moot**: the big-tile regime it supports is itself a measured wash above, and the
+188-lane barrier is already co-resident-safe (§27) with no scoreboard. Rewiring
+the production scheduler/VM (global list-scheduler + new per-entry sync fields +
+device-scope spin + WAR/region deadlock surface) for a proven-0× result, off by
+default, is the textbook §14a "don't ship". Kept as poc/16 + this design for a
+workload that HAS independent branches (parallel/GPT-J block, MoE, ensembles).
+
+### DECISION (§14a): keep all three behind flags, default OFF; do NOT change the default
+The in-megakernel TF32 tile is at its architectural ceiling (~18–20 TFLOP/s,
+smem-BW-bound at the co-residency-locked size); neither a bigger output tile
+(net loss: −occupancy > +intensity) nor one-level K-loop double-buffering
+(hides the wrong latency) moves it, and R1 has no independent work to overlap.
+**cuBLAS parity (116–133 TFLOP/s) needs a genuinely different engine** — a
+multi-stage register-blocked WMMA pipeline with warp specialisation / cp.async
+software pipelining (cuBLAS-class), which a single output-tile widen + 1-deep
+prefetch do not approximate. The flags are retained as measured A/B infrastructure
+and this honest negative result; the shipped default is unchanged.
+
+**Reproduce:** `PJRT_OCL_MEGA_BIGTILE=1 PJRT_OCL_INFO=1 … bench_transformer.py
+--config base` (lanes=188); `PJRT_OCL_MEGA_BIGTILE=1 PJRT_OCL_MM_KERNEL=0
+MMN=2048 mmbench` (isolated matmul); `PJRT_OCL_MEGA_PIPE=1` (P3 A/B). All default
+OFF; unset flags ⇒ byte-identical 64-tile/376-lane path.

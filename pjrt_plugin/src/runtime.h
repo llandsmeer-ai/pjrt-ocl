@@ -158,6 +158,10 @@ class OclRuntime {
   // EW tile size (elements): compiled into the kernels (-DEW_TS) and
   // advertised to the python scheduler (PJRT_OCL_EW_TS); the two MUST agree.
   cl_uint ew_ts() const { return ew_ts_; }
+  // MMA output-tile edge (elements): compiled into the TF32 megakernel
+  // (-DVMO_MEGA_BIGTILE => 128) and advertised to the scheduler
+  // (PJRT_OCL_MMA_T); the two MUST agree so tile counts match. Default 64.
+  cl_uint mma_t() const { return mma_t_; }
   size_t local_size() const { return local_size_; }
   // Host-dispatch engine: the host drives control flow and enforces the
   // cross-workgroup barrier via clFinish between per-phase launches (no
@@ -226,6 +230,7 @@ class OclRuntime {
   cl_mem dummy_buf_ = nullptr;         // placeholder for unused I/O ports
   cl_uint ngroups_ = 0;    // co-resident workgroups (GPUs: measured, poc/08)
   cl_uint ew_ts_ = 16384;  // EW tile elements (GPU: 4096; see ew_ts())
+  cl_uint mma_t_ = 64;     // MMA tile edge (128 when TF32 big-tile built; mma_t())
   size_t local_size_ = 64;
   bool host_dispatch_ = false;
   std::mutex mu_;  // serializes execute (single in-order queue)

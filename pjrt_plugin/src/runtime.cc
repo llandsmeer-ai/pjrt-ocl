@@ -425,8 +425,27 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
                  rt->info_.has_device_fence;
   if (const char* e = std::getenv("PJRT_OCL_MEGA_TC"); e && e[0] == '0')
     mega_tc = false;
+  // §31 go-to-188: PJRT_OCL_MEGA_BIGTILE=1 builds the TF32 megakernel with a
+  // 128x128 MMA tile (-DVMO_MEGA_BIGTILE). The larger accumulator crosses the
+  // 128-register cliff so occupancy discovery relaunches at 1 WG/SM = 188
+  // lanes (all co-resident; barrier/scoreboard safe, §27). Only meaningful
+  // with the TF32 (WMMA) path; the scheduler is told MMA_T=128 (below) only if
+  // the big-tile TF32 program actually builds, so the portable 64x64 fallback
+  // is never driven by a 128-tile schedule.
+  bool big_tile = mega_tc;
+  if (const char* e = std::getenv("PJRT_OCL_MEGA_BIGTILE");
+      !(e && e[0] && e[0] != '0'))
+    big_tile = false;
+  // P3 (§31): -DVMO_MMA_PIPE double-buffers the WMMA K-loop staging. Opt-in via
+  // PJRT_OCL_MEGA_PIPE; independent of tile size (A/B either). Off by default.
+  bool mma_pipe = mega_tc;
+  if (const char* e = std::getenv("PJRT_OCL_MEGA_PIPE");
+      !(e && e[0] && e[0] != '0'))
+    mma_pipe = false;
   if (mega_tc) {
     std::string tc_opts = rt->info_.build_opts + " -DVMO_NV_PTX";
+    if (big_tile) tc_opts += " -DVMO_MEGA_BIGTILE";
+    if (mma_pipe) tc_opts += " -DVMO_MMA_PIPE";
     const char* tsrc = kVmClSource;
     size_t tlen = std::strlen(tsrc);
     cl_int tce;
@@ -438,6 +457,10 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
       rt->vm_tc_kernel_ = clCreateKernel(rt->tc_mega_program_, "vm2", &tce);
       if (tce != CL_SUCCESS) rt->vm_tc_kernel_ = nullptr;
     }
+    // Advertise 128 to the scheduler ONLY if the 128x128 TF32 kernel is the one
+    // that will execute (built AND non-null). If it failed, mma_t_ stays 64 and
+    // the portable fallback runs a matching 64x64 schedule.
+    if (big_tile && rt->vm_tc_kernel_) rt->mma_t_ = 128;
     if (!rt->vm_tc_kernel_ && rt->tc_mega_program_) {
       std::string log(1 << 14, '\0');
       size_t ls = 0;
@@ -1616,7 +1639,8 @@ class CalBuilder {
   uint32_t ew_tile_;
 };
 
-VmProgram BuildCalProgram(uint32_t family, uint32_t tiles, uint32_t ew_tile) {
+VmProgram BuildCalProgram(uint32_t family, uint32_t tiles, uint32_t ew_tile,
+                          uint32_t mma_edge) {
   CalBuilder b(ew_tile);
   const uint64_t kEw = ew_tile;
   switch (family) {
@@ -1630,8 +1654,11 @@ VmProgram BuildCalProgram(uint32_t family, uint32_t tiles, uint32_t ew_tile) {
       break;
     }
     case kTopMma: {
-      // 64x64 output tiles (kernel MMA_TM/TN): M = 64*tiles, N = 64, K = 256.
-      const uint32_t M = 64 * tiles, N = 64, K = 256;
+      // One MMA output tile per `tiles` (kernel MMA_TM/TN == mma_edge): M =
+      // mma_edge*tiles, N = mma_edge, K = 256. Must track the kernel tile edge
+      // (64, or 128 under -DVMO_MEGA_BIGTILE) so the schedule's tile count
+      // matches the kernel's tile->(tr,tc) mapping and stays in bounds.
+      const uint32_t M = mma_edge * tiles, N = mma_edge, K = 256;
       uint32_t a = b.Buf(uint64_t{M} * K), c = b.Buf(uint64_t{K} * N),
                d = b.Buf(uint64_t{M} * N);
       b.Fill(a, uint64_t{M} * K);
@@ -1668,7 +1695,8 @@ VmProgram BuildCalProgram(uint32_t family, uint32_t tiles, uint32_t ew_tile) {
 double TimeCalProgram(OclRuntime* rt, uint32_t family, uint32_t tiles,
                       std::string* err) {
   std::unique_ptr<LoadedProgram> lp =
-      LoadedProgram::Load(rt, BuildCalProgram(family, tiles, rt->ew_ts()), err);
+      LoadedProgram::Load(rt, BuildCalProgram(family, tiles, rt->ew_ts(),
+                                              rt->mma_t()), err);
   if (!lp) return -1.0;
   std::vector<std::vector<uint8_t>> outs;
   if (!lp->Execute({}, &outs, err)) return -1.0;  // warmup
@@ -1708,7 +1736,8 @@ void OclRuntime::CalibrateCosts() {
   // go stale when the kernels (or their device-keyed variants) change.
   const std::string key =
       info_.platform_name + "|" + info_.device_name + "|" +
-      info_.driver_version + "|" + info_.build_opts;
+      info_.driver_version + "|" + info_.build_opts + "|mma" +
+      std::to_string(mma_t_);
   uint64_t hash = 1469598103934665603ull;
   for (unsigned char c : key) hash = (hash ^ c) * 1099511628211ull;
   for (const char* c = kVmClSource; *c; ++c)

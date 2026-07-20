@@ -19,8 +19,23 @@
  * cvta.to.shared, wmma.store.d.shared is broken so edges use a hand-mapped
  * direct global store. Batch (t.p3>1, attention) handled by the shared tile/g
  * setup, so batched matmul gets tensor cores too. */
+/* Output tile edge. Default 64x64. The NVIDIA TF32 path can be built with
+ * -DVMO_MEGA_BIGTILE (§31/§10d go-to-188): a 128x128 output tile whose larger
+ * register accumulator raises arithmetic intensity past the 64-tile's ~16
+ * FLOP/byte cap. The bigger accumulator pushes the megakernel's per-thread
+ * register count over 128, so occupancy discovery relaunches the WHOLE single
+ * megakernel at 1 WG/SM = 188 co-resident lanes (still barrier/scoreboard safe;
+ * §27). The scheduler's MMA_T (PJRT_OCL_MMA_T) MUST match MMA_TM/MMA_TN so tile
+ * counts agree. Only the VMO_NV_PTX (WMMA) path honours the big tile; the
+ * portable scalar 4x4 path stays 64x64 (a 128x128 scalar microtile spills,
+ * §10b), so -DVMO_MEGA_BIGTILE is only ever set on the TF32 program. */
+#if defined(VMO_MEGA_BIGTILE) && defined(VMO_NV_PTX)
+#define MMA_TM 128
+#define MMA_TN 128
+#else
 #define MMA_TM 64
 #define MMA_TN 64
+#endif
 #define MMA_BK 16
 #define MMA_TDIM 16          /* 16x16 thread grid == 256 threads */
 #define MMA_RM (MMA_TM / MMA_TDIM)   /* 4 */
@@ -31,8 +46,19 @@
  * conflict). LDS=20 makes gcd(20,32)=4 -> 8 distinct bank offsets, conflict-
  * free-ish. Costs 25% more staging smem; no accumulator registers. */
 #define TC_LDS (MMA_BK + 4)
-#define MMA_ASZ (MMA_TM * TC_LDS)    /* As[m*LDS + k] */
-#define MMA_BSZ (MMA_TN * TC_LDS)    /* Bs[n*LDS + k] col-major, padded */
+/* P3 (§31): double-buffered K-loop. Two staging panels; prefetch the NEXT
+ * K-block's global->smem while the current block is consumed by the tensor
+ * cores, so global-load latency overlaps compute. Only when built with
+ * -DVMO_MMA_PIPE (PJRT_OCL_MEGA_PIPE). At 1 WG/SM (188 lanes, the big tile) the
+ * doubled staging smem is affordable; §10d found this a WASH at 64-tile/376
+ * lanes (not latency-bound there) — measure-first. */
+#ifdef VMO_MMA_PIPE
+#define MMA_NBUF 2
+#else
+#define MMA_NBUF 1
+#endif
+#define MMA_ASZ (MMA_NBUF * MMA_TM * TC_LDS)    /* As[buf][m*LDS + k] */
+#define MMA_BSZ (MMA_NBUF * MMA_TN * TC_LDS)    /* Bs[buf][n*LDS + k] col-major */
 #else
 #define MMA_ASZ (MMA_BK * MMA_TM)    /* As[m*BK + k] */
 #define MMA_BSZ (MMA_BK * MMA_TN)    /* Bs[k*TN+n] portable */
@@ -59,7 +85,21 @@
         : "r"((a)[0]),"r"((a)[1]),"r"((a)[2]),"r"((a)[3]),                     \
           "r"((b)[0]),"r"((b)[1]),"r"((b)[2]),"r"((b)[3]))
 
+/* Warp -> output-subtile geometry. 8 warps (256 threads) are arranged as a
+ * 4(row) x 2(col) warp grid regardless of tile size; a bigger tile just gives
+ * each warp MORE 16x16 fragments to own:
+ *   64x64  : each warp owns 16 rows x 32 cols = TC_RF=1 x TC_TNW=2 fragments.
+ *   128x128: each warp owns 32 rows x 64 cols = TC_RF=2 x TC_TNW=4 fragments
+ *            (64 f32 accumulators/thread -> the register cliff -> 188 lanes). */
+#if defined(VMO_MEGA_BIGTILE) && defined(VMO_NV_PTX)
+#define TC_RF 2
+#define TC_TNW 4
+#else
+#define TC_RF 1              /* 16-row fragments per warp */
 #define TC_TNW 2             /* 16-wide col subtiles per warp (2*16 == 32) */
+#endif
+#define WARP_RM (TC_RF * 16)   /* rows a warp owns */
+#define WARP_CN (TC_TNW * 16)  /* cols a warp owns */
 #define TC_KSUB (MMA_BK / 8) /* wmma k-substeps per staged BK block */
 
 static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global const int *aux,
@@ -90,8 +130,8 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
     const uint row0 = tr * MMA_TM, col0 = tc * MMA_TN;
     const uint lid = get_local_id(0);
     const uint warp = lid >> 5, lane = lid & 31;
-    const uint wm = warp & 3;       /* 0..3  -> row block wm*16 (4*16 == 64) */
-    const uint wn = warp >> 2;      /* 0..1  -> col block wn*32 (2*32 == 64) */
+    const uint wm = warp & 3;       /* 0..3  -> row block wm*WARP_RM */
+    const uint wn = warp >> 2;      /* 0..1  -> col block wn*WARP_CN */
     /* VIEW-folded operands (docs/decisions.md §13 applied to matmul): when
      * av/bv != 0 the operand read is a strided gather (folded transpose/reshape/
      * broadcast) over the pre-transpose SOURCE buffer, so element (g,m,k) reads
@@ -103,56 +143,92 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
     __global const float *ga = ba + (size_t)g * M * K;
     __global const float *gb = bb + (size_t)g * K * N;
 
-    float acc[TC_TNW][8];
-    for (int j = 0; j < TC_TNW; j++)
-        for (int e = 0; e < 8; e++) acc[j][e] = 0.0f;
+    float acc[TC_RF][TC_TNW][8];
+    for (int i = 0; i < TC_RF; i++)
+        for (int j = 0; j < TC_TNW; j++)
+            for (int e = 0; e < 8; e++) acc[i][j][e] = 0.0f;
 
+    /* Stage K-block K0 (global -> smem panel BUF). As row-major [m*LDS+k],
+     * Bs col-major [n*LDS+k]; padded LDS is bank-conflict-mitigated. */
+#define TC_STAGE(BUF, K0)                                                      \
+    do {                                                                       \
+        __local float *As_ = As + (size_t)(BUF) * MMA_TM * TC_LDS;             \
+        __local float *Bs_ = Bs + (size_t)(BUF) * MMA_TN * TC_LDS;             \
+        for (uint idx = lid; idx < MMA_TM * MMA_BK; idx += 256) {              \
+            const uint m = idx / MMA_BK, kk = idx % MMA_BK;                    \
+            const uint gr = row0 + m, gk = (K0) + kk;                          \
+            const bool in = (gr < M && gk < K);                               \
+            As_[m * TC_LDS + kk] = !in ? 0.0f                                  \
+                : av ? ba[vmo_view_idx(aux, av - 1u,                          \
+                          (uint)((size_t)g * M * K + (size_t)gr * K + gk))]    \
+                     : ga[gr * K + gk];                                        \
+        }                                                                      \
+        for (uint idx = lid; idx < MMA_TN * MMA_BK; idx += 256) {              \
+            const uint n = idx / MMA_BK, kk = idx % MMA_BK;                    \
+            const uint gk = (K0) + kk, gc = col0 + n;                          \
+            const bool in = (gk < K && gc < N);                               \
+            Bs_[n * TC_LDS + kk] = !in ? 0.0f                                  \
+                : bv ? bb[vmo_view_idx(aux, bv - 1u,                          \
+                          (uint)((size_t)g * K * N + (size_t)gk * N + gc))]    \
+                     : gb[gk * N + gc];                                        \
+        }                                                                      \
+    } while (0)
+
+    /* Consume K-block held in panel BUF (fragment loads + tensor-core MMAs). */
+#define TC_COMPUTE(BUF)                                                        \
+    do {                                                                       \
+        __local float *As_ = As + (size_t)(BUF) * MMA_TM * TC_LDS;             \
+        __local float *Bs_ = Bs + (size_t)(BUF) * MMA_TN * TC_LDS;             \
+        for (uint ks = 0; ks < TC_KSUB; ks++) {                               \
+            uint af[TC_RF][4], bf[TC_TNW][4];                                 \
+            for (int i = 0; i < TC_RF; i++)                                    \
+                TC_LOAD_A(af[i], &As_[(wm * WARP_RM + i * 16) * TC_LDS +       \
+                                      ks * 8], TC_LDS);                        \
+            for (int j = 0; j < TC_TNW; j++)                                   \
+                TC_LOAD_B(bf[j], &Bs_[(wn * WARP_CN + j * 16) * TC_LDS +       \
+                                      ks * 8], TC_LDS);                        \
+            for (int i = 0; i < TC_RF; i++)                                    \
+                for (int j = 0; j < TC_TNW; j++)                               \
+                    TC_MMA(acc[i][j], af[i], bf[j]);                          \
+        }                                                                      \
+    } while (0)
+
+#if MMA_NBUF == 2
+    /* Double-buffered pipeline: prefetch next K-block while computing current. */
+    uint buf = 0;
+    TC_STAGE(0, 0);
+    barrier(CLK_LOCAL_MEM_FENCE);
     for (uint k0 = 0; k0 < K; k0 += MMA_BK) {
-        for (uint idx = lid; idx < MMA_TM * MMA_BK; idx += 256) {
-            const uint m = idx / MMA_BK, kk = idx % MMA_BK;   /* As row-major */
-            const uint gr = row0 + m, gk = k0 + kk;
-            const bool in = (gr < M && gk < K);
-            As[m * TC_LDS + kk] = !in ? 0.0f
-                : av ? ba[vmo_view_idx(aux, av - 1u,
-                          (uint)((size_t)g * M * K + (size_t)gr * K + gk))]
-                     : ga[gr * K + gk];
-        }
-        for (uint idx = lid; idx < MMA_TN * MMA_BK; idx += 256) {
-            const uint n = idx / MMA_BK, kk = idx % MMA_BK;   /* Bs col-major */
-            const uint gk = k0 + kk, gc = col0 + n;
-            const bool in = (gk < K && gc < N);
-            Bs[n * TC_LDS + kk] = !in ? 0.0f
-                : bv ? bb[vmo_view_idx(aux, bv - 1u,
-                          (uint)((size_t)g * K * N + (size_t)gk * N + gc))]
-                     : gb[gk * N + gc];
-        }
+        if (k0 + MMA_BK < K) TC_STAGE(buf ^ 1u, k0 + MMA_BK);
+        TC_COMPUTE(buf);
         barrier(CLK_LOCAL_MEM_FENCE);
-        for (uint ks = 0; ks < TC_KSUB; ks++) {
-            uint af[4], bf[TC_TNW][4];
-            __local float *ap = &As[(wm * 16) * TC_LDS + ks * 8];
-            TC_LOAD_A(af, ap, TC_LDS);
-            for (int j = 0; j < TC_TNW; j++) {
-                __local float *bp = &Bs[(wn * 32 + j * 16) * TC_LDS + ks * 8];
-                TC_LOAD_B(bf[j], bp, TC_LDS);
-            }
-            for (int j = 0; j < TC_TNW; j++) TC_MMA(acc[j], af, bf[j]);
-        }
+        buf ^= 1u;
+    }
+#else
+    for (uint k0 = 0; k0 < K; k0 += MMA_BK) {
+        TC_STAGE(0, k0);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        TC_COMPUTE(0);
         barrier(CLK_LOCAL_MEM_FENCE);
     }
+#endif
+#undef TC_STAGE
+#undef TC_COMPUTE
 
     /* Masked direct global store via the derived m16n16k8 D-fragment map
      * (wmma.store.d.shared is broken on this driver — poc/08):
      *   row = (lane>>2) + 8*((reg>>1)&1)
      *   col = (lane&3)*2 + (reg&1) + 8*(reg>>2)                              */
     __global float *gd = AP(float, t.dst) + (size_t)g * M * N;
+    for (int i = 0; i < TC_RF; i++)
     for (int j = 0; j < TC_TNW; j++) {
-        const uint gr0 = row0 + wm * 16;
-        const uint gc0 = col0 + wn * 32 + j * 16;
+        const uint gr0 = row0 + wm * WARP_RM + i * 16;
+        const uint gc0 = col0 + wn * WARP_CN + j * 16;
         for (int reg = 0; reg < 8; reg++) {
             const uint r = (lane >> 2) + 8u * ((reg >> 1) & 1);
             const uint c = (lane & 3) * 2 + (reg & 1) + 8u * (reg >> 2);
             const uint gr = gr0 + r, gc = gc0 + c;
-            if (gr < M && gc < N) gd[gr * N + gc] = acc[j][reg];
+            if (gr < M && gc < N) gd[gr * N + gc] = acc[i][j][reg];
         }
     }
 }

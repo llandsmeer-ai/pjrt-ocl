@@ -38,7 +38,11 @@ from . import opsem
 # on the tile -> element-range mapping. Standalone imports (unit tests) get
 # the CPU/default 16384.
 TILE_SIZE = int(os.environ.get("PJRT_OCL_EW_TS", "16384") or "16384")
-MMA_T = 64                 # MMA output tile edge (vm2.cl MMA_TM/MMA_TN)
+# MMA output tile edge (must equal the kernel's MMA_TM/MMA_TN). Default 64; the
+# runtime advertises 128 via PJRT_OCL_MMA_T when the TF32 megakernel is built
+# with -DVMO_MEGA_BIGTILE (§31 go-to-188). Tile counts (Task.n_tiles) MUST match
+# the kernel's tile->(tr,tc) mapping, so the two sides read the same value.
+MMA_T = int(os.environ.get("PJRT_OCL_MMA_T", "64") or "64")
 
 TILE_EW = 0
 TILE_MMA = 1
