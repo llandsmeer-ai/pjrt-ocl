@@ -2197,3 +2197,38 @@ and this honest negative result; the shipped default is unchanged.
 --config base` (lanes=188); `PJRT_OCL_MEGA_BIGTILE=1 PJRT_OCL_MM_KERNEL=0
 MMN=2048 mmbench` (isolated matmul); `PJRT_OCL_MEGA_PIPE=1` (P3 A/B). All default
 OFF; unset flags ⇒ byte-identical 64-tile/376-lane path.
+
+## 32. Decode workload measured — still 12×, and it's the SAME wall (2026-07-20, tools/bench_decode.py)
+
+Tested the regime megakernels are built for — batch-1 autoregressive DECODE (one token + KV cache,
+all matmuls become memory-bound matVECs). Hypothesis (§31): our launch-elimination + fusion thesis
+should WIN here where cuBLAS's compute tuning is irrelevant. **Measured: it does NOT.**
+
+| config | ours µs/tok | ours GB/s | CUDA µs/tok | CUDA GB/s | gap |
+|--------|-------------|-----------|-------------|-----------|-----|
+| small  | 1523 | 9   | 344  | 40  | 4.4× |
+| base   | 5702 | **14 (0.8% of peak)** | 464  | 176 | 12.3× |
+| large  | 8283 | 39  | 1036 | 316 | 8.0× |
+
+**But it's NOT the matvec kernel.** A *standalone* `(1,K)@(K,N)` matvec is only **1.9–2.9× off cuBLAS**
+(ours 52–115 GB/s vs 98–328) — our GEMV path is fine. The full decode model is 14 GB/s because it's
+**~107 barriered phases each doing a tiny matvec** — the per-phase overhead (barrier + fixed-376-lane
+grid hugely underutilized on ~D outputs) dominates the tiny per-token work. base decode = ~1.4ms of
+actual weight reads + ~4.3ms of phase overhead.
+
+**This is the SAME wall as prefill (§29/§31), amplified.** Too many phases, too much per-phase
+overhead relative to the work. Decode makes it worse because per-phase work is tiny (matvec vs matmul).
+
+**How the literature wins decode (survey §1.1):** Hazy fuses the WHOLE forward pass into **~7 fused
+instruction types** (RMSNorm+QKV-matvec+RoPE = ONE instruction, activation read once, weights
+streamed) + no global barriers. **~7 phases, not 107.** That's DEEP fusion that folds matmul TOGETHER
+with its surrounding norm/activation into one instruction body — hand-written fused CUDA. Our EW/norm
+fusion (§19/§24) doesn't touch the matmul boundaries, so every matmul is still its own phase.
+
+**Conclusion:** both regimes hit the same structural limit — a generic interpreted VM with one
+op(-group) per phase and a barrier between can't reach the literature's ~7-instruction deep fusion,
+which requires fusing matmul WITH its epilogue/prologue into single register-resident instructions.
+That's the real megakernel superpower, it's hand-written in the literature, and it's hard/non-portable
+to do generically. Our per-op kernels are competitive (~2×); the phase count × per-phase overhead is
+the gap, in BOTH regimes. R2c (matmul epilogue fusion, decisions.md R-list) is the frontier that
+would start to close it — fold the norm/residual/activation into the matmul's store.
