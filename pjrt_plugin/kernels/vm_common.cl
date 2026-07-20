@@ -123,8 +123,43 @@ enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
 #define FLAG_NONE   0xFFFFFFFFu
 
 typedef struct {
-    uint tile_op, dst, a, b, p0, p1, p2, p3, p4, p5;
-} task_t;   /* p4/p5: MMA operand VIEW aux-offsets (+1; 0 = contiguous) */
+    uint tile_op, dst, a, b, p0, p1, p2, p3, p4, p5, p6, p7;
+} task_t;   /* p4/p5: MMA operand VIEW aux-offsets (+1; 0 = contiguous).
+             * p6/p7 (§33 R2c matmul epilogue): p6 = epilogue descriptor aux
+             * word-offset (+1; 0 = no epilogue); p7 = the epilogue's second-input
+             * buffer handle (residual/bias), loader-patched to a byte offset. */
+
+/* §33 R2c: shared straight-line map micro-op interpreter over a per-thread
+ * value. Used by BOTH ops/region.cl (OP_MAP_REGION, float4-vectorized) and
+ * ops/mma.cl (the matmul store-epilogue, scalar per accumulator element). The
+ * builtins MUST byte-match ops/ew.cl so a fused region/epilogue is numerically
+ * identical to the decomposed EW chain it replaces. `kind` is a SUB_* opcode
+ * (the pure-map ALU subset the recognizers emit). Defined here (concatenated
+ * first) so it precedes both callers in the single translation unit. */
+static float4 vmo_region_micro(const uint kind, const float4 x, const float4 y,
+                               const float s, const float t)
+{
+    switch (kind) {
+    case SUB_ADD:    return x + y;
+    case SUB_MUL:    return x * y;
+    case SUB_SUB:    return x - y;
+    case SUB_DIV:    return x / y;
+    case SUB_MAX:    return fmax(x, y);
+    case SUB_MIN:    return fmin(x, y);
+    case SUB_NEG:    return -x;
+    case SUB_EXP:    return exp(x);
+    case SUB_LOG:    return log(x);
+    case SUB_SQRT:   return sqrt(x);
+    case SUB_RSQRT:  return rsqrt(x);
+    case SUB_TANH:   return tanh(x);
+    case SUB_ABS:    return fabs(x);
+    case SUB_AFFINE: return mad(x, (float4)(s), (float4)(t));  /* x*s + t */
+    /* GELU tanh-approx — byte-identical to ops/ew.cl VMO_GELU_BODY / vmo_gelu4. */
+    case SUB_GELU:   return 0.5f * x * (1.0f + tanh(0.7978845608f *
+                            (x + 0.044715f * x * x * x)));
+    default:         return x;
+    }
+}
 
 typedef struct {
     uint task, tile_lo, tile_hi, wait_flag, wait_count, signal_flag,

@@ -32,9 +32,12 @@ enum VmOp : uint32_t {
 struct VmTask {
   // p4/p5: MMA operand VIEW aux-offsets (+1; 0 = contiguous), for shape-op
   // (transpose/reshape/broadcast) fold into the matmul operand read (§13).
-  uint32_t tile_op, dst, a, b, p0, p1, p2, p3, p4, p5;
+  // p6/p7 (§33 R2c matmul epilogue): p6 = epilogue descriptor aux word-offset
+  // (+1; 0 = none); p7 = the epilogue's second-input (residual/bias) buffer
+  // handle, loader-patched to a byte offset like dst/a/b when p6 != 0.
+  uint32_t tile_op, dst, a, b, p0, p1, p2, p3, p4, p5, p6, p7;
 };
-static_assert(sizeof(VmTask) == 40);
+static_assert(sizeof(VmTask) == 48);
 
 struct VmEntry {
   uint32_t task, tile_lo, tile_hi, wait_flag, wait_count, signal_flag,

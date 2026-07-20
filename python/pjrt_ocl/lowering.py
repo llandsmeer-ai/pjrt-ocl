@@ -224,6 +224,11 @@ class Instr:
     # ins.aux (written by _finalize_matmul_views, so it survives serialization).
     aview: int = 0
     bview: int = 0
+    # OP_DOT matmul epilogue (§33 R2c), set by _fuse_mma_epilogue. NOT serialized:
+    # the scheduler reads these in-memory -> task p6/p7; the epilogue descriptor
+    # itself lives in the (serialized) aux pool and the kernel finds it via p6.
+    epi: int = 0        # epilogue descriptor aux word-offset (+1; 0 = none)
+    epi_res: int = 0    # epilogue second-input (residual/bias) buffer id
 
 
 def _pad8(out: bytearray) -> None:
@@ -2005,15 +2010,145 @@ def _fuse_matmul_views(ctx: _Ctx) -> None:
 
 
 def _finalize_matmul_views(ctx: _Ctx) -> None:
-    """Mirror each folded DOT's (aview, bview) into a 2-word aux header and point
-    ins.aux at it, so the tensor-interpreter validator (which runs on the
-    re-parsed, serialized bytecode and cannot see the in-memory aview/bview) can
-    recover the views. The scheduler uses the in-memory fields directly; the
-    device uses the resulting task p4/p5."""
+    """Mirror each folded DOT's (aview, bview) AND its §33 R2c epilogue (epi
+    descriptor offset + residual buf) into a 4-word aux header, pointing ins.aux
+    at it, so the tensor-interpreter validator (which runs on the re-parsed,
+    serialized bytecode and cannot see the in-memory aview/bview/epi) can recover
+    them. The scheduler uses the in-memory fields directly (-> task p4/p5/p6/p7);
+    the device uses the resulting task fields. Runs AFTER _fuse_mma_epilogue so
+    the epilogue fields are settled."""
     for idx, ins in enumerate(ctx.instrs):
-        if ins.op == OP_DOT and (ins.aview or ins.bview):
-            hdr = ctx.add_aux([ins.aview, ins.bview])
+        if ins.op == OP_DOT and (ins.aview or ins.bview or ins.epi):
+            hdr = ctx.add_aux([ins.aview, ins.bview, ins.epi, ins.epi_res])
             ctx.instrs[idx] = dataclasses.replace(ins, aux=hdr)
+
+
+# --- §33 R2c: matmul-inclusive epilogue fusion --------------------------------
+#
+# A matmul computes its output TILE in registers/accumulators before the store
+# (ops/mma.cl vmo_mma_tile). Fold a following pure-map EW chain
+# (scale/bias/gelu/+residual) into that store so `matmul → {scale,gelu,+residual}`
+# collapses from ≥2 barrier phases into ONE. The micro-program rides in the aux
+# pool (task.p6) and the kernel runs the shared vmo_region_micro on each
+# accumulator value before storing. Attacks the §29/§32 phase-count wall at the
+# matmul boundary the §19/§26/§28 EW fusion never touched.
+
+# SUB_* opcodes the epilogue micro-program uses (MUST match vm_common.cl).
+_EPI_ADD, _EPI_AFFINE, _EPI_GELU = 0, 40, 41
+# src: 0 = unary on the accumulator; 1 = binary reading p7 per-element
+# (residual: p7[g*M*N + gr*N + gc]); 2 = binary reading p7 per-column (bias).
+_EPI_SELF, _EPI_ELEM, _EPI_COL = 0, 1, 2
+
+
+def _fuse_mma_epilogue(ctx: _Ctx, main_len: int) -> None:
+    """Fold each matmul's following pure-map EW chain into the matmul store
+    (§33 R2c). For every OP_DOT that will use TILE_MMA (skip the N==1 gemv route
+    and viewed-output cases), greedily walk the SINGLE consumer of the matmul
+    output while it is a fusible epilogue op with matching element count and is
+    not a program output:
+      OP_GELU            → gelu on the accumulator          (unary)
+      OP_AFFINE_F32      → x*s+t on the accumulator          (unary; QKᵀ scale)
+      OP_ADD_F32 + a full-size external `res` → +residual    (binary, one per DOT)
+    Stop at the first non-eligible/multi-consumer/second-binary/size-mismatch.
+    Retarget the DOT dst to the last folded op's dst, NOP the folded ops, encode
+    the micro-program into aux, set DOT.epi / epi_res / reads_hint. Gated HARD;
+    any mismatch leaves the decomposed chain untouched.  PJRT_OCL_FUSE_MMA_EPI=0
+    reverts. Runs after _fuse_norm/_fuse_gelu/_fuse_region (so GELU/scale are
+    already single ops) and before _reuse_arena."""
+    if os.environ.get("PJRT_OCL_FUSE_MMA_EPI", "1") == "0":
+        return
+    instrs = ctx.instrs
+
+    def _elems(buf: int) -> int:
+        return ctx.buffers[buf].size_bytes // 4
+
+    # unique writer + total reader count per buffer (over live, non-NOP instrs).
+    writer: dict[int, int] = {}
+    multi: set[int] = set()
+    readers: dict[int, list[int]] = {}
+    for idx, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        d = ins.dst
+        if d in writer or d in multi:
+            writer.pop(d, None)
+            multi.add(d)
+        else:
+            writer[d] = idx
+        for b in _reads_of(ins):
+            readers.setdefault(b, []).append(idx)
+    outs = set(ctx.outputs)
+
+    for di, DOT in enumerate(instrs):
+        if DOT.op != OP_DOT:
+            continue
+        M, N = DOT.n, DOT.imm >> 16
+        G = max(1, DOT.imm2)
+        total = M * N * G
+        # N==1 routes to the segmented-reduce gemv path (no epilogue) — skip.
+        # A viewed OUTPUT never happens (dot writes contiguous); operand views
+        # (aview/bview) are fine and independent of the epilogue.
+        if N == 1 and G == 1:
+            continue
+
+        micros: list[tuple[int, int, int, int]] = []   # (kind, src, s, t)
+        consumed: list[int] = []
+        res_buf = 0
+        binary_used = False
+        cur = DOT.dst
+        last_dst = DOT.dst
+        while True:
+            live_rs = [j for j in readers.get(cur, [])
+                       if instrs[j].op != OP_NOP and j != di]
+            if len(live_rs) != 1 or cur in outs or cur in multi:
+                break
+            ci = live_rs[0]
+            c = instrs[ci]
+            if c.dst in multi or c.n != total:
+                break
+            if c.op == OP_GELU and c.a == cur:
+                micros.append((_EPI_GELU, _EPI_SELF, 0, 0))
+            elif c.op == OP_AFFINE_F32 and c.a == cur:
+                micros.append((_EPI_AFFINE, _EPI_SELF, c.imm, c.imm2))
+            elif (c.op == OP_ADD_F32 and not binary_used and not c.imm
+                  and not c.imm2 and (c.a == cur or c.b == cur)):
+                res = c.b if c.a == cur else c.a
+                # residual: a full-size external buffer, distinct from the fused
+                # output, single-writer (not a loop carry), read directly.
+                if res in (cur, c.dst) or res in multi or _elems(res) != total:
+                    break
+                # CRITICAL ordering gate: folding a binary makes the matmul DEPEND
+                # on `res`, but the matmul keeps its (early) position in the instr
+                # stream. `res` must therefore already be produced BEFORE the DOT
+                # (else the tensor interp / same-phase schedule read it stale).
+                # Program inputs (no writer) are available from the start. The
+                # transformer's residual x is always the earlier block input, so
+                # this holds; a `q+matmul` where q is computed later is rejected.
+                wr = writer.get(res)
+                if wr is not None and wr > di:
+                    break
+                micros.append((_EPI_ADD, _EPI_ELEM, 0, 0))
+                res_buf = res
+                binary_used = True
+            else:
+                break
+            consumed.append(ci)
+            last_dst = c.dst
+            cur = c.dst
+
+        if not micros:
+            continue
+        # encode: [n_micro] then n_micro × {kind, src, s_bits, t_bits}
+        desc = [len(micros)]
+        for kind, src, s, t in micros:
+            desc += [kind, src, s & 0xFFFFFFFF, t & 0xFFFFFFFF]
+        off = ctx.add_aux(desc)
+        for ci in consumed:
+            instrs[ci] = Instr(OP_NOP)
+        new_hint = tuple(DOT.reads_hint) + ((res_buf,) if res_buf else ())
+        instrs[di] = dataclasses.replace(
+            DOT, dst=last_dst, epi=off + 1, epi_res=res_buf,
+            reads_hint=new_hint)
 
 
 def _reuse_arena(ctx: _Ctx, main_len: int) -> None:
@@ -2224,7 +2359,6 @@ def lower_module(module) -> VMProgram:
     _compose_affines(ctx)
     _fuse_matmul_views(ctx)
     _fuse_views(ctx)
-    _finalize_matmul_views(ctx)
     _dce_nops(ctx)
 
     # Recognize softmax/layernorm reduce→broadcast idioms and collapse each into
@@ -2238,7 +2372,19 @@ def lower_module(module) -> VMProgram:
     # all cross-lane ops) into one OP_MAP_REGION each — K phases → 1. Runs last
     # so softmax/layernorm/gelu are already single ops (= region boundaries).
     _fuse_region(ctx, main_len)
+    # DCE first so the dead gelu/norm backbones (_fuse_gelu leaves them for later
+    # DCE) are gone — the epilogue recognizer's single-consumer test must see the
+    # matmul output's ONLY live reader (the fused GELU/affine/residual op).
     _dce_nops(ctx)
+    # §33 R2c: fold post-matmul map chains (scale/gelu/+residual) into the DOT
+    # store-epilogue, collapsing the matmul→EW barrier boundary. Runs after the
+    # EW/norm/gelu fusions so those are single ops = epilogue candidates, and
+    # before _reuse_arena so liveness sees the retargeted DOT + residual read.
+    _fuse_mma_epilogue(ctx, main_len)
+    _dce_nops(ctx)
+    # Mirror DOT views + epilogue into the serialized aux header now that both
+    # are settled, so the reparsed tensor validator can recover them.
+    _finalize_matmul_views(ctx)
 
     # Liveness-reuse: rewrite arena offsets so the arena is bounded by peak
     # concurrent liveness, not the sum of every intermediate (§16). Runs AFTER

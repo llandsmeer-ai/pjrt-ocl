@@ -30,27 +30,8 @@
 #endif
 #define REGION_NONE 0xFFFFu
 
-static float4 vmo_region_micro(const uint kind, const float4 x, const float4 y,
-                               const float s, const float t)
-{
-    switch (kind) {
-    case SUB_ADD:    return x + y;
-    case SUB_MUL:    return x * y;
-    case SUB_SUB:    return x - y;
-    case SUB_DIV:    return x / y;
-    case SUB_MAX:    return fmax(x, y);
-    case SUB_MIN:    return fmin(x, y);
-    case SUB_NEG:    return -x;
-    case SUB_EXP:    return exp(x);
-    case SUB_LOG:    return log(x);
-    case SUB_SQRT:   return sqrt(x);
-    case SUB_RSQRT:  return rsqrt(x);
-    case SUB_TANH:   return tanh(x);
-    case SUB_ABS:    return fabs(x);
-    case SUB_AFFINE: return mad(x, (float4)(s), (float4)(t));  /* x*s + t */
-    default:         return x;
-    }
-}
+/* vmo_region_micro (the shared straight-line map micro-op interpreter) now lives
+ * in vm_common.cl (§33 R2c) so ops/mma.cl's store-epilogue can call it too. */
 
 static void vmo_map_region(__global uchar *arena, __global uchar **iop,
                            __global const int *aux, const task_t t,

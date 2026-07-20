@@ -2232,3 +2232,132 @@ That's the real megakernel superpower, it's hand-written in the literature, and 
 to do generically. Our per-op kernels are competitive (~2×); the phase count × per-phase overhead is
 the gap, in BOTH regimes. R2c (matmul epilogue fusion, decisions.md R-list) is the frontier that
 would start to close it — fold the norm/residual/activation into the matmul's store.
+
+## 33. R2c — matmul-inclusive deep fusion (epilogue), the frontier of §29/§31/§32 (2026-07-20)
+
+**Goal (from §32).** Both regimes hit the SAME wall: 108 barriered phases, each a
+tiny latency-bound pass. §19/§26/§28 fused all *non-matmul* compute to ~8% but never
+touched the matmul boundary, so every matmul + its surrounding norm/activation/residual
+is still ≥2 separate phases. The literature (Hazy, survey §1.1) runs ~7 fused
+instructions because it folds matmul TOGETHER with its epilogue into one register-resident
+instruction body. R2c does that generically: a matmul computes its output TILE in
+registers/accumulators before the store; run a per-element micro-program on that tile
+BEFORE storing → fold `matmul → {scale, +bias, gelu/relu, +residual}` from ≥2 phases into ONE.
+
+### Reuse the §27/§28 substrate
+`ops/region.cl`'s `vmo_region_micro` already interprets a straight-line map micro-program
+over a per-thread value (the map-region ALU: add/mul/sub/div/max/min/neg/exp/log/sqrt/
+rsqrt/tanh/abs/affine, byte-matching `ops/ew.cl`). Factor it into a SHARED function
+(moved to `vm_common.cl`, concatenated first, so both `ops/mma.cl`'s epilogue and
+`ops/region.cl` call it; SUB_GELU added so the FFN activation is expressible) and call it
+from `vmo_mma_tile`'s store site. No new occupancy: the accumulator tile is already in
+registers; the epilogue micro-ops reuse it (§27 max-not-sum; the epilogue adds only a
+short scalar loop, no new live array).
+
+### Encoding
+- **task_t / VmTask / TASK_STRUCT grow by two u32**: `p6` = epilogue descriptor aux
+  word-offset (+1; 0 = no epilogue), `p7` = the epilogue's second-input buffer handle
+  (residual/bias), loader-patched to a byte offset exactly like dst/a/b (only when p6≠0).
+  40B → 48B task; the C++ reads `tasks[en.task]` as a raw struct so all three layouts
+  move together.
+- **Descriptor** (int words at aux[p6-1]): `[n_micro]` then n_micro × `{kind, src, s_bits,
+  t_bits}`. `kind` is a SUB_* op; `src` = 0 (unary on the accumulator), 1 (binary reading
+  p7 per-element = residual: `p7[g*M*N + gr*N + gc]`), 2 (binary reading p7 per-column =
+  bias: `p7[gc]`). Applied per stored accumulator element at logical (g,gr,gc):
+  `v = vmo_region_micro(kind, v, y, s, t)` where y=v (unary) or the p7 read (binary).
+- **In-memory Instr fields** `epi` (aux off +1) / `epi_res` (residual buf id), NOT
+  serialized — mirrors how aview/bview ride to `to_task` and become task p4/p5. `to_task`
+  sets p6=ins.epi, p7=ins.epi_res. The descriptor itself lives in the (serialized) aux
+  pool; the kernel finds it through p6. The residual RAW dependency rides in
+  `Instr.reads_hint` (OP_DOT READS = {a,b} | reads_hint) so the scheduler/arena-reuse
+  order the DOT after the residual is produced.
+
+### Recognizer `_fuse_mma_epilogue` (gated `PJRT_OCL_FUSE_MMA_EPI`, default ON if it lands)
+Runs after `_fuse_norm/_fuse_gelu/_fuse_region` (so GELU/scale are already single ops =
+epilogue candidates) and before `_reuse_arena`. For each `OP_DOT` that will use TILE_MMA
+(skip the N==1 gemv route), greedily walk the SINGLE consumer of the matmul output while it
+is a pure-map epilogue op with matching element count (=G*M*N) and not a program output:
+  - `OP_GELU` → micro (SUB_GELU, src=0)
+  - `OP_AFFINE_F32` (unary, a==cur) → micro (SUB_AFFINE, src=0, s=imm, t=imm2)  [QKᵀ scale]
+  - `OP_ADD_F32` (cur + external `res` of size G*M*N) → micro (SUB_ADD, src=1), p7=res  [residual]
+Stop at the first non-eligible consumer, a multi-consumer output, a second binary (only one
+p7), or a size/view mismatch. Collect the micro chain, retarget DOT.dst to the last folded
+op's dst, NOP the folded ops, set DOT.epi / reads_hint. GATED HARD; any mismatch leaves the
+decomposed chain untouched. `PJRT_OCL_FUSE_MMA_EPI=0` reverts.
+
+### Prologue (stage 4, phase 2) — scoped, not built this session
+Fold the post-reduce LN normalize affine `(x-µ)·rsqrt(v+eps)·g+b` into the following
+matmul's LOAD so the normalized activation never materializes. LN's reduce stays a phase;
+its normalize fuses into the QKV/FFN1 matmul stage. `PJRT_OCL_FUSE_MMA_PRO`. Deferred: the
+epilogue is the higher-leverage half (it removes the residual/activation phases that §29's
+tail-of-77-tiny-phases is made of); the LN normalize is already inside the single
+TILE_LAYERNORM_SEG op, so a prologue only saves the ONE materialized normalized tensor per
+LN, and needs strided/broadcast load addressing for g/b.
+
+### Flash-attention (QKᵀ→softmax→AV) — bigger separate follow-on, scoped only
+The softmax REDUCE between QKᵀ and AV makes this a specialized fused instruction (online
+softmax / running max+sum), NOT a simple store-epilogue. Out of scope here; noted as the
+next matmul-inclusive lever after the epilogue/prologue land.
+
+### Measurements — mechanism REAL + CORRECT, phases collapse 22%, e2e a SMALL win (§14a)
+Built (task_t 40→48B, shared micro-interpreter, recognizer, C++ loader) and measured
+on RTX PRO 6000 Blackwell (TF32 megakernel; CUDA ref = JAX-on-cuda/cuBLAS).
+
+**Headline — phase count (compute barriers), EPI ON vs OFF:**
+
+| config       | phases OFF | phases ON | Δ         |
+|--------------|-----------|-----------|-----------|
+| base prefill | 108       | **84**    | −24 (−22%)|
+| base decode  | 108       | **84**    | −24 (−22%)|
+| large_l1     | 18        | **14**    | −4        |
+
+Fires on all 4 epilogue patterns/layer: QKᵀ→×scale (affine), out-proj→+residual,
+FFN1→gelu, FFN2→+residual. The remaining 24 base EW ops are the LN affine `x·γ+β`
+(prologue target, not epilogue) + the reshape gathers (not map-fusible).
+
+**Prefill (ms/iter, iters 40):**
+
+| config    | EPI ON | EPI OFF | Δ      | CUDA  | gap ON |
+|-----------|--------|---------|--------|-------|--------|
+| base      | 5.41   | 5.49    | −1.5%  | 0.436 | 12.4×  |
+| large_l1  | 4.465  | 4.471   | wash   | 0.563 | 7.9×   |
+
+**Decode (µs/token):**
+
+| config | EPI ON | EPI OFF | Δ      | CUDA  | gap ON |
+|--------|--------|---------|--------|-------|--------|
+| base   | 3835   | 3864    | −0.8%  | 464   | 8.3×   |
+| large  | 7918   | 7919    | wash   | 1025  | 7.7×   |
+
+**Correctness (all PASS):** 289 pytest + 1 skip; runtime_test NVIDIA+PoCL; TF32
+tiny/small/base/large_l1 (4.1e-4 / 1.6e-3 / 4.6e-3 / 4.2e-3); **NVIDIA MEGA_TC=0
+scalar-f32 base 2.38e-6** and **PoCL f32 base 2.26e-6** (f32-EXACT — proves the
+epilogue math on BOTH the WMMA and the portable scalar mma paths). Occupancy
+UNCHANGED: `PJRT_OCL_INFO` lanes=376 measured-residency=376 (the scalar epilogue
+loop reuses the accumulator registers, no 128-reg cliff — §27 max-not-sum holds).
+
+### Verdict (§14a): KEEP, default ON — but it does NOT close the gap; here is why
+The mechanism is correct everywhere, occupancy-free, collapses 22% of phases, and
+is a small consistent win at base (−1.5% prefill / −0.8% decode) with zero
+regression at large — the §26/§28 precedent (correct + base needle + no regression
+⇒ default ON). `PJRT_OCL_FUSE_MMA_EPI=0` reverts byte-identically.
+
+BUT the honest finding is that a store-epilogue **cannot** reach the literature's
+107→7 collapse, and the e2e numbers show why: §29 already pinned base at **matmul
+84% / EW+softmax+norm 8% / barrier-floor 8%**, and the phases an epilogue folds are
+exactly the *cheap 8%* (residual/activation/scale), not the matmul. So the ceiling
+of this lever is ~8%, and we banked ~1.5% of it (the rest is offset because the
+folded residual read now counts under the matmul straggler instead of a free
+lane-idle phase). Decode is the same: the removed phases are the tiny EW ones; the
+memory-bound matVEC weight-read phases (the real decode cost, §32) are untouched.
+
+**What WOULD close it (scoped, not built):** fusing the MATMUL phases *together* —
+(a) **flash-attention** QKᵀ→softmax→AV as one instruction (the softmax reduce makes
+it a specialized online-softmax op, not a store-epilogue), and (b) **QKV / prologue**
+fusion that folds the pre-matmul LN normalize into the matmul load. Those attack the
+84%/matvec phases the epilogue leaves alone. The epilogue is the necessary substrate
+(shared micro-interpreter, task p6/p7, recognizer) they build on, but on this
+serial-block transformer it is a small win, not the frontier's payoff. Prologue
+(stage 4) deliberately NOT built this session: it targets the remaining 24 *even
+cheaper* LN-affine EW phases, so its e2e ceiling is below the epilogue's — not worth
+the strided-load risk until a flash-attention-class lever lands (§14a).

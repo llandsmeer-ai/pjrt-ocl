@@ -691,6 +691,11 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
     t.b = elem_off(t.b);
     if ((t.tile_op & 0xFFu) == kTopEw && t.p0 == kEwSubSelect)
       t.p3 = elem_off(t.p3);
+    // §33 R2c: a matmul epilogue's second input (residual/bias) rides in p7 as a
+    // buffer id; resolve it to a byte offset / port exactly like dst/a/b. Only
+    // meaningful when p6 (the epilogue descriptor) is present.
+    if (t.p6)
+      t.p7 = elem_off(t.p7);
   }
 
   // Patch dynamic_slice/update start-scalar locations in the aux pool:
@@ -721,9 +726,11 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
   // Exclude VIEW-folded matmuls (p4/p5 != 0): the standalone mm2/gemv kernels
   // read contiguous operands and have no view descriptor path — those stay on
   // the megakernel, which does implement the strided operand read.
+  // Exclude epilogue-fused matmuls (p6 != 0): the standalone mm2/gemv kernels
+  // have no store-epilogue path (§33 R2c), so those stay on the megakernel.
   if (tasks.size() == 1 && (tasks[0].tile_op & 0xFFu) == kTopMma &&
       ((tasks[0].tile_op >> 8) & 0xFFu) == kDtF32 && tasks[0].p3 <= 1 &&
-      tasks[0].p4 == 0 && tasks[0].p5 == 0) {
+      tasks[0].p4 == 0 && tasks[0].p5 == 0 && tasks[0].p6 == 0) {
     bool clean = true;
     for (const VmEntry& en : p.entries)
       if (en.task == kEntBarrier || en.task == kEntWhile ||

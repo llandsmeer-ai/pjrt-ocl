@@ -64,6 +64,37 @@
 #define MMA_BSZ (MMA_BK * MMA_TN)    /* Bs[k*TN+n] portable */
 #endif
 
+/* §33 R2c matmul store-epilogue: run the fused straight-line map micro-program
+ * (in aux at t.p6-1) on one accumulator value v at logical output (g,gr,gc)
+ * BEFORE it is stored — folding a following scale/bias/gelu/residual chain into
+ * the matmul phase. Reuses the shared vmo_region_micro (vm_common.cl). src=0
+ * unary on v; src=1 binary reading the residual buffer t.p7 per-element
+ * (p7[g*M*N + gr*N + gc]); src=2 per-column bias (p7[gc]). No epilogue (t.p6==0)
+ * → returns v unchanged, byte-identical to the pre-R2c store. */
+static float vmo_mma_epi(float v, __global uchar *arena, __global uchar **iop,
+                         __global const int *aux, const task_t t,
+                         uint g, uint gr, uint gc, uint M, uint N)
+{
+    if (!t.p6) return v;
+    const int eoff = (int)t.p6 - 1;
+    const uint nm = (uint)aux[eoff];
+    for (uint m = 0; m < nm; ++m) {
+        const int o = eoff + 1 + (int)m * 4;
+        const uint kind = (uint)aux[o];
+        const uint src  = (uint)aux[o + 1];
+        const float s  = as_float(aux[o + 2]);
+        const float tt = as_float(aux[o + 3]);
+        float y = v;
+        if (src == 1u)
+            y = ((__global const float *)VMO_BASE(t.p7))
+                    [(size_t)g * M * N + (size_t)gr * N + gc];
+        else if (src == 2u)
+            y = ((__global const float *)VMO_BASE(t.p7))[gc];
+        v = vmo_region_micro(kind, (float4)(v), (float4)(y), s, tt).x;
+    }
+    return v;
+}
+
 #ifdef VMO_NV_PTX
 /* --- inline-PTX WMMA helpers (tf32 m16n16k8, from poc/08 / tc_mma.cl) ------ */
 #define TC_LOAD_A(f, ptr, stride)                                              \
@@ -228,7 +259,9 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
             const uint r = (lane >> 2) + 8u * ((reg >> 1) & 1);
             const uint c = (lane & 3) * 2 + (reg & 1) + 8u * (reg >> 2);
             const uint gr = gr0 + r, gc = gc0 + c;
-            if (gr < M && gc < N) gd[gr * N + gc] = acc[i][j][reg];
+            if (gr < M && gc < N)
+                gd[gr * N + gc] = vmo_mma_epi(acc[i][j][reg], arena, iop, aux,
+                                              t, g, gr, gc, M, N);
         }
     }
 }
@@ -302,7 +335,9 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
         if (gr >= M) continue;
         for (int j = 0; j < MMA_RN; j++) {
             const uint gc = col0 + tx * MMA_RN + j;
-            if (gc < N) gd[gr * N + gc] = acc[i][j];
+            if (gc < N)
+                gd[gr * N + gc] = vmo_mma_epi(acc[i][j], arena, iop, aux,
+                                              t, g, gr, gc, M, N);
         }
     }
 }
