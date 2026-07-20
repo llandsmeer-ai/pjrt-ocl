@@ -1844,3 +1844,152 @@ so γ/β broadcasts read in place. That captures the 12 layernorm affines
 (107 → ~95 phases + 12 removed intermediate round-trips) and any `scale·x+bias`
 per-channel idiom. Deferred: measured here as the concrete lever, low-risk but
 out of this session's 2-input scope.
+
+## 29. Decomposing the base 5.0 ms in-kernel time — it is MATMUL, not EW/reduce (2026-07-20)
+
+**Question.** base transformer is ~12× slower than native CUDA (mega 5.44 ms /
+kernel 5.01 ms vs CUDA 0.44 ms); 93% is in-kernel. Decompose the 5 ms and prove
+where it goes. Hypothesis on the table: "strictly-serial globally-barriered VLIW
+interpreter, no overlap → each phase is a latency-bound small-data pass and the
+grid barrier serializes them, so utilization is few-%."
+
+**Verdict up front: the hypothesis is HALF right, and the wrong half rewrites the
+roadmap.** The *mechanism* is exactly as described — 107 serial global-barrier
+phases, each straggler-bound, mean lane utilization **31%** (lanes idle 69% of
+every phase). But the premise that the latency-bound phases are elementwise/
+reduce/norm is **now false**: the §19/§26/§28 fusion campaign already collapsed
+all non-matmul compute to **0.4 ms (8%)**. The 5 ms is **MATMUL** (84%). We spent
+the last campaigns fusing the cheap 8% while matmul — the expensive 84% — sat
+unattacked. R2 (EW fusion) is essentially done and is no longer a lever; the
+levers are R1 (overlap the many small independent matmuls to fill the grid) and
+R3 (a bigger matmul tile for the per-tile intensity cap).
+
+### Instrumentation (behind flags; product build byte-identical, 289 pytest + runtime_test green)
+Two hooks, both inert unless a `-D` is injected via `PJRT_OCL_EXTRA_BUILD` (§27's
+mechanism) and/or an env is set. Default kernel/behaviour unchanged (base --check
+PASS max_abs 4.6e-3; runtime_test PASS).
+- **Op-class stubbing** `-DVMO_STUB_MASK=<bits>` (`vm_main.cl` `vmo_exec_tiles`):
+  bit *k* set ⇒ tile-op *k* returns immediately (skips its tile work; the entry/
+  phase/barrier structure is untouched). `full − stub_X` = X's wall contribution
+  *as the phase straggler* (only the straggler bounds a global-barriered phase, so
+  this is the correct wall attribution). Correctness intentionally void; timing only.
+- **Per-phase device timestamps** `-DVMO_PHASE_TS` + env `PJRT_OCL_PHASE_TS`
+  (`vm_common.cl` `vmo_now_ns` reads NV `%globaltimer` — a *GPU-global* ns counter,
+  so arrival times are comparable across workgroups, unlike per-SM `clock64`).
+  Every lane writes its arrival ns into the existing `stats` buffer at each barrier;
+  host (`runtime.cc` ExecuteDevice) reads it back → per phase: `wall = release[b] −
+  release[b−1]` (release = last-lane arrival), `skew = max−min arrival`,
+  `idle = release − mean arrival` (avg per-lane wait). Only the VMO_NV_PTX (TF32)
+  build has globaltimer — which is the default base path on NVIDIA.
+
+### The 5.0 ms labelled budget (base, NVIDIA RTX PRO 6000 Blackwell, TF32 megakernel)
+Op-class stub subtraction (kernel= from PJRT_OCL_PROFILE, mean of last iters):
+
+| stub                     | kernel (ms) | ⇒ class wall (ms) | % of 5.01 |
+|--------------------------|-------------|-------------------|-----------|
+| full                     | 5.01        | —                 | —         |
+| MMA (op 1)               | 0.82        | **matmul 4.19**   | **84%**   |
+| EW (op 0, incl gelu/affine) | 4.80     | EW 0.21           | 4%        |
+| SOFTMAX_SEG (11)         | 4.90        | softmax 0.11      | 2%        |
+| GATHER (2,7)             | 4.96        | gather 0.05       | 1%        |
+| LAYERNORM_SEG (12)       | 4.98        | layernorm 0.03    | 0.6%      |
+| RED_SEG (10)             | 5.00        | reduce ~0.01      | ~0%       |
+| MMA-only (~1, all else stubbed) | 4.61 | matmul isolated 4.61 | — |
+| all compute stubbed floor ≈ stub_MMA − Σnon-mma | ≈0.41 | **barrier/interp/empty-phase 0.41** | 8% |
+
+Labelled 5.0 ms ≈ **matmul 4.2 / EW 0.21 / softmax 0.11 / gather 0.05 / layernorm
+0.03 / reduce 0.01 / barrier+interpreter+empty-phase 0.41**. (Matmul's straggler
+attribution 4.19 ms and its isolated 4.61 ms bracket it: when non-matmul ops share
+a matmul phase their work hides under the matmul straggler, so isolated > marginal.)
+
+### Per-phase timestamps — the serialization/imbalance is real, and it IS the matmul
+`PJRT_OCL_PHASE_TS`, base: **107 phases, sum_wall 4.96 ms** (validates the
+instrument against the 5.01 ms profile), **skew ≈ wall in EVERY phase** (the
+first-arriving lane reaches the barrier with ~no work while the last-arriving lane
+defines the phase — every phase is straggler-bound), **sum_idle 3.44 ms, mean lane
+utilization 0.306** (an average lane is busy only 31% of each phase; 69% is spent
+waiting at barriers). Wall is concentrated, not spread:
+
+| phase wall bucket | # phases | Σ wall (µs) | what |
+|-------------------|----------|-------------|------|
+| ≥300 µs           | 5        | 1884 (38%)  | FFN matmuls (1/layer; 6th is 296 µs) |
+| 100–300 µs        | 9        | 1256 (25%)  | projection / attention matmuls |
+| 30–100 µs         | 16       | 1044 (21%)  | smaller matmuls + fused norms |
+| 10–30 µs          | 41       | 593 (12%)   | tiny ops at the latency floor |
+| <10 µs            | 36       | 195 (4%)    | barrier + trivial-op floor |
+
+Top 14 phases (all matmul-heavy) = 3.1 ms (63%). The 107 global barriers' own cost
+is small (~1.7 µs each ≈ 0.18 ms; consistent with §14's flat lane-count sweep) —
+the tax is not the barrier primitive, it is **stragglers idling 375 lanes while a
+few finish a small matmul**.
+
+### Per-phase utilization — the small matmuls are latency/occupancy-bound (proved by size)
+The 64×64 MMA tile means an M×N matmul spawns `⌈M/64⌉·⌈N/64⌉` tiles = busy lanes
+(of 376). base shapes: QKV/out projections (512×512×512) = 64 tiles = **17%**
+occupancy; attention per-head (128×64×128, ×32 batch) = 2–4 tiles/head; FFN
+(512×512→2048) = 256 tiles = 68%. Mostly far under 376 → most lanes idle → the 31%
+mean. Confirmed by sweeping size on the SAME code:
+
+| config    | phases | mean lane util | matmul share | matmul TFLOP/s | CUDA TFLOP/s | gap |
+|-----------|--------|----------------|--------------|----------------|--------------|-----|
+| base      | 107    | **0.31**       | 84%          | **4.7**        | 47.5         | 10× |
+| large_l1  | 17     | **0.72**       | 92%          | **14.1**       | 97.9         | 7×  |
+
+As phases grow (D=1024/F=4096), lane utilization jumps 31→72%, matmul throughput
+4.7→14 TFLOP/s (approaching our own §10d in-megakernel tile ceiling ~18–20), and
+the CUDA gap shrinks 10→7× — the textbook signature of latency/occupancy-bound
+small ops, now *attributed to the matmul phases specifically*.
+
+### Splitting the 10× matmul gap into its two buckets
+base matmul 4.7 TFLOP/s vs cuBLAS-in-CUDA 47.5:
+1. **Occupancy/latency (~3.8×):** 4.7 → our own ~18 TFLOP/s tile ceiling (§10d) is
+   the price of small matmuls filling 31% of the grid + being individually tiny.
+   Dominant at base; nearly gone at large_l1 (14 of 18).
+2. **Per-tile intensity cap (~2.5–7×):** the 64×64 single-buffered co-residency-
+   locked tile tops out ~18–20 TFLOP/s (§10d: intensity 16 FLOP/byte, a bigger
+   register tile drops residency below the 376-lane barrier floor). This is the
+   *whole* residual gap on large (compute-bound), a minor one at base.
+
+So base's 10× is **mostly bucket 1 (occupancy)**, large's 7× is **mostly bucket 2
+(tile intensity)**. Different levers for different regimes.
+
+### Ranked causes (of the base 5.0 ms) and the fix each maps to
+1. **Matmul under-occupancy — ~2.4 ms recoverable, megakernel-native (R1).** Small
+   independent matmuls run in serial global-barriered phases at 31% lane occupancy.
+   In one layer the 3 QKV projections are mutually independent, the 32 attention
+   heads are independent, FFN tiles are independent — today each is its own barrier
+   phase. **R1 (per-tile dependency scoreboard replacing the global barrier)** lets
+   independent matmul phases co-occupy the 376 lanes instead of serializing. Est: if
+   base matmul reached large_l1's 72% util, matmul 4.2 → ~1.8 ms, kernel → ~2.6 ms
+   (**~1.9×**, gap 10→~5×). This is the single highest-leverage megakernel-native
+   change and it directly consumes the 3.44 ms of measured lane-idle.
+2. **Matmul per-tile intensity cap — megakernel-native (R3).** The 64×64 tile's ~18
+   TFLOP/s ceiling caps even a *fully-occupied* matmul at ~7× off cuBLAS. Fix: R3's
+   compile-time VM split (a `vm2_heavy` variant with a 128×128 double-buffered
+   register tile, independent register budget, no relaunch). Biggest lever for the
+   `large`/compute-bound regime; secondary at base (occupancy dominates there).
+3. **Barrier/phase serialization floor — ~0.4 ms + a 0.79 ms tail of 77 tiny
+   phases.** 107 serial global barriers, each straggler-bound. R1 subsumes this
+   (a scoreboard removes the barriers and lets the tail overlap the fat phases).
+
+**NOT a cause any more: non-matmul compute (0.4 ms, 8%).** EW/softmax/gather/
+layernorm/reduce are already fused to near-nothing (§19/§26/§28). R2 (EW micro-
+program fusion) is effectively complete for this workload — further EW/norm work
+would chase 8% and is explicitly deprioritised. This corrects §14's "65% non-matmul"
+finding, which predated the fusion campaign.
+
+### Single highest-leverage megakernel-native fix
+**R1 — dependency scoreboard replacing the global barrier**, so the many small
+*independent* matmuls (3× QKV, 32 attention heads, independent FFN tiles) overlap
+and fill the lane grid instead of serializing at 31% occupancy. It attacks the
+dominant bucket (occupancy, ~2.4 ms of lane-idle at base) and dissolves the 107-
+barrier serialization in one structural change; the WAIT/SIGNAL fields are already
+reserved in the bytecode (`vm_main.cl`), the scheduler already owns the producer/
+consumer graph, and the barrier fix already proved device-scope coherent spinning
+works. R3 (bigger matmul tile) is the follow-on for the compute-bound `large` end.
+
+**Reproduce:** `PJRT_OCL_EXTRA_BUILD="-DVMO_PHASE_TS" PJRT_OCL_PHASE_TS=1 python
+tools/bench_transformer.py --config base` (per-phase wall/skew/idle + summary);
+`PJRT_OCL_EXTRA_BUILD="-DVMO_STUB_MASK=0x2" PJRT_OCL_PROFILE=1 …` (stub op 1 = MMA;
+bit k = tile-op k). Instrumentation is `#ifdef`/env-gated — the shipped build is
+unchanged.

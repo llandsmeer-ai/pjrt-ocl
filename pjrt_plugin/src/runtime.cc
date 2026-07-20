@@ -900,6 +900,15 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
   cl_kernel k = rt_->vm_exec_kernel();
   cl_uint nlanes = p.n_lanes;
   size_t lsz = 256, gsz = size_t{nlanes} * lsz;
+  // §29 phase-timestamp instrumentation: zero the stats buffer so unwritten
+  // barrier rows read 0 (the kernel writes %globaltimer per lane per barrier
+  // when built -DVMO_PHASE_TS). Off unless PJRT_OCL_PHASE_TS is set.
+  static const bool phase_ts = std::getenv("PJRT_OCL_PHASE_TS") != nullptr;
+  if (phase_ts) {
+    std::vector<uint32_t> z(size_t{4096} * nlanes, 0u);
+    clEnqueueWriteBuffer(q, stats_buf_, CL_FALSE, 0, z.size() * 4, z.data(), 0,
+                         nullptr, nullptr);
+  }
   clSetKernelArg(k, 0, sizeof(arena_), &arena_);
   clSetKernelArg(k, 1, sizeof(aux_buf_), &aux_buf_);
   clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
@@ -1442,6 +1451,51 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
     auto t3 = clk();
     fprintf(stderr, "PROFILE in_copy=%.4f kernel=%.4f out_copy=%.4f total=%.4f ms\n",
             msec(t0, t1), msec(t1, t2), msec(t2, t3), msec(t0, t3));
+  }
+  // §29 per-phase timestamp dump (mega engine only). Reads back the per-lane
+  // %globaltimer arrivals and prints, per barrier phase b: wall time (release[b]
+  // - release[b-1], where release == last-lane arrival) and idle-at-barrier skew
+  // (max - min arrival). CSV to stderr for post-processing.
+  if (std::getenv("PJRT_OCL_PHASE_TS") && !rt_->host_dispatch() && !mm_ok_) {
+    const uint32_t nl = prog_.n_lanes;
+    std::vector<uint32_t> ts(size_t{4096} * nl);
+    if (clEnqueueReadBuffer(q, stats_buf_, CL_TRUE, 0, ts.size() * 4, ts.data(),
+                            0, nullptr, nullptr) == CL_SUCCESS) {
+      uint64_t prev_release = 0, sum_wall = 0, sum_skew = 0, sum_idle = 0;
+      uint32_t nbar = 0;
+      for (uint32_t b = 0; b < 4096; ++b) {
+        uint32_t amin = 0xFFFFFFFFu, amax = 0;
+        uint64_t asum = 0;
+        uint32_t nz = 0;
+        for (uint32_t l = 0; l < nl; ++l) {
+          uint32_t v = ts[size_t{b} * nl + l];
+          if (v) { amin = std::min(amin, v); amax = std::max(amax, v);
+                   asum += v; ++nz; }
+        }
+        if (nz == 0) break;
+        nbar = b + 1;
+        uint64_t wall = (b == 0) ? 0 : (uint64_t)(amax - prev_release);
+        uint64_t skew = (uint64_t)(amax - amin);
+        // Average per-lane idle at this barrier = release - mean_arrival. Sums
+        // lane-idle over ALL lanes (not just max-min), so idle/wall = the mean
+        // fraction of the phase a lane spends waiting = 1 - lane utilization.
+        double mean_arr = (double)asum / nz;
+        uint64_t idle = (b == 0) ? 0 : (uint64_t)((double)amax - mean_arr);
+        prev_release = amax;
+        sum_wall += wall;
+        sum_skew += skew;
+        sum_idle += idle;
+        fprintf(stderr,
+                "PHASETS b=%u nz=%u wall_ns=%llu skew_ns=%llu idle_ns=%llu\n", b,
+                nz, (unsigned long long)wall, (unsigned long long)skew,
+                (unsigned long long)idle);
+      }
+      fprintf(stderr,
+              "PHASETS_SUMMARY nbar=%u sum_wall_us=%.2f sum_skew_us=%.2f "
+              "sum_idle_us=%.2f mean_lane_util=%.3f\n",
+              nbar, sum_wall / 1000.0, sum_skew / 1000.0, sum_idle / 1000.0,
+              sum_wall ? 1.0 - (double)sum_idle / sum_wall : 0.0);
+    }
   }
   return true;
 }

@@ -186,6 +186,32 @@ typedef union { float f; int i; uint u; } slot_t;
     memory_scope_device)
 #endif
 
+/* §29 investigation: per-phase device timestamps. Each lane (workgroup) records
+ * the GPU-global nanosecond clock (%globaltimer — one counter shared across all
+ * SMs, so arrival times ARE comparable across workgroups, unlike per-SM clock64)
+ * into stats[barrier_i*nlanes+lane] at every barrier arrival. Host reads it back
+ * (PJRT_OCL_PHASE_TS) → per-phase wall time (max-arrival delta) + idle-at-barrier
+ * skew (max-min arrival). Low 32 bits of ns: wraps at ~4.29 s, never within a
+ * phase. Only the VMO_NV_PTX build has globaltimer; portable build records 0. */
+#ifdef VMO_PHASE_TS
+#ifdef VMO_NV_PTX
+static inline uint vmo_now_ns(void) {
+    ulong t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return (uint)t;
+}
+#else
+static inline uint vmo_now_ns(void) { return 0u; }
+#endif
+#define VMO_TS_REC(stats, bi, lane, nl)                                        \
+    do {                                                                       \
+        if (get_local_id(0) == 0u && (bi) < 4096u)                             \
+            (stats)[(bi) * (nl) + (lane)] = vmo_now_ns();                       \
+    } while (0)
+#else
+#define VMO_TS_REC(stats, bi, lane, nl) do {} while (0)
+#endif
+
 static void vmo_barrier(volatile __global uint *bar, const uint ngroups)
 {
     barrier(CLK_GLOBAL_MEM_FENCE);

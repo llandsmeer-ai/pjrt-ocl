@@ -16,6 +16,15 @@ static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
     const uint esz = (dt == DT_I64 || dt == DT_F64) ? 8u
                    : (dt == DT_BOOL) ? 1u
                    : (dt == DT_F16 || dt == DT_BF16) ? 2u : 4u;
+#ifdef VMO_STUB_MASK
+    /* §29 investigation: per-op-class wall-time attribution by subtraction.
+     * If this tile-op's class bit is set in the compile-time mask, skip ALL its
+     * tile work (the entry/phase/barrier structure is untouched — only the
+     * compute is removed), so full-time minus stubbed-time = that class's tile
+     * cost. Correctness is intentionally void; timing only. Off unless built with
+     * -DVMO_STUB_MASK=<bits> (via PJRT_OCL_EXTRA_BUILD). */
+    if (((uint)(VMO_STUB_MASK) >> op) & 1u) return;
+#endif
     for (uint tile = tile_lo; tile < tile_hi; ++tile) {
         switch (op) {
         case TOP_EW:       vmo_ew_tile(arena, iop, aux, t, tile, dt, adt, lid, lsz); break;
@@ -122,6 +131,7 @@ __kernel void vm2(__global uchar *arena,
             if (w.task == ENT_FOR) {           /* fixed-trip iteration done */
                 /* Barrier publishes loop carries the next iteration reads
                  * across lanes. phase counts REMAINING iterations. */
+                VMO_TS_REC(stats, barrier_i, lane, nlanes);
                 vmo_barrier(bar, nlanes);
                 barrier_i++;
                 if (--st[sp].phase != 0u) {
@@ -134,6 +144,7 @@ __kernel void vm2(__global uchar *arena,
                 continue;
             }
             if (st[sp].phase == 0) {           /* while-cond range done */
+                VMO_TS_REC(stats, barrier_i, lane, nlanes);
                 vmo_barrier(bar, nlanes);
                 barrier_i++;
                 const uint cbits = atomic_add(
@@ -147,6 +158,7 @@ __kernel void vm2(__global uchar *arena,
                     st[sp].pc++;
                 }
             } else {                           /* while-body done: recheck */
+                VMO_TS_REC(stats, barrier_i, lane, nlanes);
                 vmo_barrier(bar, nlanes);
                 barrier_i++;
                 st[sp].pc = w.tile_lo;
@@ -160,8 +172,12 @@ __kernel void vm2(__global uchar *arena,
         const entry_t en = entries[span.x + epc];
 
         if (en.task == ENT_BARRIER) {
+#ifdef VMO_PHASE_TS
+            VMO_TS_REC(stats, barrier_i, lane, nlanes);
+#else
             if (lid == 0 && barrier_i < 4096u)
                 stats[barrier_i * nlanes + lane] = atomic_inc(&bar[2]) % nlanes;
+#endif
             vmo_barrier(bar, nlanes);
             barrier_i++;
             st[sp].pc++;
