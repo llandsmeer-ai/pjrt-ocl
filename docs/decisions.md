@@ -1993,3 +1993,116 @@ tools/bench_transformer.py --config base` (per-phase wall/skew/idle + summary);
 `PJRT_OCL_EXTRA_BUILD="-DVMO_STUB_MASK=0x2" PJRT_OCL_PROFILE=1 …` (stub op 1 = MMA;
 bit k = tile-op k). Instrumentation is `#ifdef`/env-gated — the shipped build is
 unchanged.
+
+## 30. R1 — per-tile dependency scoreboard replacing the global barrier (DESIGN, 2026-07-20)
+
+**Goal (from §29).** The 107 serial global barriers serialize INDEPENDENT small
+matmuls (3 QKV, 32 heads, FFN tiles) that each fill only 17–31 % of the 376 lanes;
+mean lane util 0.31. Replace the grid-wide barrier with point-to-point WAIT/SIGNAL
+so independent work overlaps and fills the grid. Est ~1.9× (kernel 5.0→2.6 ms).
+
+**Correction to the §29 premise.** §29 said "the WAIT/SIGNAL fields are already
+reserved in the bytecode". They are NOT free: `Entry.wait_flag/wait_count/
+signal_flag` were repurposed by §15 (OP_FOR) / WHILE to carry cond/body ranges and
+trip counts (scheduler.py `_emit_while`, vm_main.cl ENT_WHILE/ENT_FOR). So a
+scoreboard needs its OWN per-entry sync fields (grow the entry struct) or a
+side-table — the compute-tile entries never use those three fields, only
+WHILE/FOR/IF control entries do, so a compute-tile can borrow them, but that
+overlaps semantically with control flow and is fragile. Design uses NEW fields.
+
+### The primitive (proven, §10c/poc07)
+Producer: `VMO_FENCE_DEV_REL()` then `atomic_inc(flag)` (release) — the SAME
+device-scope release the spin-barrier uses; poc07 test E proved plain cross-lane
+data writes become visible after a device-scope acquire on the consumer. Consumer:
+spin `while(atomic_load_acquire(flag) < threshold)` then `VMO_FENCE_DEV_ACQ()`.
+Point-to-point instead of all-to-all. Same #1-risk primitive, same portability
+envelope (NVIDIA honours memory_scope_device; PoCL native; strict-1.2 → host
+engine, scoreboard OFF).
+
+### The two coupled changes
+1. **Sync**: each producer TASK gets a flag = its arrival counter; each of its
+   tiles `atomic_inc`s the flag on completion. A consumer tile WAITs until every
+   producer task's flag == that task's n_tiles. wait_count = #producer tasks; a
+   side "wait list" of (flag_idx, threshold) pairs indexed by (wait_off, wait_n).
+2. **Lane assignment MUST change** (the non-obvious half). Today `_pack_units`
+   resets `loads=[0]*n_lanes` per phase, so every phase packs onto lanes 0..T-1 —
+   3 independent QKV matmuls all land on the SAME low lanes. Removing the barrier
+   alone gives NO overlap: a lane runs its linear stream in order, and the same
+   lanes are reused. Fix: a GLOBAL list-scheduler over the whole tile-DAG that
+   spreads independent ready tiles across ALL lanes (carry `loads` across phases /
+   assign independent tasks to disjoint lane ranges) so they co-occupy the grid.
+   A lane's stream stays linear and topologically valid; a WAIT only fires on a
+   true cross-lane producer.
+
+### Correctness / deadlock
+Acyclic DAG incl. WAR carries (§16) and region ops — verified by the existing
+`_depends` (RAW+WAW+WAR). Region ops (while/if/for) stay grid-barrier sync points
+(a scoreboard across a data-dependent loop back-edge is future work); the
+scoreboard overlaps only the straight-line compute BETWEEN region ops, which is
+where the 107 barriers / matmul phases live. Exact flag thresholds = producer
+n_tiles; a consumer never waits on a flag no tile signals (every producer task
+emits all its tiles). Liveness (co-residency) is UNCHANGED risk vs the spin-barrier
+— point-to-point waiting still needs producers co-resident; NVIDIA 376 co-resident
+(occupancy-capped), PoCL needs lanes ≤ cores (already true / host engine).
+
+### Fallback
+`PJRT_OCL_SCOREBOARD=0` (default until proven on all vendors) → today's global-
+barrier path, byte-identical. Scoreboard is opt-in, NVIDIA-first.
+
+### Gate (poc/16-scoreboard, hard, measure both devices)
+K independent matmul-like tasks + 1 dependent. MEASURE (a) correctness race-free
+under a stress loop (acquire/release orders the writes), (b) independent tasks
+actually OVERLAP — per-WG %globaltimer timestamps show lane utilization rising
+toward full grid vs the serial-barrier baseline, (c) real speedup on this pattern.
+NVIDIA AND PoCL. **If overlap does not materialize or correctness can't be made
+race-free, STOP and report — do not rewire the scheduler on a false premise (§14a).**
+
+### GATE RESULT — mechanism PASSES, premise FALSE, STOPPED (2026-07-20, poc/16)
+**The scoreboard mechanism works and is race-free on both devices** (poc/16):
+- NVIDIA RTX PRO 6000: independent tiles OVERLAP — lane util 0.115→0.362 (3.2×),
+  wall 2.3× (K=16: util 0.056→0.326 = 5.8×, wall 4.0×); **0/94000 wrong dependent
+  reads** over 2000 iters (device-scope acquire/release orders the non-atomic
+  producer writes point-to-point, poc/07 test E). No hangs.
+- PoCL (Ryzen 3900X): race-free (0/9000 over 1500 iters), wall 15× (the CPU
+  spin-barrier is catastrophic — §10c — so barrier-free wins big). No hangs.
+
+**BUT the base transformer — R1's target — has ZERO independent phase-level work,
+so a scoreboard cannot help it.** Measured on the real lowered schedule
+(`poc/16-scoreboard/analyze_schedule.py`, `critical_path.py`):
+- §29's premise is FALSE as stated. The scheduler ALREADY fuses the 3 QKV
+  projections into ONE 3-matmul phase (`_phases` detects their mutual
+  independence) and attention heads are ALREADY batched into one MMA task
+  (`p3=batch`). Those were never "each its own barrier phase" — that intra-phase
+  parallelism is already extracted (occupancy 0.51 for the fused QKV phase).
+- Everything else is a strict RAW dataflow chain: QKᵀ→softmax→AV→out-proj→
+  residual→LN→FFN1→gelu→FFN2→residual→next layer.
+- **Overlap ceiling = total_phase_cost / critical_path, using the OPTIMISTIC
+  RAW-only edge set (minimal constraints = max possible overlap): 1.000× on
+  tiny/small/base/large_l1/large — 0.0 % of any config is overlappable.** The
+  program IS its own critical path.
+
+**Why the 31 % util then, and what actually fixes it.** Each matmul is
+individually SMALL (64–256 tiles < 376 lanes) AND the matmuls are serially
+DEPENDENT — the low occupancy is small-per-op + chain, not independent work
+artificially serialized. A scoreboard only overlaps INDEPENDENT phases, of which
+there are none. The lever that raises util is **bigger matmul tiles / bigger
+effective matmuls (R3)** — large_l1's 0.72 comes from D=1024/F=4096 giving 4× more
+tiles per matmul (fills the grid within ONE phase), NOT from overlap. §29
+conflated "fill the grid" (R3, size) with "overlap independent matmuls" (R1), and
+R1's independence does not exist in this workload. §29's own bucket-2 already
+pinned the residual `large` gap on the per-tile intensity cap (R3).
+
+**DECISION (§14a): STOP — do NOT rewire the production scheduler/VM for R1.** The
+mechanism is proven and kept as ready infrastructure (poc/16 + this design) for a
+workload that DOES have independent branches — a *parallel* transformer block
+(GPT-J/PaLM: attention ∥ FFN off the same LN), mixture-of-experts, ensembles, or
+independent batched models. For the current serial-block transformer it buys 0×;
+integrating the #1-risk primitive (races, deadlocks, co-residency) for no measured
+gain, off by default, is exactly the §14a "don't ship" case. Production code
+UNTOUCHED (only docs + poc/16 added) → 289/1 pytest baseline preserved by
+construction. Next real matmul lever: **R3** (compile-time `vm2_heavy` variant with
+a 128×128 double-buffered register tile, §29/§10d).
+
+**Reproduce:** `cd poc/16-scoreboard && make && PJRT_OCL_DEVICE=NVIDIA ./poc16`
+(mechanism gate); `CFG=base .venv/bin/python poc/16-scoreboard/critical_path.py`
+(overlap ceiling on the real schedule).
