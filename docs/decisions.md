@@ -2887,3 +2887,84 @@ this backend's tf32-exact contract — not pursued.
 `ACC=1 ONLY="256x128 W8x4 BK16 NBUF2" ./bench17hp` (accuracy);
 `make run-probe` (cp.async re-check). Gates: winner verifies exact-int +
 max_abs 3e-3 random-f32; degenerate RF=0 configs now caught by zeroed-C verify.
+
+## 39. The fp16 "92 TF/s wall" is staging-byte-bound; f16 inputs break it to ~107 (2026-07-21)
+
+Adversarial push on §38's 92 TF/s standalone f16 ceiling (poc/17, RTX PRO 6000
+Blackwell sm_120, OpenCL→PTX). Goal: close the 1.46× gap to cuBLAS-tf32 (134).
+Three levers the brief named; the winner was a diagnostic, not a bigger MMA.
+
+### Modern mma.sync + ldmatrix TIES legacy wmma at 92 (not the lever)
+`poc/17-nv-mma/mma17_mma.cl` + `bench17mma`: replaced legacy
+`wmma.mma.m16n16k16` (f16 A/B = 8+8 `.b32` fragment regs) with
+`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` (A=4, B=2 regs) fed by
+`ldmatrix`. Correctness pinned down: A loads x4 non-trans from `[M][K]` smem; the
+col-major **B operand loads NON-trans (`ldmatrix.x2`, no `.trans`) from `[N][K]`
+smem** (`BVAR=1`; `.trans` gave a near-miss off-by-~4 fragment permutation —
+BVAR=0/2 WRONG, BVAR=1 exact). D-store map `row=(lane>>2)+8*(reg>>1)`,
+`col=(lane&3)*2+(reg&1)`. Result: **exactly 92 across every tile** — the 3–4×
+fragment-register saving converts to nothing. **⇒ the ceiling is NOT
+fragment-register-bound.**
+
+### wgmma / tcgen05 unavailable on sm_120
+`ptxas` (9.2): *"Instruction 'wgmma.mma_async with floating point types' not
+supported on .target 'sm_120'"*. Warpgroup MMA is Hopper sm_90a only;
+consumer/workstation Blackwell (sm_120) has neither wgmma nor tcgen05. So
+**`mma.sync.m16n8k16` is the largest f16 tensor primitive on this HW** — no
+wider-MMA rung exists to climb.
+
+### The diagnostic: it's 100% staging-bound, tensor op is free
+hp kernel `-DNOMMA`/`-DNOLOAD`: dropping the tensor op AND the ldmatrix loads
+leaves the time **unchanged at 92** — MMA+ldmatrix are entirely hidden. mma
+kernel STAGE decomposition (`-DNOGLOB` skip global reads / `-DNOSMEM` skip smem
+writes), @4096 converted to time:
+
+| variant | time | isolates |
+|---------|------|----------|
+| full | 1.49 ms | — |
+| NOGLOB (smem writes only) | 0.89 ms | global reads cost 0.49 ms |
+| NOSMEM (global reads only) | 1.25 ms | smem conv+write cost 0.12 ms |
+| neither (barrier+mma+loop) | 0.77 ms | **floor** |
+
+Global f32 reads are the largest addable cost. The f32 arena reads **4 bytes for
+a value the tensor core consumes at 2** → 2× wasted global/L2 traffic. (Coalescing
+the previously-strided B staging alone changed nothing — it's byte-volume-bound,
+not raw-coalescing-bound.)
+
+### Result: f16 INPUTS break 92 → ~107 TF/s @4096 (+17%)
+`mma17_f16in.cl` + `bench17f16in`: A,B uploaded as fp16 (half the staging bytes;
+`ushort8`-vectorized A load, coalesced B); C stays f32, f32 accumulate. With the
+freed staging budget **BK32** now wins (fewer barriers / higher intensity per
+stage) where it lost at f32-arena:
+
+| config | 2048³ | 4096³ | max_abs @1024³ |
+|--------|-------|-------|----------------|
+| f32-arena f16 (§38 wmma / §39 mma.sync) | 72 | 92 | 3.1e-3 |
+| f16-in 256×128 W8×4 BK16 NBUF2 | 58 | 81 | 3.1e-3 |
+| **f16-in 256×128 W8×4 BK32 NBUF3** | **76** | **107** | **3.06e-3** |
+| f16-in 256×128 W8×4 BK32 NBUF2 | 74 | 106 | 3.06e-3 |
+| cuBLAS tf32 (ref) | 116 | 133 | — |
+
+**92 → 107 @4096, 72 → 76 @2048, at tf32-exact accuracy** (max_abs 3.06e-3 =
+§38's f16 = tf32). Gap to cuBLAS-tf32-134 closes **1.46× → 1.25×**.
+Lane-saturated (188/376/564 all 107 → SM saturates on 1 block, robust). BK64
+overflows smem on the 256-wide tile (110 KB > 100 KB); BK32 is the knee.
+
+### cp.async still dead; fp8 would not help
+`make run-probe` re-run: scalar/`st.shared` CONTROL correct, every async form
+(cp.async.cg/.ca/+fence/spin/mbarrier) WRONG 1024/1024. The residual 107→134 gap
+is still the multistage global-latency pipeline only cp.async buys — but the
+**sync ceiling is now 107, not 92/57**. fp8 (m16n8k32, 2× rate) buys nothing:
+compute is already free (staging-bound), and its 3–4-bit mantissa breaks the
+tf32-exact contract.
+
+### DECISION (§14a): PoC-only; NOT integrated
+This re-baselines the honest standalone fp16 tensor ceiling on this ICD from 92
+to **~107 TF/s (tf32-precision)** and identifies the 92 wall as **staging-byte-
+bound**, not compute/register-bound. Integrating the f16-input win needs a real
+**f16 input lane** in the plugin (convert-on-H2D or an f16 arena) + range guards
+— deliberately deferred as product work. Value banked: the ceiling is 1.17×
+higher than §38 believed, and the bottleneck is now precisely characterized
+(halve the input bytes, not the MMA). **Reproduce:** `cd poc/17-nv-mma`,
+`make run-bench-mma` (mma.sync ties 92), `make run-bench-f16in` (107, `ACC=1` for
+accuracy), `make run-probe` (cp.async dead).
