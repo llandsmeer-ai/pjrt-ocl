@@ -915,4 +915,177 @@ __kernel void mm_tc_fp16(__global uchar *arena, VMO_IO_PARAMS,
         }
     }
 }
+
+/* §39 fp16-INPUT tensor-core SGEMM (poc/17-nv-mma mma17_f16in.cl BK32 NBUF3).
+ * Unlike mm_tc_fp16 (which reads f32 from the arena and narrows in smem — 4
+ * staging bytes for a value the tensor core consumes at 2), this variant reads
+ * A and B as fp16 arrays already staged in device scratch by pack_f16, so the
+ * dominant global/L2 traffic halves. §39 measured the f32-arena kernel is 100%
+ * staging-byte-bound (MMA is free); halving the input bytes broke the 92 TF/s
+ * wall to ~107 @4096 (and 72->76 @2048) at tf32-exact accuracy. Uses
+ * mma.sync.m16n8k16 + ldmatrix (ties legacy wmma at the ceiling, fewer regs).
+ * Af/Bf are separate __global const half* scratch buffers with padded leading
+ * dims lda/ldb (>= K/N; pack_f16 pads to break power-of-2 cache aliasing that
+ * dips the f32-arena path at K=2048). C is written to the arena via dsth. */
+#define MHF_TM 256
+#define MHF_TN 128
+#define MHF_BK 16
+#define MHF_NBUF 2
+#define MHF_WM 8
+#define MHF_WN 4
+#define MHF_PAD 8
+#define MHF_LDS (MHF_BK + MHF_PAD)
+#define MHF_NTHREADS (MHF_WM * MHF_WN * 32)
+#define MHF_RF  ((MHF_TM / MHF_WM) / 16)   /* 2 */
+#define MHF_TNW ((MHF_TN / MHF_WN) / 8)    /* 4 */
+#define MHF_KSUB (MHF_BK / 16)             /* 2 */
+
+#define MHF_LDM_A(f, base_ptr, lds)                                            \
+    do {                                                                      \
+        uint _mat = (lane >> 3) & 3u, _wi = lane & 7u;                        \
+        __local const ushort *_p = (base_ptr) + ((_mat & 1u) * 8u + _wi) * (lds)\
+                                    + (_mat >> 1) * 8u;                        \
+        asm volatile("{ .reg .u64 sp; cvta.to.shared.u64 sp, %4;\n"           \
+            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [sp]; }" \
+            : "=r"((f)[0]),"=r"((f)[1]),"=r"((f)[2]),"=r"((f)[3])             \
+            : "l"(_p));                                                       \
+    } while (0)
+#define MHF_LDM_B(f, base_ptr, lds)                                           \
+    do {                                                                      \
+        uint _mat = (lane >> 3) & 1u, _wi = lane & 7u;                        \
+        __local const ushort *_p = (base_ptr) + _wi * (lds) + _mat * 8u;      \
+        asm volatile("{ .reg .u64 sp; cvta.to.shared.u64 sp, %2;\n"           \
+            "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [sp]; }"       \
+            : "=r"((f)[0]),"=r"((f)[1])                                       \
+            : "l"(_p));                                                       \
+    } while (0)
+#define MHF_MMA(acc, a, b)                                                    \
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n"        \
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"              \
+        : "+f"((acc)[0]),"+f"((acc)[1]),"+f"((acc)[2]),"+f"((acc)[3])         \
+        : "r"((a)[0]),"r"((a)[1]),"r"((a)[2]),"r"((a)[3]),                    \
+          "r"((b)[0]),"r"((b)[1]))
+
+__attribute__((reqd_work_group_size(MHF_NTHREADS, 1, 1)))
+__kernel void mm_tc_fp16p(__global uchar *arena, VMO_IO_PARAMS,
+                          __global const ushort *Af,
+                          __global const ushort *Bf,
+                          const uint M, const uint N, const uint K,
+                          const uint dsth, const uint lda, const uint ldb)
+{
+    VMO_IO_ARRAY;
+    __local __attribute__((aligned(16))) ushort As[MHF_NBUF * MHF_TM * MHF_LDS];
+    __local __attribute__((aligned(16))) ushort Bs[MHF_NBUF * MHF_TN * MHF_LDS];
+    __global float *C = AP(float, dsth);
+
+    const uint tiles_n = (N + MHF_TN - 1) / MHF_TN;
+    const uint tiles_m = (M + MHF_TM - 1) / MHF_TM;
+    const uint total = tiles_m * tiles_n;
+    const uint lid = get_local_id(0);
+    const uint warp = lid >> 5, lane = lid & 31;
+    const uint wm = warp % MHF_WM, wn = warp / MHF_WM;
+    const uint nlanes = get_num_groups(0);
+
+    for (uint tile = get_group_id(0); tile < total; tile += nlanes) {
+        const uint tr = tile / tiles_n, tc = tile % tiles_n;
+        const uint row0 = tr * MHF_TM, col0 = tc * MHF_TN;
+        float acc[MHF_RF][MHF_TNW][4];
+        for (int i = 0; i < MHF_RF; i++)
+            for (int j = 0; j < MHF_TNW; j++)
+                for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
+
+#define MHF_STAGE(BUF, K0)                                                    \
+        do {                                                                  \
+            __local ushort *As_ = As + (size_t)(BUF) * MHF_TM * MHF_LDS;      \
+            __local ushort *Bs_ = Bs + (size_t)(BUF) * MHF_TN * MHF_LDS;      \
+            const int full = (row0 + MHF_TM <= M) && (col0 + MHF_TN <= N) &&  \
+                             ((K0) + MHF_BK <= K);                            \
+            if (full) {                                                       \
+                for (uint q = lid; q < MHF_TM * (MHF_BK/8); q += MHF_NTHREADS){\
+                    const uint m = q / (MHF_BK/8), kk = (q % (MHF_BK/8)) * 8u;\
+                    ushort8 v = vload8(0, Af + (size_t)(row0+m)*lda+(K0)+kk); \
+                    vstore8(v, 0, (__local ushort*)&As_[m*MHF_LDS+kk]);       \
+                }                                                             \
+                for (uint q = lid; q < MHF_BK * (MHF_TN/8); q += MHF_NTHREADS){\
+                    const uint kk = q / (MHF_TN/8), n = (q % (MHF_TN/8)) * 8u;\
+                    ushort8 v = vload8(0, Bf + (size_t)((K0)+kk)*ldb+col0+n); \
+                    for (uint e=0;e<8;e++) Bs_[(n+e)*MHF_LDS+kk]=((ushort*)&v)[e];\
+                }                                                             \
+            } else {                                                          \
+                for (uint idx = lid; idx < MHF_TM*MHF_BK; idx += MHF_NTHREADS){\
+                    const uint m = idx / MHF_BK, kk = idx % MHF_BK;           \
+                    const uint gr = row0 + m, gk = (K0) + kk;                 \
+                    As_[m*MHF_LDS+kk] = (gr<M&&gk<K) ? Af[(size_t)gr*lda+gk]:0;\
+                }                                                             \
+                for (uint idx = lid; idx < MHF_TN*MHF_BK; idx += MHF_NTHREADS){\
+                    const uint kk = idx % MHF_BK, n = idx / MHF_BK;           \
+                    const uint gk = (K0) + kk, gc = col0 + n;                 \
+                    Bs_[n*MHF_LDS+kk] = (gk<K&&gc<N) ? Bf[(size_t)gk*ldb+gc]:0;\
+                }                                                             \
+            }                                                                 \
+        } while (0)
+
+#define MHF_COMPUTE(BUF)                                                      \
+        do {                                                                  \
+            __local ushort *As_ = As + (size_t)(BUF) * MHF_TM * MHF_LDS;      \
+            __local ushort *Bs_ = Bs + (size_t)(BUF) * MHF_TN * MHF_LDS;      \
+            for (uint ks = 0; ks < MHF_KSUB; ks++) {                          \
+                uint af[MHF_RF][4], bf[MHF_TNW][2];                           \
+                for (int i = 0; i < MHF_RF; i++)                              \
+                    MHF_LDM_A(af[i], &As_[(wm*MHF_RF*16+i*16)*MHF_LDS+ks*16], MHF_LDS);\
+                for (int j = 0; j < MHF_TNW; j++)                             \
+                    MHF_LDM_B(bf[j], &Bs_[(wn*MHF_TNW*8+j*8)*MHF_LDS+ks*16], MHF_LDS);\
+                for (int i = 0; i < MHF_RF; i++)                              \
+                    for (int j = 0; j < MHF_TNW; j++)                         \
+                        MHF_MMA(acc[i][j], af[i], bf[j]);                     \
+            }                                                                 \
+        } while (0)
+
+        uint buf = 0;
+        MHF_STAGE(0, 0);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint k0 = 0; k0 < K; k0 += MHF_BK) {
+            if (k0 + MHF_BK < K) MHF_STAGE((buf + 1u) % MHF_NBUF, k0 + MHF_BK);
+            MHF_COMPUTE(buf);
+            barrier(CLK_LOCAL_MEM_FENCE);
+            buf = (buf + 1u) % MHF_NBUF;
+        }
+#undef MHF_STAGE
+#undef MHF_COMPUTE
+
+        for (int i = 0; i < MHF_RF; i++)
+        for (int j = 0; j < MHF_TNW; j++) {
+            const uint gr0 = row0 + wm*MHF_RF*16 + i*16;
+            const uint gc0 = col0 + wn*MHF_TNW*8 + j*8;
+            for (int reg = 0; reg < 4; reg++) {
+                const uint r = (lane >> 2) + 8u * (reg >> 1);
+                const uint c = (lane & 3) * 2 + (reg & 1);
+                const uint gr = gr0 + r, gc = gc0 + c;
+                if (gr < M && gc < N) C[(size_t)gr * N + gc] = acc[i][j][reg];
+            }
+        }
+    }
+}
+
+/* f32 -> fp16 pack with an optionally padded leading dim (§39). Reads the
+ * source (arena or I/O port) as f32 at src[r*cols + c], writes fp16 at
+ * dst[r*ld + c]. 2D grid (dim0=col, dim1=row), grid-strided both ways => no
+ * per-element integer division on the hot path. The pad columns [cols, ld) are
+ * never read by mm_tc_fp16p (its staging guards gk<K / gc<N), so they are left
+ * uninitialized. dst is a plain fp16 scratch buffer. When ld==cols this is a
+ * plain contiguous convert. */
+__kernel void pack_f16(__global uchar *arena, VMO_IO_PARAMS,
+                       __global ushort *dst, const uint srch,
+                       const uint rows, const uint cols, const uint ld)
+{
+    VMO_IO_ARRAY;
+    __global const float *src = AP(const float, srch);
+    const uint cstr = get_global_size(0), rstr = get_global_size(1);
+    for (uint r = get_global_id(1); r < rows; r += rstr) {
+        __global const float *srow = src + (size_t)r * cols;
+        __global ushort *drow = dst + (size_t)r * ld;
+        for (uint c = get_global_id(0); c < cols; c += cstr)
+            vstore_half(srow[c], 0, (__global half *)&drow[c]);
+    }
+}
 #endif  /* VMO_NV_PTX */

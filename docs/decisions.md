@@ -3344,3 +3344,73 @@ peak 5–7 live slots** (≤ the shipped 8-slot budget).
   ms, noise; only a cosmetic static op-count drop 33→18). Per §14a "keep only if
   it moves the needle", and since the reciprocal is not f32-exact, **dropped
   entirely** — the win is 100% the region infrastructure.
+## 41. fp16 matmul, round 2: packed fp16-input is a WASH in-plugin; the real win is the fp16+hybrid routing/engine fix (2026-07-21)
+
+Two fronts on §38a/§39's fp16 tensor-core matmul. **(a) close the standalone→
+in-plugin gap** (§39's f16-input tile hits 107 TF/s standalone; in-plugin
+mm_tc_fp16 does 67/85 @2048/4096) via **packed-A staging / dim-padding**;
+**(b) extend the large win (§38a: large 5.2→4.98× CUDA) to base + the matmul-heavy
+bench_suite without the small-config hybrid regression.** (a) is a NEGATIVE
+result; (b) is the shippable win.
+
+### (a) Packed fp16-INPUT tile — BUILT, CORRECT, but a WASH → default OFF
+Ported §39's poc/17 `mma17_f16in.cl` (mma.sync.m16n8k16 + ldmatrix, reads A/B as
+fp16 from global) into the plugin: new kernels `mm_tc_fp16p` + `pack_f16`
+(f32→fp16 convert with a padded leading dim, 2D grid = no per-element div), a
+per-program fp16 scratch (`mm_f16a_`/`mm_f16b_`, grown lazily, PoolAlloc), and
+`EnqueueFp16Matmul` wired into the pure-matmul fast path. Opt-in
+`PJRT_OCL_MM_FP16_PACK=1`.
+
+Measured (RTX PRO 6000 Blackwell, `x@y` fast path):
+| N | tf32 | fp16 f32-arena (§38a) | fp16 PACKED | tile-only (no pack) |
+|---|------|-----------------------|-------------|---------------------|
+| 2048 | 45 | **68** | 54 | 64 |
+| 4096 | 56 | **85** | 78 | 82–85 |
+
+The packed tile **ties** the f32-arena tile at the tile level (~85 @4096) and the
+mandatory pack pass makes the end-to-end a **regression** (85→78). Root cause:
+§39's 92→107 came from inputs *already* fp16 in global (zero conversion) — a pure
+byte-halving on reads. A standalone matmul must PAY an f32→fp16 conversion pass
+(read M·K·4 + write M·K·2, ×2 for B) that is new global traffic, and it exceeds
+the L2-read savings (a single matmul reads each input ~once from global; the
+tiles_n re-reads are L2-served). Also the 256×128 W8×4 tile's 90 KB smem
+(BK32/NBUF3) caps occupancy to 1 block/SM on this ICD (48 KB reported, ~100 KB HW
+max) — BK16/NBUF2 (36 KB, 2 blocks/SM) is the knee but still only ties. The
+standalone 107 does NOT transfer to a single in-plugin launch. **The "2048 dips
+to 370" aliasing claim did not reproduce** — f32-arena fp16 @2048 is a healthy 67
+TF/s. Correctness: tf32-exact (max_abs ~1e-3) incl. power-of-2 K (padding active),
+odd K, M=1, non-tile-aligned. **Kept behind the default-OFF flag per the §31/§36
+precedent (measured washes stay opt-in, default byte-identical); NOT wired into
+the hybrid path (transformer keeps the f32-arena tile).**
+
+### (b) fp16+hybrid: volume-gated routing + per-program engine fallback — THE WIN
+`PJRT_OCL_MM_FP16=1 PJRT_OCL_MM_HYBRID=1` regressed transformer **base** (5.4→6.1,
+then 8.3 with a naive stricter gate) for TWO reasons, both now fixed:
+1. **Routing gate too loose for fp16.** The shared hybrid predicate
+   (`M≥512,N≥512,K≥256`) routed base's small matmuls (vol ≤5.4e8) to the fp16
+   256×128 1024-thread tile, whose occupancy/launch floor is far above the tf32
+   128×128 256-thread tile → regression. Fix: when fp16, gate on **compute volume
+   `M·N·K ≥ 2^30`** so base stays in the megakernel and large (vol ≥2e9) routes.
+2. **HYBRID forced host-dispatch client-wide.** Even with base routing nothing,
+   `PJRT_OCL_MM_HYBRID=1` forced the host-dispatch engine (per-phase launch
+   penalty) for *every* program → base 5.4→8.3. Fix: **per-program engine
+   fallback** — when host-dispatch was forced SOLELY by HYBRID on a
+   megakernel-capable GPU AND the program has no routable big-matmul phase, run
+   the **megakernel** for that program (`LoadedProgram::host_dispatch_`,
+   `OclRuntime::hybrid_forces_hd_`/`can_use_megakernel()`).
+
+Measured (RTX PRO 6000 Blackwell; one flag combo FP16+HYBRID for all):
+| workload | tf32 default | fp16+hybrid | note |
+|---|---|---|---|
+| transformer base | 5.40 ms | **5.49 ms** | no regression (was 6.1/8.3) |
+| transformer large | 27.4 ms | **16.0 ms** | **1.71×** (kept) |
+| bench_suite mlp | 0.222 ms | 0.221 ms | unchanged (stays on megakernel) |
+| bench_suite attention | 0.197 ms | 0.199 ms | unchanged |
+| matmul 2048/4096 (fast path) | 45/56 | 68/85 | fp16 f32-arena, unchanged |
+
+Correctness: transformer base/large `--check` PASS (max_abs 4.6e-3/2.9e-3,
+tf32-equivalent); bench_suite mlp/attention PASS/close vs CUDA. **Default & PoCL
+untouched: pytest 344 passed / 1 skipped; NVIDIA tf32 default `--check` PASS.**
+Reproduce: `PJRT_OCL_MM_FP16=1 PJRT_OCL_MM_HYBRID=1` on
+`tools/bench_transformer.py --config {base,large}` and
+`tools/bench_suite/run_suite.py --only mlp attention`.

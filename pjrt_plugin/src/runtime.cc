@@ -479,11 +479,27 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
       cl_int fe;
       rt->mm_tc_fp16_kernel_ = clCreateKernel(rt->tc_mega_program_, "mm_tc_fp16", &fe);
       if (fe != CL_SUCCESS) rt->mm_tc_fp16_kernel_ = nullptr;
+      // §39: fp16-INPUT tile (reads pre-packed fp16 scratch, halves staging
+      // bytes -> ~107 TF/s) + its f32->fp16 pack kernel. Same NV_PTX program.
+      cl_int pe;
+      rt->mm_tc_fp16p_kernel_ =
+          clCreateKernel(rt->tc_mega_program_, "mm_tc_fp16p", &pe);
+      if (pe != CL_SUCCESS) rt->mm_tc_fp16p_kernel_ = nullptr;
+      cl_int ke;
+      rt->pack_f16_kernel_ = clCreateKernel(rt->tc_mega_program_, "pack_f16", &ke);
+      if (ke != CL_SUCCESS) rt->pack_f16_kernel_ = nullptr;
     }
     // §38 opt-in: PJRT_OCL_MM_FP16=1 routes big matmuls (LaunchMatmul fast path
     // + MM_HYBRID phases) through the fp16 WMMA tile instead of tf32 mm_tc.
     if (const char* e = std::getenv("PJRT_OCL_MM_FP16"); e && e[0] && e[0] != '0')
       rt->mm_fp16_ = true;
+    // §39 packed fp16-INPUT path — MEASURED A WASH in-plugin (the mandatory
+    // f32->fp16 conversion pass negates the halved-input-read savings the
+    // standalone 107 TF/s assumed from pre-existing fp16 inputs). Default OFF;
+    // opt-in via PJRT_OCL_MM_FP16_PACK=1 for the record.
+    if (const char* e = std::getenv("PJRT_OCL_MM_FP16_PACK");
+        e && e[0] && e[0] != '0')
+      rt->mm_fp16_pack_ = true;
     // Advertise 128 to the scheduler ONLY if the 128x128 TF32 kernel is the one
     // that will execute (built AND non-null). If it failed, mma_t_ stays 64 and
     // the portable fallback runs a matching 64x64 schedule.
@@ -533,8 +549,15 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   // can be interleaved with standalone mm_tc launches on the in-order queue; the
   // single persistent megakernel launch cannot be split mid-flight. Forcing it
   // here makes PJRT_OCL_MM_HYBRID=1 a one-switch gate.
-  if (const char* e = std::getenv("PJRT_OCL_MM_HYBRID"); e && e[0] && e[0] != '0')
+  if (const char* e = std::getenv("PJRT_OCL_MM_HYBRID"); e && e[0] && e[0] != '0') {
+    // Record whether HYBRID is the SOLE reason for host-dispatch: only then can
+    // a matmul-light program safely fall back to the megakernel per-program.
+    // (If the device already required host-dispatch — CPU / no device fence /
+    // ENGINE=host — the megakernel is unavailable and this stays false.)
+    if (!rt->host_dispatch_ && rt->can_use_megakernel())
+      rt->hybrid_forces_hd_ = true;
     rt->host_dispatch_ = true;
+  }
 
   // Execution tracing (PJRT_OCL_VM_TRACE=<path>): per-entry event profiling
   // only exists on the host-dispatch engine (the megakernel's entries are not
@@ -637,6 +660,8 @@ OclRuntime::~OclRuntime() {
   if (mm_kernel_) clReleaseKernel(mm_kernel_);
   if (mm_tc_kernel_) clReleaseKernel(mm_tc_kernel_);
   if (mm_tc_fp16_kernel_) clReleaseKernel(mm_tc_fp16_kernel_);
+  if (mm_tc_fp16p_kernel_) clReleaseKernel(mm_tc_fp16p_kernel_);
+  if (pack_f16_kernel_) clReleaseKernel(pack_f16_kernel_);
   if (gemv_kernel_) clReleaseKernel(gemv_kernel_);
   if (mm_pack_kernel_) clReleaseKernel(mm_pack_kernel_);
   if (mm_packed_kernel_) clReleaseKernel(mm_packed_kernel_);
@@ -918,6 +943,30 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
       }
     }
   }
+  // Per-program engine selection. Default to the client-wide choice. But when
+  // host-dispatch was forced SOLELY by MM_HYBRID (GPU + megakernel available),
+  // a program with no routable big-matmul phase gains nothing from routing and
+  // pays host-dispatch's per-phase penalty — so fall it back to the megakernel.
+  // Proxy for "has a routable phase": at least one individually routable big
+  // matmul task exists (the per-phase all-routable check happens at execute; a
+  // program with zero routable tasks can never route). Mirrors the GPU gate in
+  // LaunchHostDispatch (fp16 uses a compute-volume gate; tf32 uses dims).
+  lp->host_dispatch_ = rt->host_dispatch();
+  if (rt->host_dispatch() && rt->hybrid_forces_hd() && rt->trace_path().empty()) {
+    bool any_routable = false;
+    for (const VmTask& tk : tasks) {
+      if ((tk.tile_op & 0xFFu) != kTopMma ||
+          ((tk.tile_op >> 8) & 0xFFu) != kDtF32 || tk.p3 > 1 || tk.p4 || tk.p5 ||
+          tk.p6)
+        continue;
+      const uint64_t vol = (uint64_t)tk.p0 * (uint64_t)tk.p1 * (uint64_t)tk.p2;
+      const bool routable = rt->mm_fp16()
+                                ? (vol >= (1ull << 30))
+                                : (tk.p0 >= 512 && tk.p1 >= 512 && tk.p2 >= 256);
+      if (routable) { any_routable = true; break; }
+    }
+    if (!any_routable) lp->host_dispatch_ = false;  // use the megakernel
+  }
   // Patch control-entry cond buffer ids.
   std::vector<VmEntry> entries = p.entries;
   for (VmEntry& en : entries)
@@ -959,6 +1008,8 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
 LoadedProgram::~LoadedProgram() {
   if (mm_bp_) rt_->PoolFree(mm_bp_, mm_bp_bytes_);
   if (hy_bp_) rt_->PoolFree(hy_bp_, hy_bp_bytes_);
+  if (mm_f16a_) rt_->PoolFree(mm_f16a_, mm_f16a_bytes_);
+  if (mm_f16b_) rt_->PoolFree(mm_f16b_, mm_f16b_bytes_);
   for (cl_mem m : {arena_, aux_buf_, tasks_buf_, entries_buf_, lane_tab_buf_,
                    bar_buf_, stats_buf_, seg_tab_buf_})
     if (m) clReleaseMemObject(m);
@@ -1032,8 +1083,8 @@ bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
     }
   }
 
-  if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
-                             : LaunchKernel(q, err))) {
+  if (!(host_dispatch_ ? LaunchHostDispatch(q, err)
+                       : LaunchKernel(q, err))) {
     cleanup();
     return false;
   }
@@ -1186,6 +1237,102 @@ bool LoadedProgram::EnqueuePackedMM(cl_command_queue q, uint32_t M, uint32_t N,
   return true;
 }
 
+// §39 fp16-INPUT matmul. Pack A(MxK) and B(KxN) from f32 (arena/port) into fp16
+// device scratch with a padded leading dim, then run mm_tc_fp16p (reads fp16 =>
+// half the global staging bytes vs the f32-arena mm_tc_fp16, ~107 vs ~85 TF/s
+// @4096). Padding lda/ldb to (dim+8) breaks the power-of-2 (K=2048) cache-set
+// aliasing that dips the f32-arena tile. No drain: pack -> tile -> caller's next
+// op serialize on the in-order queue; the shared scratch is safe because
+// pack_{i+1} is ordered after tile_i (which fully consumes it). Only the pad
+// column of the LAST row is unwritten, and the tile never reads it.
+bool LoadedProgram::EnqueueFp16Matmul(cl_command_queue q, uint32_t M,
+                                      uint32_t N, uint32_t K, uint32_t dst,
+                                      uint32_t ah, uint32_t bh,
+                                      std::string* err) {
+  // Pad the fp16 leading dim (contiguous axis) to break power-of-2 aliasing
+  // while keeping 16-byte row alignment (8 halves = 16 B) for the vectorized
+  // ushort8 staging loads. +8 is enough to move consecutive rows off the same
+  // L2 set; a no-op perf-wise for non-power-of-2 dims.
+  auto padld = [](uint32_t d) -> uint32_t {
+    return ((d & (d - 1u)) == 0u && d >= 512u) ? d + 8u : d;
+  };
+  const uint32_t lda = padld(K), ldb = padld(N);
+  const size_t abytes = (size_t)M * lda * sizeof(cl_ushort);
+  const size_t bbytes = (size_t)K * ldb * sizeof(cl_ushort);
+  if (mm_f16a_bytes_ < abytes) {
+    if (mm_f16a_) rt_->PoolFree(mm_f16a_, mm_f16a_bytes_);
+    mm_f16a_ = rt_->PoolAlloc(abytes, err);
+    if (!mm_f16a_) return false;
+    mm_f16a_bytes_ = abytes;
+  }
+  if (mm_f16b_bytes_ < bbytes) {
+    if (mm_f16b_) rt_->PoolFree(mm_f16b_, mm_f16b_bytes_);
+    mm_f16b_ = rt_->PoolAlloc(bbytes, err);
+    if (!mm_f16b_) return false;
+    mm_f16b_bytes_ = bbytes;
+  }
+  // pack_f16(arena, io0..io7, dst, srch, rows, cols, ld)
+  cl_kernel kp = rt_->pack_f16_kernel();
+  auto enqueue_pack = [&](cl_mem dstbuf, uint32_t srch, uint32_t rows,
+                          uint32_t cols, uint32_t ld) -> bool {
+    clSetKernelArg(kp, 0, sizeof(arena_), &arena_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(kp, 1 + pt, sizeof(cl_mem), &b);
+    }
+    clSetKernelArg(kp, 9, sizeof(cl_mem), &dstbuf);
+    clSetKernelArg(kp, 10, sizeof(uint32_t), &srch);
+    clSetKernelArg(kp, 11, sizeof(uint32_t), &rows);
+    clSetKernelArg(kp, 12, sizeof(uint32_t), &cols);
+    clSetKernelArg(kp, 13, sizeof(uint32_t), &ld);
+    // 2D grid: dim0 = columns (contiguous, coalesced), dim1 = rows. Cap each
+    // extent so residency stays bounded; the kernel grid-strides the remainder.
+    size_t gcols = ((cols + 255u) / 256u) * 256u;
+    if (gcols > 4096) gcols = 4096;
+    size_t grows = rows < 512u ? rows : 512u;
+    size_t g2[2] = {gcols, grows};
+    size_t l2[2] = {256, 1};
+    return clEnqueueNDRangeKernel(q, kp, 2, nullptr, g2, l2, 0, nullptr,
+                                  nullptr) == CL_SUCCESS;
+  };
+  static const bool nopack_dbg =
+      std::getenv("PJRT_OCL_MM_FP16_NOPACK_DBG") != nullptr;
+  if (!nopack_dbg &&
+      !enqueue_pack(mm_f16a_, ah, M, K, lda)) {
+    *err = "Execute: pack_f16(A) launch failed";
+    return false;
+  }
+  if (!nopack_dbg && !enqueue_pack(mm_f16b_, bh, K, N, ldb)) {
+    *err = "Execute: pack_f16(B) launch failed";
+    return false;
+  }
+  // mm_tc_fp16p(arena, io0..io7, Af, Bf, M, N, K, dsth, lda, ldb)
+  cl_kernel km = rt_->mm_tc_fp16p_kernel();
+  clSetKernelArg(km, 0, sizeof(arena_), &arena_);
+  for (int pt = 0; pt < kNIoPorts; ++pt) {
+    cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+    clSetKernelArg(km, 1 + pt, sizeof(cl_mem), &b);
+  }
+  clSetKernelArg(km, 9, sizeof(cl_mem), &mm_f16a_);
+  clSetKernelArg(km, 10, sizeof(cl_mem), &mm_f16b_);
+  clSetKernelArg(km, 11, sizeof(uint32_t), &M);
+  clSetKernelArg(km, 12, sizeof(uint32_t), &N);
+  clSetKernelArg(km, 13, sizeof(uint32_t), &K);
+  clSetKernelArg(km, 14, sizeof(uint32_t), &dst);
+  clSetKernelArg(km, 15, sizeof(uint32_t), &lda);
+  clSetKernelArg(km, 16, sizeof(uint32_t), &ldb);
+  constexpr uint32_t kTM = 256, kTN = 128;   // must match MHF_TM/MHF_TN
+  const size_t tiles_m = (M + kTM - 1) / kTM;
+  const size_t tiles_n = (N + kTN - 1) / kTN;
+  size_t lsz = 1024, gsz = tiles_m * tiles_n * lsz;  // one WG per 256x128 tile
+  if (clEnqueueNDRangeKernel(q, km, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                             nullptr) != CL_SUCCESS) {
+    *err = "Execute: mm_tc_fp16p launch failed";
+    return false;
+  }
+  return true;
+}
+
 // mm2(arena, io0..io7, M, N, K, dst, a, b). No barrier buffer / lanes / tasks.
 // N==1 routes to gemv(arena, io0..io7, M, K, dst, a, b) — one row per WI.
 // Geometry per engine: GPU mm2 = one 256-WI workgroup per 128x64 output tile;
@@ -1198,6 +1345,10 @@ bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
   // §38: PJRT_OCL_MM_FP16=1 prefers the fp16 WMMA tile (~72/92 TF/s) over the
   // tf32 mm_tc (~47/57). Different tile geometry: 256x128 W8x4 = 1024 threads.
   const bool use_fp16 = use_tc && rt_->mm_fp16();
+  // §39: the packed fp16-INPUT path (pack A/B to fp16 scratch, then read fp16 =
+  // half the staging bytes) supersedes the f32-arena fp16 tile when enabled.
+  if (use_fp16 && rt_->mm_fp16_pack())
+    return EnqueueFp16Matmul(q, mm_M_, mm_N_, mm_K_, mm_dst_, mm_a_, mm_b_, err);
   cl_kernel k = is_gemv ? rt_->gemv_kernel()
                         : (use_fp16 ? rt_->mm_tc_fp16_kernel()
                                     : (use_tc ? rt_->mm_tc_kernel()
@@ -1502,10 +1653,22 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         if (p.entries[e].task == kEntNop) continue;
         const uint32_t t = p.entries[e].task;
         const VmTask& tk = p.tasks[t];
+        // Size gate: keep small matmuls (attention per-head, base dims) on the
+        // VM where they're faster. The fp16 tile is a 256x128 1024-thread WG —
+        // its per-launch/occupancy floor is far higher than the tf32 128x128
+        // 256-thread tile, so on SMALL matmuls (base: M=512, vol<=5.4e8) routing
+        // to fp16 REGRESSES (measured 5.4->6.1 ms base). fp16 only pays off on
+        // compute-bound large matmuls (vol>=~1e9): use a stricter volume gate
+        // for fp16 so base stays in the tf32 megakernel (no regression) while
+        // large (vol>=2e9) still routes. tf32 hybrid keeps its dim threshold.
+        const uint64_t vol =
+            (uint64_t)tk.p0 * (uint64_t)tk.p1 * (uint64_t)tk.p2;
+        const bool big_enough =
+            rt_->mm_fp16() ? (vol >= (1ull << 30))
+                           : (tk.p0 >= 512 && tk.p1 >= 512 && tk.p2 >= 256);
         const bool ok = (tk.tile_op & 0xFFu) == kTopMma &&
                         ((tk.tile_op >> 8) & 0xFFu) == kDtF32 && tk.p3 <= 1 &&
-                        tk.p4 == 0 && tk.p5 == 0 && tk.p6 == 0 && tk.p0 >= 512 &&
-                        tk.p1 >= 512 && tk.p2 >= 256;
+                        tk.p4 == 0 && tk.p5 == 0 && tk.p6 == 0 && big_enough;
         if (!ok) { mm_tasks.clear(); return false; }  // any non-matmul -> VM
         if (std::find(mm_tasks.begin(), mm_tasks.end(), t) == mm_tasks.end())
           mm_tasks.push_back(t);
@@ -1782,9 +1945,9 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
   if (prof) clFinish(q);
   auto t1 = clk();
 
-  if (!(mm_ok_               ? LaunchMatmul(q, err)
-        : rt_->host_dispatch() ? LaunchHostDispatch(q, err)
-                             : LaunchKernel(q, err))) {
+  if (!(mm_ok_          ? LaunchMatmul(q, err)
+        : host_dispatch_ ? LaunchHostDispatch(q, err)
+                         : LaunchKernel(q, err))) {
     for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
     outputs->clear();
     return false;
@@ -1819,7 +1982,7 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
   // %globaltimer arrivals and prints, per barrier phase b: wall time (release[b]
   // - release[b-1], where release == last-lane arrival) and idle-at-barrier skew
   // (max - min arrival). CSV to stderr for post-processing.
-  if (std::getenv("PJRT_OCL_PHASE_TS") && !rt_->host_dispatch() && !mm_ok_) {
+  if (std::getenv("PJRT_OCL_PHASE_TS") && !host_dispatch_ && !mm_ok_) {
     const uint32_t nl = prog_.n_lanes;
     std::vector<uint32_t> ts(size_t{4096} * nl);
     if (clEnqueueReadBuffer(q, stats_buf_, CL_TRUE, 0, ts.size() * 4, ts.data(),
