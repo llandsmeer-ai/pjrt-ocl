@@ -188,18 +188,24 @@ dispatch-free — see methodology above):
   segmented-reduce tile in **dot mode** — one matrix row per tile, the whole
   workgroup doing a coalesced float4 dot + local tree, M-way parallel
   (§22.4). 1024²: 101 → 8.2 µs (cuBLAS: 3.7, L2-resident).
-- **`dot_general`** ~5.9x at 2048³. Large matmul runs a **standalone SGEMM**
-  (`mm2`, launched outside the megakernel so an 8×4 register tile doesn't
-  inflate the shared register budget). cuBLAS hits **134 TFLOP/s at 4096,
-  above Blackwell's f32 peak** — i.e. it is TF32 **tensor-core** bound, which
-  a portable f32 kernel can't reach. So there's an **NVIDIA-only TF32
-  tensor-core path** (inline-PTX `wmma` behind the `VMO_NV_PTX` build,
-  portable f32 fallback intact; note tf32 means ~1e-3 relative precision on
-  NVIDIA matmul, same trade cuBLAS makes by default). It stays short of cuBLAS
-  because the in-kernel tile is **arithmetic-intensity-capped**: it can't grow
-  without dropping below the co-residency the persistent megakernel's
-  cross-workgroup barrier requires. See the end-to-end transformer numbers
-  below for where this lands on a real workload.
+- **`dot_general`.** Large matmul runs a **standalone kernel launched outside
+  the megakernel** (so a big register tile isn't capped by the persistent
+  barrier's co-residency). On NVIDIA that's `mm_tc`, a tuned **inline-PTX TF32
+  WMMA** tile (`mma.sync`, float4-coalesced smem staging, double-buffered) —
+  **~43 / 52 TFLOP/s at 2048³ / 4096³**, 2.2× the prior scalar tile (tf32 ≈ 1e-3
+  relative precision, the same trade cuBLAS makes by default). A
+  `PJRT_OCL_MM_HYBRID` mode routes a real program's big matmuls to it:
+  **`large` transformer 27.7 → 18.8 ms (1.48×, gap vs cuBLAS 7.5× → 5.2×)** on
+  compute-bound configs (small ones regress — their matmuls don't fill the SMs).
+  - **The residual ~2.3× under cuBLAS (134 TFLOP/s) is a root-caused *portable*
+    ceiling, not an effort ceiling.** The tile is **register-file-capped at 2
+    workgroups/SM** (a 128×128 f32 accumulator is 16384 registers; it can't grow),
+    and the one mechanism that hides the resulting memory latency — **`cp.async`**
+    (Ampere+ async global→shared copy) — **is not wired up by NVIDIA's OpenCL
+    runtime**: the driver emits correct PTX but the async unit never delivers
+    data (verified at the PTX level; CUDA-only). So cuBLAS-class matmul is
+    *fundamentally unreachable* from portable OpenCL — the honest matmul ceiling
+    of a no-vendor-SDK design. Full analysis in `docs/decisions.md §31–§36`.
 - **`while` loops: faster than CUDA up to ~1M elements (~100x below 256K,
   0.7–0.8x at 512K–1M), 1.1–1.4x above.** The counted-loop pipeline (`OP_FOR`
   + bytecode unroll, §15) plus affine-chain composition folds the 32-step
@@ -255,12 +261,16 @@ layernorm/softmax `reduce→broadcast→…` idiom and collapse it into a single
 workgroup-per-segment kernel — one global round-trip instead of 5–7 latency-bound
 phases (layernorm 7→2 barriers, softmax 5→0; standalone softmax now *beats* native
 CUDA; 6.8 → 5.8 ms); and a **fused `OP_GELU`** opcode (§24/§26) that computes the
-whole tanh-approx GELU per element in registers (8 ops → 1, 5.8 → 5.3 ms). The
-residual gap is the ~100 remaining barrier-phases: our fusion so far removes the
-*sync* between ops but not the *global-memory round-trip*, so intermediates still
-hand off through DRAM — the documented next lever is register-resident map-region
-fusion (`docs/ideas-for-v2.md`), plus the matmul arithmetic-intensity cap on the
-compute-bound end.
+whole tanh-approx GELU per element in registers (8 ops → 1, 5.8 → 5.3 ms). After
+this campaign, a decomposition of the remaining time (`docs/decisions.md §29–§36`)
+shows the residual gap is **almost entirely matmul** (non-matmul is fused down to
+~8%): our per-op kernels are competitive, but the tensor-core matmul is at the
+**portable ceiling** — cuBLAS's edge comes from `cp.async`, which NVIDIA's OpenCL
+runtime doesn't expose (§35), so cuBLAS-class matmul is unreachable without a
+vendor SDK. The `PJRT_OCL_MM_HYBRID` standalone-matmul path claws the *compute-bound*
+end back (`large` gap **7.5× → 5.2×**); the small-model overhead-bound end is a
+known, documented hard case. This is an honest, measured ceiling for a
+portable-OpenCL design, not a to-do.
 
 ### Intel Arc 140V (Xe2, Lunar Lake iGPU) — vs JAX CPU
 
