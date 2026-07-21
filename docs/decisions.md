@@ -3201,3 +3201,68 @@ its own process). Scoreboard: `docs/workload-coverage-cpu.md`.
   not perf. Perf work should target the enqueue-count fix only where it changes the
   qualitative story (loop laggards from ~1000× to ~10×), not chase a win that the launch
   floor forecloses.
+
+## 41. brax / MuJoCo-MJX: two integration layers cleared (allowlist + sdy); the wall is a JAX-side threefry bug (2026-07-21)
+
+Goal: unblock brax on our OpenCL backend. There were TWO confirmed host-side
+layers before any compute even reached us, then a JAX-internal wall.
+
+### Layer 1 — MJX device allowlist (host-side, bypassed)
+brax 0.14.2 routes EVERY backend (positional/spring/generalized AND mjx) through
+`mujoco.mjx._src.io._resolve_impl(device)`, which `raise`s `Unsupported device:
+{device}` for any `device.platform` not in `{gpu, tpu, cpu}`. Our PJRT device
+reports platform `opencl`, so env construction dies before tracing. The physics
+is device-agnostic pure jax — the allowlist is purely a host guard. Bypass:
+monkeypatch `_resolve_impl` to return `types.Impl.JAX` for the unknown platform
+(no-op on cuda/cpu). Applied in the `brax_step` bench workload. NOT a backend
+change; a host shim.
+
+### Layer 2 — Shardy `sdy` dialect (OUR fix, general infra, SHIPPED)
+After the bypass, our lowering subprocess aborted at
+`deserialize_portable_artifact` with **"dialect 'sdy' is unknown"**. Any sharded
+jax program (jax.jit under a mesh, `shard_map`, `with_sharding_constraint`)
+serializes Shardy sharding hints into the VHLO artifact — as `sdy.*` **ops**
+(`sdy.mesh`, `sdy.sharding_constraint`) *and* as `sdy.*` **attributes**
+(`sdy.sharding_rule` riding on compute ops). On our single device all are
+identity. Fix (`python/pjrt_ocl/lowering.py`), two parts, both required:
+  1. `deserialize_artifact` now registers the sdy dialect on the `ir.Context`
+     (`jaxlib.mlir._mlir_libs._sdy.register_dialect`, guarded — older jaxlib
+     without Shardy is a no-op). Without this the deserializer can't even parse
+     the sdy *attributes*, so the whole module fails before the walk.
+  2. Identity handlers for the value-carrying sdy *ops*: `sdy.sharding_constraint`
+     / `sdy.reshard` alias result→operand; `sdy.mesh` (module-level, no results)
+     is a no-op.
+General win — unblocks ANY sharded jax program, not just brax. Proven by a
+self-contained e2e test (`tests/_sdy_e2e_body.py`, `test_e2e_sdy_sharding_*`): a
+`with_sharding_constraint` program emitting `sdy.mesh`+`sdy.sharding_constraint`
+now lowers and runs bit-exact through the plugin. Full suite: 345 pass (was 344).
+
+### The wall — JAX-internal threefry lowering bug on the `opencl` platform
+With both layers cleared, a **combined** `jit(reset+step)` still fails at JAX's
+own MLIR verify (before reaching our plugin):
+`'func.call' op operand type mismatch: expected 'tensor<2xui32>', but provided
+'tensor<2xi32>'` — JAX outlines `@_threefry_split` with a ui32 signature but
+calls it with i32. Confirmed **opencl-platform-specific**: the identical brax
+positional inverted_pendulum reset+step lowers AND runs on CPU (and CUDA).
+Not our code. Not worked around by `jax_threefry_partitionable` (T/F),
+`jax_threefry_gpu_kernel_lowering=False`, or typed keys (`jax.random.key`).
+`jit(reset)` **alone** lowers — the mismatch only appears in the combined graph.
+
+### Also catalogued — compute-op gaps for MJX physics (next M3 work)
+Reaching mjx-backend physics (ant/humanoid) via eager reset (dodging the combined
+threefry bug) surfaces genuine op gaps, in first-hit order:
+  1. `stablehlo.reduce` with an **`and`/`or`** reducer body (from `jp.allclose` /
+     `jp.all`; pervasive in MJX). Needs an INTEGER min/max reduce path — our
+     REDUCE/REDUCE_SEG do f32 min/max on 4-byte slots, wrong for i32/bool-stored
+     values, so this is real kernel work, not a lowering one-liner.
+  2. general data-dependent `stablehlo.scatter` (our OP_SCATTER is strided
+     concatenate/pad only).
+  3. `chlo.erf_inv`.
+
+### Outcome / decision
+brax coverage stays **FAIL** (not 17/18): the physics is otherwise in-set (runs on
+CPU with our op coverage) but the JAX opencl threefry verifier bug forecloses a
+full jitted reset+step, and mjx physics additionally needs reduce-and/scatter/
+erf_inv. Banked this session: the sdy dialect infra (general, tested) and the
+allowlist shim — brax now advances two full layers, and the exact next blockers
+are pinned. `brax_step` workload note updated to the precise reason.

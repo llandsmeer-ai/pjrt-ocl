@@ -32,7 +32,7 @@ stablehlo.gather → embedding_softmax PASS.)*
 | fft | SCI | **FAIL** | - | 0.047 | - | - | `complex-dtype` — complex dtype unsupported (cuda: PASS); 1D FFT magnitude (needs complex dtype + fft) |
 | spring_mass | PHYS | PASS | 3.513 | 1.110 | 3.16x | close (0.0e+00) | spring-mass chain (brax analogue, scan) |
 | hh_neuron | PHYS | PASS | 15.321 | 1.292 | 11.86x | close (1.3e-04) | Hodgkin-Huxley neuron (jaxley analogue, scan) |
-| brax_step | PHYS | **FAIL** | - | 0.309 | - | - | `platform-allowlist` — host lib rejects OpenCL PJRT platform (device allowlist) (cuda: PASS); brax inverted_pendulum reset+step (real env); step HLO also needs gather/scatter/case/atan |
+| brax_step | PHYS | **FAIL** | - | 0.309 | - | - | `jax-threefry-ui32-verifier` — §41: layer-1 MJX device allowlist bypassed + layer-2 sdy dialect FIXED; now blocked by a JAX-internal opencl-platform threefry lowering bug (`@_threefry_split` ui32 vs i32 in combined reset+step; CPU/CUDA lower fine). mjx physics also needs reduce-and / scatter / erf_inv (cuda: PASS) |
 
 ## Ranked missing-op priority (M3 test-driven order)
 
@@ -51,7 +51,7 @@ Each row: how many suite workloads that op/feature would unlock, and which.
 | ~~3~~ | ~~`stablehlo.gather`~~ | ~~1~~ | ~~embedding_softmax~~ — SHIPPED §38 (OP_GATHER_INDEX) |
 | 4 | `stablehlo.shift_right_logical` | 1 | monte_carlo |
 | 5 | `complex-dtype` | 1 | fft |
-| 6 | `platform-allowlist` | 1 | brax_step |
+| 6 | `platform-allowlist`+`sdy` (SHIPPED §41) → now `jax-threefry-ui32-verifier` (JAX-side, opencl-platform) | 1 | brax_step |
 
 ## Bottom line (generalization read)
 

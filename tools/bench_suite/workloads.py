@@ -419,6 +419,22 @@ def build(name):
 
     if name == "brax_step":
         # Real brax env: reset + one physics step, jitted as one program.
+        #
+        # LAYER 1 (host device allowlist): brax 0.14.2 routes every backend
+        # through MuJoCo-MJX's io._resolve_impl, which raises "Unsupported
+        # device" for any platform other than gpu/tpu/cpu (our 'opencl' PJRT
+        # device is device-agnostic pure jax — the physics doesn't care). Bypass
+        # by pinning the JAX impl (§41). This is a host-side monkeypatch, not a
+        # backend change; it is a no-op on cuda (which resolves normally).
+        try:
+            import mujoco.mjx._src.io as _mjxio
+            from mujoco.mjx._src import types as _mjxtypes
+            _orig = _mjxio._resolve_impl
+            _mjxio._resolve_impl = (lambda d: _mjxtypes.Impl.JAX
+                                    if d.platform not in ("gpu", "tpu", "cpu")
+                                    else _orig(d))
+        except Exception:  # noqa: BLE001 — no mjx: brax's own backends still build
+            pass
         from brax import envs
         env = envs.create("inverted_pendulum", backend="positional")
         key = jax.random.PRNGKey(0)
@@ -430,9 +446,23 @@ def build(name):
             nxt = env.step(state, p["act"])
             return nxt.obs
 
+        # LAYER 2 (sdy dialect) is now FIXED in lowering.py: the VHLO artifact's
+        # Shardy sharding hints deserialize + collapse to identity (§41). What
+        # still blocks a full end-to-end brax run (catalogued, next M3 gaps):
+        #   * combined jit(reset+step) trips a JAX-internal 'opencl'-platform
+        #     lowering bug: @_threefry_split is outlined with a ui32 signature
+        #     but called with i32 (MLIR verifier: 'operand type mismatch
+        #     tensor<2xui32> vs tensor<2xi32>'). Not our code — JAX's random
+        #     lowering for the experimental platform. jit(reset) alone lowers.
+        #   * mjx physics (ant/humanoid): reduce with an `and`/`or` reducer body
+        #     (from jp.allclose/jp.all — needs an integer min/max reduce),
+        #     general data-dependent stablehlo.scatter, and chlo.erf_inv.
         return fn, tree, {"cat": "PHYS",
-                          "note": "brax inverted_pendulum reset+step (real env); step HLO also "
-                                  "needs gather/scatter/case/atan",
-                          "expect": "FAIL(platform-allowlist; +gather/scatter/case/atan)"}
+                          "note": "brax inverted_pendulum reset+step (real env). "
+                                  "Layer-1 device allowlist bypassed; sdy dialect fixed. "
+                                  "Blocked on JAX opencl-platform threefry ui32/i32 "
+                                  "verifier bug (combined reset+step)",
+                          "expect": "FAIL(jax-threefry-ui32-verifier; mjx also needs "
+                                    "reduce-and/scatter/erf_inv)"}
 
     raise KeyError(f"unknown workload: {name}")
