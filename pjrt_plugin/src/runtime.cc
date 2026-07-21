@@ -461,6 +461,11 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
                        nullptr, nullptr) == CL_SUCCESS) {
       rt->vm_tc_kernel_ = clCreateKernel(rt->tc_mega_program_, "vm2", &tce);
       if (tce != CL_SUCCESS) rt->vm_tc_kernel_ = nullptr;
+      // §36: the standalone TF32 WMMA SGEMM (poc/17) lives in the SAME NV_PTX
+      // program (inline PTX). Non-fatal if absent — the SGEMM mm2 remains.
+      cl_int me;
+      rt->mm_tc_kernel_ = clCreateKernel(rt->tc_mega_program_, "mm_tc", &me);
+      if (me != CL_SUCCESS) rt->mm_tc_kernel_ = nullptr;
     }
     // Advertise 128 to the scheduler ONLY if the 128x128 TF32 kernel is the one
     // that will execute (built AND non-null). If it failed, mma_t_ stays 64 and
@@ -507,6 +512,12 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
     }
     // "auto" (or anything else) keeps the default.
   }
+  // §36 hybrid needs the segmented (host-dispatch) engine so big-matmul phases
+  // can be interleaved with standalone mm_tc launches on the in-order queue; the
+  // single persistent megakernel launch cannot be split mid-flight. Forcing it
+  // here makes PJRT_OCL_MM_HYBRID=1 a one-switch gate.
+  if (const char* e = std::getenv("PJRT_OCL_MM_HYBRID"); e && e[0] && e[0] != '0')
+    rt->host_dispatch_ = true;
 
   // Execution tracing (PJRT_OCL_VM_TRACE=<path>): per-entry event profiling
   // only exists on the host-dispatch engine (the megakernel's entries are not
@@ -601,6 +612,7 @@ OclRuntime::~OclRuntime() {
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
   if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
   if (mm_kernel_) clReleaseKernel(mm_kernel_);
+  if (mm_tc_kernel_) clReleaseKernel(mm_tc_kernel_);
   if (gemv_kernel_) clReleaseKernel(gemv_kernel_);
   if (mm_pack_kernel_) clReleaseKernel(mm_pack_kernel_);
   if (mm_packed_kernel_) clReleaseKernel(mm_packed_kernel_);
@@ -799,6 +811,7 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
       en.signal_flag = elem_off(en.signal_flag);
   lp->tasks_buf_ = make_buf(tasks.data(), tasks.size() * sizeof(VmTask), "tasks");
   if (!lp->tasks_buf_) return nullptr;
+  lp->tasks_patched_ = tasks;  // §36 hybrid: patched dst/a/b handles for mm_tc
   lp->entries_buf_ =
       make_buf(entries.data(), entries.size() * sizeof(VmEntry), "entries");
   if (!lp->entries_buf_) return nullptr;
@@ -977,11 +990,21 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
 // CPU mm2 (VMO_CPU_TILES body) = one single-WI workgroup per 4-row block.
 bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
   const bool is_gemv = mm_N_ == 1;
-  cl_kernel k = is_gemv ? rt_->gemv_kernel() : rt_->mm_kernel();
+  // §36: on GPU/TF32 prefer the standalone WMMA SGEMM (mm_tc, ~47/57 TF/s) over
+  // the scalar mm2 SGEMM (~21/24 TF/s). Same (M,N,K,dst,a,b) ABI; grid-strided.
+  const bool use_tc = !is_gemv && rt_->is_gpu() && rt_->mm_tc_kernel();
+  cl_kernel k = is_gemv ? rt_->gemv_kernel()
+                        : (use_tc ? rt_->mm_tc_kernel() : rt_->mm_kernel());
   size_t gsz, lsz;
   if (is_gemv) {
     lsz = 256;
     gsz = (mm_M_ + lsz - 1) / lsz * lsz;
+  } else if (use_tc) {
+    constexpr uint32_t kTM = 128, kTN = 128;   // must match MMTC_TM/MMTC_TN
+    const size_t tiles_m = (mm_M_ + kTM - 1) / kTM;
+    const size_t tiles_n = (mm_N_ + kTN - 1) / kTN;
+    lsz = 256;
+    gsz = tiles_m * tiles_n * lsz;             // one 256-thread WG per 128x128 tile
   } else if (!rt_->is_gpu() && mm_bp_) {
     // Packed path: pack B panels, then KC sweeps of the 6x16 kernel, all
     // enqueued back-to-back on the in-order queue (caller drains).
@@ -1270,6 +1293,65 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     return true;
   };
 
+  // §36 HYBRID (PJRT_OCL_MM_HYBRID=1): route a phase that is exactly one big
+  // TF32 matmul's tiles to the standalone WMMA kernel (mm_tc, ~47/57 TF/s) while
+  // the VM keeps every other phase. The pending staged phases are flushed
+  // (enqueued, NOT drained) first so the in-order queue serializes mm_tc after
+  // them and the following phases after mm_tc — no clFinish, launch cost is just
+  // the enqueue. Only when mm_tc built (NV_PTX / GPU). Returns task idx or -1.
+  static const bool mm_hybrid = [] {
+    const char* e = std::getenv("PJRT_OCL_MM_HYBRID");
+    return e && e[0] && e[0] != '0';
+  }();
+  const bool hybrid_ok = mm_hybrid && rt_->is_gpu() && rt_->mm_tc_kernel();
+  // Collect the phase's distinct big-TF32-matmul task ids into `mm_tasks`, but
+  // ONLY when EVERY task in the phase is such a matmul. The scheduler packs the
+  // independent projection matmuls (Q/K/V/out) into one barrier phase, so a
+  // routable phase carries several matmul tasks; a phase mixing a matmul with
+  // any non-matmul op stays on the VM (return false). Threshold keeps small
+  // matmuls (attention per-head, base dims) on the VM where they're faster.
+  std::vector<uint32_t> mm_tasks;
+  auto routable_phase = [&]() -> bool {
+    mm_tasks.clear();
+    for (uint32_t L = 0; L < n; ++L)
+      for (uint32_t e = seg[2 * L]; e < seg[2 * L] + seg[2 * L + 1]; ++e) {
+        if (p.entries[e].task == kEntNop) continue;
+        const uint32_t t = p.entries[e].task;
+        const VmTask& tk = p.tasks[t];
+        const bool ok = (tk.tile_op & 0xFFu) == kTopMma &&
+                        ((tk.tile_op >> 8) & 0xFFu) == kDtF32 && tk.p3 <= 1 &&
+                        tk.p4 == 0 && tk.p5 == 0 && tk.p6 == 0 && tk.p0 >= 512 &&
+                        tk.p1 >= 512 && tk.p2 >= 256;
+        if (!ok) { mm_tasks.clear(); return false; }  // any non-matmul -> VM
+        if (std::find(mm_tasks.begin(), mm_tasks.end(), t) == mm_tasks.end())
+          mm_tasks.push_back(t);
+      }
+    return !mm_tasks.empty();
+  };
+  auto enqueue_mm_tc = [&](const VmTask& tk) -> bool {
+    cl_kernel km = rt_->mm_tc_kernel();
+    clSetKernelArg(km, 0, sizeof(arena_), &arena_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(km, 1 + pt, sizeof(cl_mem), &b);
+    }
+    const uint32_t M = tk.p0, N = tk.p1, Kd = tk.p2;
+    clSetKernelArg(km, 9, sizeof(uint32_t), &M);
+    clSetKernelArg(km, 10, sizeof(uint32_t), &N);
+    clSetKernelArg(km, 11, sizeof(uint32_t), &Kd);
+    clSetKernelArg(km, 12, sizeof(uint32_t), &tk.dst);
+    clSetKernelArg(km, 13, sizeof(uint32_t), &tk.a);
+    clSetKernelArg(km, 14, sizeof(uint32_t), &tk.b);
+    const size_t tiles_m = (M + 127) / 128, tiles_n = (N + 127) / 128;
+    size_t lsz = 256, gsz = tiles_m * tiles_n * lsz;
+    if (clEnqueueNDRangeKernel(q, km, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                               nullptr) != CL_SUCCESS) {
+      *err = "host-dispatch: mm_tc (hybrid) launch failed";
+      return false;
+    }
+    return true;
+  };
+
   for (long guard = 0;; ++guard) {
     if (guard > 100000000L) {
       *err = "host-dispatch: runaway control loop";
@@ -1286,7 +1368,19 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       }
       if (seg[2 * L + 1] > 0) any = true;
     }
-    if (any) {
+    const bool route = any && hybrid_ok && !tracing && routable_phase();
+    if (route && std::getenv("PJRT_OCL_MM_HYBRID_DBG"))
+      for (uint32_t t : mm_tasks)
+        std::fprintf(stderr, "[hybrid] ph%u -> mm_tc %ux%ux%u\n", phase_i,
+                     p.tasks[t].p0, p.tasks[t].p1, p.tasks[t].p2);
+    if (route) {
+      // Flush pending VM phases (enqueue only, no drain), then run each of this
+      // phase's matmuls on the dedicated mm_tc kernel — the in-order queue keeps
+      // them after the flushed phases and before the next phase; no clFinish.
+      if (!flush_group(false)) { release_tevs(); return false; }
+      for (uint32_t t : mm_tasks)
+        if (!enqueue_mm_tc(tasks_patched_[t])) { release_tevs(); return false; }
+    } else if (any) {
       if (ring + staged == kSegSlots && !flush_group(true)) {  // ring wrap
         release_tevs();
         return false;

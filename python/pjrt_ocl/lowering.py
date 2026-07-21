@@ -2061,6 +2061,13 @@ def _fuse_mma_epilogue(ctx: _Ctx, main_len: int) -> None:
     already single ops) and before _reuse_arena."""
     if os.environ.get("PJRT_OCL_FUSE_MMA_EPI", "1") == "0":
         return
+    # §36 hybrid: the standalone TF32 kernel (mm_tc) has no store-epilogue path,
+    # so a matmul with a fused epilogue cannot be routed to it. When the hybrid
+    # is enabled we keep the big FFN/projection matmuls epilogue-free (the GELU/
+    # residual run as their own cheap VM phases) so they route to mm_tc — the
+    # 1.4x large-config win depends on it. One switch: MM_HYBRID implies this.
+    if os.environ.get("PJRT_OCL_MM_HYBRID", "0") not in ("", "0"):
+        return
     instrs = ctx.instrs
 
     def _elems(buf: int) -> int:

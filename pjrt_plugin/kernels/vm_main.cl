@@ -522,3 +522,132 @@ __kernel void gemv(__global uchar *arena, VMO_IO_PARAMS,
     for (; k < K; ++k) s = mad(ga[k], gx[k], s);
     AP(float, dsth)[r] = s;
 }
+
+#ifdef VMO_NV_PTX
+/* §36 standalone TF32 tensor-core SGEMM (poc/17-nv-mma). A dedicated kernel —
+ * NOT the megakernel — so it is free of the cross-workgroup spin-barrier's
+ * co-residency cap (§10c/§27): a 128x128 register accumulator at 2 WG/SM runs
+ * ~47/57 TF/s @2048/4096 standalone vs the in-megakernel WMMA tile's ~17-19
+ * (§35). Used by (a) the pure-matmul fast path (LaunchMatmul, GPU/TF32) and
+ * (b) the PJRT_OCL_MM_HYBRID host-dispatch split, which routes a program's big
+ * TF32 matmul phases here while the VM keeps every other phase. Synchronous
+ * double-buffered staging — cp.async is DEAD on this ICD (§35). Scalar
+ * edge-guarded staging so arbitrary M/N/K are correct (B staged coalesced-by-n).
+ * m16n16k8 fragment maps identical to vmo_mma_tile / poc/08. */
+#define MMTC_TM 128
+#define MMTC_TN 128
+#define MMTC_BK 16
+#define MMTC_LDS (MMTC_BK + 4)
+#define MMTC_WM 4              /* warp grid rows */
+#define MMTC_WN 2              /* warp grid cols; 8 warps == 256 threads */
+#define MMTC_RF  (MMTC_TM / (MMTC_WM * 16))   /* 2 */
+#define MMTC_TNW (MMTC_TN / (MMTC_WN * 16))   /* 4 */
+#define MMTC_KSUB (MMTC_BK / 8)
+
+#define MMTC_LOAD_A(f, ptr, stride)                                            \
+    asm volatile("{ .reg .u64 sp; cvta.to.shared.u64 sp, %4;\n"                \
+        "wmma.load.a.sync.aligned.m16n16k8.shared.row.tf32 {%0,%1,%2,%3}, [sp], %5; }" \
+        : "=r"((f)[0]),"=r"((f)[1]),"=r"((f)[2]),"=r"((f)[3])                  \
+        : "l"(ptr),"r"(stride))
+#define MMTC_LOAD_B(f, ptr, stride)                                            \
+    asm volatile("{ .reg .u64 sp; cvta.to.shared.u64 sp, %4;\n"                \
+        "wmma.load.b.sync.aligned.m16n16k8.shared.col.tf32 {%0,%1,%2,%3}, [sp], %5; }" \
+        : "=r"((f)[0]),"=r"((f)[1]),"=r"((f)[2]),"=r"((f)[3])                  \
+        : "l"(ptr),"r"(stride))
+#define MMTC_MMA(acc, a, b)                                                    \
+    asm volatile("wmma.mma.sync.aligned.row.col.m16n16k8.f32.tf32.tf32.f32\n"  \
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9,%10,%11}, {%12,%13,%14,%15},\n"     \
+        "{%0,%1,%2,%3,%4,%5,%6,%7};"                                           \
+        : "+f"((acc)[0]),"+f"((acc)[1]),"+f"((acc)[2]),"+f"((acc)[3]),         \
+          "+f"((acc)[4]),"+f"((acc)[5]),"+f"((acc)[6]),"+f"((acc)[7])          \
+        : "r"((a)[0]),"r"((a)[1]),"r"((a)[2]),"r"((a)[3]),                     \
+          "r"((b)[0]),"r"((b)[1]),"r"((b)[2]),"r"((b)[3]))
+
+__attribute__((reqd_work_group_size(256, 1, 1)))
+__kernel void mm_tc(__global uchar *arena, VMO_IO_PARAMS,
+                    const uint M, const uint N, const uint K,
+                    const uint dsth, const uint ah, const uint bh)
+{
+    VMO_IO_ARRAY;
+    __local float As[2 * MMTC_TM * MMTC_LDS];
+    __local float Bs[2 * MMTC_TN * MMTC_LDS];
+    __global const float *A = AP(const float, ah);
+    __global const float *B = AP(const float, bh);
+    __global float *C = AP(float, dsth);
+
+    const uint tiles_n = (N + MMTC_TN - 1) / MMTC_TN;
+    const uint tiles_m = (M + MMTC_TM - 1) / MMTC_TM;
+    const uint total = tiles_m * tiles_n;
+    const uint lid = get_local_id(0);
+    const uint warp = lid >> 5, lane = lid & 31;
+    const uint wm = warp % MMTC_WM, wn = warp / MMTC_WM;
+    const uint nlanes = get_num_groups(0);
+
+    for (uint tile = get_group_id(0); tile < total; tile += nlanes) {
+        const uint tr = tile / tiles_n, tc = tile % tiles_n;
+        const uint row0 = tr * MMTC_TM, col0 = tc * MMTC_TN;
+        float acc[MMTC_RF][MMTC_TNW][8];
+        for (int i = 0; i < MMTC_RF; i++)
+            for (int j = 0; j < MMTC_TNW; j++)
+                for (int e = 0; e < 8; e++) acc[i][j][e] = 0.0f;
+
+#define MMTC_STAGE(BUF, K0)                                                    \
+        do {                                                                  \
+            __local float *As_ = As + (size_t)(BUF) * MMTC_TM * MMTC_LDS;     \
+            __local float *Bs_ = Bs + (size_t)(BUF) * MMTC_TN * MMTC_LDS;     \
+            for (uint idx = lid; idx < MMTC_TM * MMTC_BK; idx += 256) {       \
+                const uint m = idx / MMTC_BK, kk = idx % MMTC_BK;             \
+                const uint gr = row0 + m, gk = (K0) + kk;                     \
+                As_[m * MMTC_LDS + kk] =                                       \
+                    (gr < M && gk < K) ? A[(size_t)gr * K + gk] : 0.f;        \
+            }                                                                 \
+            for (uint idx = lid; idx < MMTC_TN * MMTC_BK; idx += 256) {       \
+                const uint n = idx / MMTC_BK, kk = idx % MMTC_BK;            \
+                const uint gk = (K0) + kk, gc = col0 + n;                     \
+                Bs_[n * MMTC_LDS + kk] =                                       \
+                    (gk < K && gc < N) ? B[(size_t)gk * N + gc] : 0.f;        \
+            }                                                                 \
+        } while (0)
+
+#define MMTC_COMPUTE(BUF)                                                      \
+        do {                                                                  \
+            __local float *As_ = As + (size_t)(BUF) * MMTC_TM * MMTC_LDS;     \
+            __local float *Bs_ = Bs + (size_t)(BUF) * MMTC_TN * MMTC_LDS;     \
+            for (uint ks = 0; ks < MMTC_KSUB; ks++) {                         \
+                uint af[MMTC_RF][4], bf[MMTC_TNW][4];                          \
+                for (int i = 0; i < MMTC_RF; i++)                              \
+                    MMTC_LOAD_A(af[i], &As_[(wm*MMTC_RF*16 + i*16)*MMTC_LDS + ks*8], MMTC_LDS); \
+                for (int j = 0; j < MMTC_TNW; j++)                            \
+                    MMTC_LOAD_B(bf[j], &Bs_[(wn*MMTC_TNW*16 + j*16)*MMTC_LDS + ks*8], MMTC_LDS); \
+                for (int i = 0; i < MMTC_RF; i++)                              \
+                    for (int j = 0; j < MMTC_TNW; j++)                        \
+                        MMTC_MMA(acc[i][j], af[i], bf[j]);                     \
+            }                                                                 \
+        } while (0)
+
+        uint buf = 0;
+        MMTC_STAGE(0, 0);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint k0 = 0; k0 < K; k0 += MMTC_BK) {
+            if (k0 + MMTC_BK < K) MMTC_STAGE(buf ^ 1u, k0 + MMTC_BK);
+            MMTC_COMPUTE(buf);
+            barrier(CLK_LOCAL_MEM_FENCE);
+            buf ^= 1u;
+        }
+#undef MMTC_STAGE
+#undef MMTC_COMPUTE
+
+        for (int i = 0; i < MMTC_RF; i++)
+        for (int j = 0; j < MMTC_TNW; j++) {
+            const uint gr0 = row0 + wm*MMTC_RF*16 + i*16;
+            const uint gc0 = col0 + wn*MMTC_TNW*16 + j*16;
+            for (int reg = 0; reg < 8; reg++) {
+                const uint r = (lane >> 2) + 8u * ((reg >> 1) & 1);
+                const uint c = (lane & 3) * 2 + (reg & 1) + 8u * (reg >> 2);
+                const uint gr = gr0 + r, gc = gc0 + c;
+                if (gr < M && gc < N) C[(size_t)gr * N + gc] = acc[i][j][reg];
+            }
+        }
+    }
+}
+#endif  /* VMO_NV_PTX */

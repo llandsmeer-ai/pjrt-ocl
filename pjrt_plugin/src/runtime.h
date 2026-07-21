@@ -137,6 +137,9 @@ class OclRuntime {
   cl_kernel vm_seg_kernel() const { return vm_seg_kernel_; }
   cl_kernel vm_one_kernel() const { return vm_one_kernel_; }
   cl_kernel mm_kernel() const { return mm_kernel_; }
+  // §36 standalone TF32 tensor-core SGEMM (poc/17); null unless the NVIDIA
+  // VMO_NV_PTX program built. Preferred over mm_kernel_ (SGEMM) on GPU/TF32.
+  cl_kernel mm_tc_kernel() const { return mm_tc_kernel_; }
   cl_kernel gemv_kernel() const { return gemv_kernel_; }
   // CPU-only (VMO_CPU_TILES builds; null on GPU): packed+blocked SGEMM.
   cl_kernel mm_pack_kernel() const { return mm_pack_kernel_; }
@@ -225,6 +228,7 @@ class OclRuntime {
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
   cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
   cl_kernel mm_kernel_ = nullptr;      // standalone SGEMM (pure-matmul fast path)
+  cl_kernel mm_tc_kernel_ = nullptr;   // §36 standalone TF32 WMMA (NV_PTX only)
   cl_kernel gemv_kernel_ = nullptr;    // width-1 matmul (both device classes)
   cl_kernel mm_pack_kernel_ = nullptr;    // CPU only: B panel packing
   cl_kernel mm_packed_kernel_ = nullptr;  // CPU only: packed 6x16 KC-swept
@@ -284,6 +288,10 @@ class LoadedProgram {
   bool EnsureTraceQueues(std::string* err);
   OclRuntime* rt_ = nullptr;  // borrowed; client outlives executables
   VmProgram prog_;
+  // §36 hybrid: tasks with dst/a/b patched to arena byte-offsets / port handles
+  // (prog_.tasks keeps raw buffer ids). The mm_tc dispatch needs the patched
+  // handles; the persistent VM reads them from tasks_buf_ instead.
+  std::vector<VmTask> tasks_patched_;
   cl_mem arena_ = nullptr;
   cl_mem aux_buf_ = nullptr;
   cl_mem tasks_buf_ = nullptr;

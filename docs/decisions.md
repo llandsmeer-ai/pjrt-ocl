@@ -2545,3 +2545,91 @@ NVIDIA portable `MEGA_TC=0` f32-exact (max_abs 2.4e-6); PoCL portable f32-exact
 ./bench17` (standalone ceiling); `JAX_PLATFORMS=opencl PJRT_OCL_MM_KERNEL=0
 python mmbench.py 4096` (in-megakernel; add `PJRT_OCL_MEGA_BIGTILE=1
 PJRT_OCL_MEGA_PIPE=1 PJRT_OCL_MMA_T=128` for the big tile).
+
+## 36. Standalone TF32 WMMA tile pushed to the sync ceiling + hybrid dispatch — the hybrid WINS 1.45x on large (compute-bound), loses on base (2026-07-21, poc/17 + mm_tc)
+
+Follow-on to §35. Two parts: (1) "optimize the standalone tile to hell"; (2)
+route the transformer's big matmuls to it (hybrid) and measure e2e.
+
+### Part 1 — the sync-only WMMA ceiling is ~57 TF/s; every classic GEMM lever is a WASH
+`poc/17/bench17` (parametrized: TM/TN, BK, NBUF, warp grid WM×WN, VEC4 float4
+staging, PAD, PIPE fragment-pipeline), best-of-7, warmed, RTX PRO 6000 Blackwell:
+
+| config | 2048³ TF/s | 4096³ TF/s |
+|--------|-----------|-----------|
+| 128×128 W4×2 BK16 NBUF2 (§35 base, scalar uncoalesced-B) | 47.4 | 56.2 |
+| + float4 coalesced staging (VEC4) | 43.8 | 57.0 |
+| + fragment-pipeline (PIPE) | 43.9 | 57.7 |
+| 128×256 / 256×128 (512–1024 t, ≤64 acc/thr) | 36–41 | 47–54 |
+| BK32, PAD8, more warps | all ≤ base | all ≤ base |
+| cuBLAS (ref) | 116.5 | 133.3 |
+
+**Nothing beat the §35 tile by more than noise (~±3%).** The B global load WAS
+stride-N uncoalesced; fixing it (coalesced/float4) moved 4096 by 56.2→57.0 —
+noise, because the tile is **not** global/L2-BW bound. The lane sweep is decisive:
+188 lanes (1 WG/SM)=33, 376 (2 WG/SM)=56, ≥564 no gain. We are **pinned at 2
+WG/SM = 16 warps/SM** — a 128×128 f32 accumulator is 16384 regs, so 256 threads
+already spend 64 regs/thread on accumulators; the register file (65536/SM) caps
+residency at 2 blocks and there is no oversubscription to hide latency. That is
+exactly the hole cp.async multistage fills — and cp.async is DEAD here (§35). So
+**~57 TF/s @4096 / ~47 @2048 is the honest sync ceiling, ~2.3× under cuBLAS**;
+the gap is latency-hiding the register file cannot buy and PTX cannot async its
+way around on this ICD. Bigger tiles are impossible (a 256×256 f32 accumulator =
+65536 regs = the whole SM file).
+
+### Part 2 — hybrid dispatch: standalone mm_tc for the big matmul phases, VM for the rest
+Ported the §35 tile into the plugin as **`mm_tc`** (vm_main.cl, `#ifdef
+VMO_NV_PTX`, same arena/IO-port ABI as mm2). It replaces the scalar SGEMM mm2 on
+the GPU/TF32 pure-matmul fast path: **standalone matmul 20.9/24.4 → 43.5/53.0
+TF/s @2048/4096** (mmbench, 2.2×), TF32-exact incl. ragged M/N/K (max_rel 7e-4).
+
+`PJRT_OCL_MM_HYBRID=1` then interleaves mm_tc into a full program. The single
+persistent spin-barrier megakernel **cannot be split mid-flight**, and its base
+is 8ms cheaper than host-dispatch (27.7 vs 35.4 ms/large) — so the hybrid runs on
+the **host-dispatch engine** (already segments per-phase, enqueues back-to-back
+on the in-order queue with NO clFinish) and, for any phase that is EXACTLY big
+TF32 matmul tasks, flushes the pending VM phases then enqueues mm_tc per matmul
+(patched dst/a/b handles — the raw prog_.tasks carry buffer ids; arena+id is
+misaligned → context loss, the -36 trap). The scheduler packs the independent
+Q/K/V projections into one phase, so a routable phase carries several matmuls.
+
+**The FFN/out matmuls are epilogue-fused (§33 R2c, p6≠0) and mm_tc has no
+epilogue path** — so MM_HYBRID also disables `_fuse_mma_epilogue` in lowering
+(one switch), leaving the big FFN matmuls plain-routable and running GELU/residual
+as their own cheap VM phases. That is what unlocks the win:
+
+| large (6-layer, B8 T256 D1024 F4096) | ms/iter | vs default |
+|--------------------------------------|---------|-----------|
+| spin-barrier default (§35 baseline) | 27.7 | 1.00× |
+| host-dispatch base (engine cost) | 35.4 | 0.78× |
+| host-dispatch + noEpi base | 40.1 | — |
+| **HYBRID (host + mm_tc, routes 30 matmuls/iter)** | **19.1** | **1.45×** |
+| CUDA (ref) | 3.69 | — |
+
+`large` is ~92% big-matmul FLOP; routing them to ~45 TF/s (from ~17 in-VM) saves
+~21 ms, and even after eating the host-dispatch engine's +8/+12 ms overhead the
+net is **27.7 → 19.1 ms, gap to CUDA 7.5× → 5.2×.** `large_l1` 4.53→3.42 (1.32×).
+Correct on all (max_abs 1.2e-2, TF32 tol). **base REGRESSES 5.4→7.3 ms**: its
+matmuls are M=512 (16–64 tiles, mm_tc starves the SMs) and it is overhead-bound,
+so the host-dispatch tax is unrecovered — the §29/§14b small-op wall, unmoved.
+
+### DECISION (§14a): keep, OFF by default, opt-in for compute-bound large configs
+- **mm_tc pure-matmul fast path (mm2→mm_tc on GPU/TF32): kept ON** — strictly
+  better (2.2×), TF32-exact, NVIDIA-only (portable mm2 untouched).
+- **Hybrid: opt-in `PJRT_OCL_MM_HYBRID=1`** — a clean 1.3–1.45× on compute-bound
+  large transformers, a loss on small/overhead-bound ones. Correct either way.
+  It rides the host-dispatch engine (the megakernel can't be segmented without
+  core-VM pc-range surgery); a spin-barrier-segmented hybrid would start from the
+  27.7 ms base instead of 35.4 and land ~16 ms — the biggest remaining lever, and
+  the reason this is not yet default.
+
+**Gates:** default pytest **301 / 1 skip**; NVIDIA TF32 `--check`
+tiny/small/base/large **PASS** (max_abs 4e-4…1.3e-2); NVIDIA `MEGA_TC=0`
+f32-exact (2.4e-6); PoCL f32-exact (7e-7); default large unchanged (27.8 ms).
+Hybrid `--check` large **PASS** (1.2e-2). **NOT merged — reported for review.**
+
+**Reproduce:** `cd poc/17-nv-mma && make && ./bench17` (Part 1 sweep);
+`JAX_PLATFORMS=opencl PJRT_OCL_DEVICE=NVIDIA PJRT_OCL_MM_KERNEL=1 python
+mmbench.py 4096` (mm_tc fast path); `PJRT_OCL_MM_HYBRID=1 python
+tools/bench_transformer.py --config large` (hybrid e2e; `--check` for
+correctness; `PJRT_OCL_MM_HYBRID_DBG=1 --iters 1` to log routed matmuls).
