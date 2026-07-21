@@ -83,3 +83,19 @@ split** (route big matmul phases to a dedicated 128×128 TF32 kernel — this Po
 55-TF/s tile — while the megakernel keeps everything else), which §10d measured
 as host-dispatch-overhead-bound and deferred as a large architectural change.
 Full detail: docs/decisions.md §35.
+
+## §36 update — sync ceiling swept, hybrid BUILT and it wins on large
+
+`bench17` is now parametrized (TM/TN, BK, NBUF, warp grid WM×WN, VEC4 float4
+staging, PAD, PIPE fragment-pipeline). Full sweep verdict: **every classic GEMM
+lever is a wash within ±3%** — the tile is register-file-capped at 2 WG/SM (lane
+sweep: 188→33, 376→57, ≥564 flat), not BW-bound, so ~57 TF/s @4096 / ~47 @2048
+is the honest sync ceiling (~2.3× under cuBLAS; only cp.async — dead — could buy
+the missing latency hiding).
+
+The hybrid IS built (no longer deferred): the tile ships in the plugin as
+`mm_tc` (pjrt_plugin/kernels/vm_main.cl), replacing scalar mm2 on the GPU/TF32
+pure-matmul fast path (24→53 TF/s), and `PJRT_OCL_MM_HYBRID=1` routes a full
+program's big TF32 matmul phases to it on the host-dispatch engine. **large
+transformer 27.7→19.1 ms (1.45×), gap to CUDA 7.5×→5.2×**; base regresses
+(overhead-bound, M=512 too small). Opt-in, not merged. Detail: decisions.md §36.

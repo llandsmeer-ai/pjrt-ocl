@@ -30,6 +30,11 @@ static cl_kernel build(const char*opts){
 static cl_uint g_regs(cl_kernel k){
     cl_uint r=0; clGetKernelWorkGroupInfo(k,dev,0x11B3/*NV_REGISTERS*/,sizeof r,&r,0); return r;
 }
+static size_t klocal(cl_kernel k){
+    size_t rq[3]={0,0,0};
+    clGetKernelWorkGroupInfo(k,dev,CL_KERNEL_COMPILE_WORK_GROUP_SIZE,sizeof rq,rq,0);
+    return rq[0]?rq[0]:256;
+}
 static double run_once(cl_kernel k,cl_uint M,cl_uint N,cl_uint K){
     cl_uint ao=0,bo=M*K,co=M*K+K*N;
     clSetKernelArg(k,0,sizeof arena,&arena);
@@ -37,7 +42,7 @@ static double run_once(cl_kernel k,cl_uint M,cl_uint N,cl_uint K){
     clSetKernelArg(k,3,sizeof co,&co); clSetKernelArg(k,4,sizeof M,&M);
     clSetKernelArg(k,5,sizeof N,&N);   clSetKernelArg(k,6,sizeof K,&K);
     clSetKernelArg(k,7,sizeof nlanes,&nlanes);
-    size_t g=(size_t)nlanes*256,l=256;
+    size_t l=klocal(k), g=(size_t)nlanes*l;
     struct timespec a,b; clFinish(q);
     clock_gettime(CLOCK_MONOTONIC,&a);
     chk(clEnqueueNDRangeKernel(q,k,1,0,&g,&l,0,0,0),"launch");
@@ -81,15 +86,26 @@ int main(void){
     const size_t AR=3ull*4096*4096; arena=clCreateBuffer(ctx,CL_MEM_READ_WRITE,AR*4,0,&e);chk(e,"arena");
 
     struct { const char*name,*opts; } steps[] = {
-      {"64x64  BK16 NBUF1 (== in-mega tile)", "-DTM=64  -DTN=64  -DBK=16 -DNBUF=1"},
-      {"64x64  BK16 NBUF2 (sync dbl-buf)",    "-DTM=64  -DTN=64  -DBK=16 -DNBUF=2"},
-      {"128x64 BK16 NBUF1",                   "-DTM=128 -DTN=64  -DBK=16 -DNBUF=1"},
-      {"128x64 BK16 NBUF2",                   "-DTM=128 -DTN=64  -DBK=16 -DNBUF=2"},
-      {"128x128 BK16 NBUF1",                  "-DTM=128 -DTN=128 -DBK=16 -DNBUF=1"},
-      {"128x128 BK16 NBUF2",                  "-DTM=128 -DTN=128 -DBK=16 -DNBUF=2"},
-      {"128x128 BK32 NBUF2",                  "-DTM=128 -DTN=128 -DBK=32 -DNBUF=2"},
-      {"256x128 BK16 NBUF1",                  "-DTM=256 -DTN=128 -DBK=16 -DNBUF=1"},
-      {"256x128 BK16 NBUF2",                  "-DTM=256 -DTN=128 -DBK=16 -DNBUF=2"},
+      /* baseline: old default shape, scalar UNCOALESCED-B staging (== §35 55TF) */
+      {"128x128 W4x2 BK16 NBUF2 (old base)",  "-DTM=128 -DTN=128 -DBK=16 -DNBUF=2 -DWM=4 -DWN=2 -DVEC4=0"},
+      /* float4 coalesced staging */
+      {"128x128 W4x2 BK16 NBUF2 VEC4",        "-DTM=128 -DTN=128 -DBK=16 -DNBUF=2 -DWM=4 -DWN=2 -DVEC4=1"},
+      {"128x128 W4x2 BK8  NBUF2 VEC4",        "-DTM=128 -DTN=128 -DBK=8  -DNBUF=2 -DWM=4 -DWN=2 -DVEC4=1"},
+      {"128x128 W4x4 BK16 NBUF2 VEC4 (512t)", "-DTM=128 -DTN=128 -DBK=16 -DNBUF=2 -DWM=4 -DWN=4 -DVEC4=1"},
+      /* rectangular: 128x256 halves A-panel L2 traffic */
+      {"128x256 W4x4 BK16 NBUF2 VEC4 (512t)", "-DTM=128 -DTN=256 -DBK=16 -DNBUF=2 -DWM=4 -DWN=4 -DVEC4=1"},
+      {"128x256 W4x8 BK16 NBUF2 VEC4 (1024t)","-DTM=128 -DTN=256 -DBK=16 -DNBUF=2 -DWM=4 -DWN=8 -DVEC4=1"},
+      {"256x128 W4x4 BK16 NBUF2 VEC4 (512t)", "-DTM=256 -DTN=128 -DBK=16 -DNBUF=2 -DWM=4 -DWN=4 -DVEC4=1"},
+      {"256x128 W8x4 BK16 NBUF2 VEC4 (1024t)","-DTM=256 -DTN=128 -DBK=16 -DNBUF=2 -DWM=8 -DWN=4 -DVEC4=1"},
+      /* wider K-block with vectorized staging (BK32 was smem-heavy before) */
+      {"128x128 W4x2 BK32 NBUF2 VEC4",        "-DTM=128 -DTN=128 -DBK=32 -DNBUF=2 -DWM=4 -DWN=2 -DVEC4=1"},
+      /* PAD sweep (smem bank-conflict): pad=8 vs 4 */
+      {"128x128 W4x2 BK16 NBUF2 VEC4 PAD8",   "-DTM=128 -DTN=128 -DBK=16 -DNBUF=2 -DWM=4 -DWN=2 -DVEC4=1 -DPAD=8"},
+      /* fragment-level software pipeline (hide smem-load latency) */
+      {"128x128 W4x2 BK16 NBUF2 VEC4 PIPE",   "-DTM=128 -DTN=128 -DBK=16 -DNBUF=2 -DWM=4 -DWN=2 -DVEC4=1 -DPIPE=1"},
+      {"128x128 W4x2 BK32 NBUF2 VEC4 PIPE",   "-DTM=128 -DTN=128 -DBK=32 -DNBUF=2 -DWM=4 -DWN=2 -DVEC4=1 -DPIPE=1"},
+      {"128x128 W4x2 BK32 NBUF1 VEC4 PIPE",   "-DTM=128 -DTN=128 -DBK=32 -DNBUF=1 -DWM=4 -DWN=2 -DVEC4=1 -DPIPE=1"},
+      {"128x256 W4x8 BK16 NBUF2 VEC4 PIPE",   "-DTM=128 -DTN=256 -DBK=16 -DNBUF=2 -DWM=4 -DWN=8 -DVEC4=1 -DPIPE=1"},
     };
     int ns=sizeof steps/sizeof steps[0];
     const char*only=getenv("ONLY");
