@@ -2692,3 +2692,42 @@ brax) and **threefry shift ops** (unlocks the entire RNG class from one small op
 **Reproduce:** `. ./env.sh && .venv/bin/python tools/bench_suite/run_suite.py --md
 docs/workload-coverage.md` (add `--only <names>` for a subset). Verified: full 18-workload run
 reproduces 11 PASS / 7 FAIL with stable gaps across two runs.
+
+## 38. Partial-axis reduce over a contiguous interior/prefix axis block (OP_REDUCE_STRIDED) — batchnorm + nbody unlocked (2026-07-21)
+
+The #1 coverage gap from the §37 survey: `stablehlo.reduce` over a non-suffix axis
+(2 of 7 fails — batchnorm reduces axis 0, nbody reduces axis 1 of a (Np,Np,3)).
+Prior coverage was FULL reduce (two-phase REDUCE_PART/COMB → scalar) and
+INNERMOST-SUFFIX reduce (OP_REDUCE_SEG, contiguous segments, whole-WG local tree).
+Anything else raised LoweringError ("needs a transpose first").
+
+**What was tried / chosen.** View the row-major input as `(outer, red, inner)` for a
+CONTIGUOUS reduced-axis block `dims == [k, k+m)`:
+`outer = prod(shape[:k])`, `red = prod(shape[k:k+m])`, `inner = prod(shape[k+m:])`,
+`out[o*inner + i] = reduce_r in[(o*red + r)*inner + i]`. The suffix case (`inner==1`)
+still routes to OP_REDUCE_SEG; the new `inner>1` (interior/prefix) case lowers to one
+new op **OP_REDUCE_STRIDED** (tile op TILE_RED_STRIDED=15, kernel `vmo_redstrided_tile`).
+Encoding: `n=n_out (outer*inner)`, `imm=(kind<<28)|red`, `imm2=inner`.
+
+**Kernel design — thread-per-output, EW-style tiling, NO workgroup barriers.**
+Each tile owns `EW_TS` output elements; work-items grid-stride within and each fully
+reduces one output serially over `red` strided reads (stride `inner`). Deliberately
+barrier-free — sidesteps the whole PoCL-5.0 parallel-region-formation trap class
+(§18) that the collaborative RED_SEG/softmax/layernorm tiles have to tiptoe around.
+Output counts here are small (batchnorm n_out=256, nbody n_out=192) so thread-per-
+output is not starved; a collaborative-WG variant is only worth it if a workload
+shows up with tiny n_out and huge `red` (none in the suite).
+
+**Still rejected (deferred):** NON-contiguous axis sets (e.g. `{0,2}` of a rank-3)
+would need a permuting transpose first. Gated cleanly with a LoweringError.
+
+**Verified.** Dual validators (tensor interp + schedule sim) vs jax on prefix/interior/
+block reductions across sum/max/min (`tests/test_ops_reduce.py`, +new strided cases;
+58 pass). e2e on NVIDIA and PoCL, TF32 and MEGA_TC=0 f32-exact: batchnorm/nbody both
+allclose(2e-2) vs numpy (max rel 2.3e-7 / 5.5e-6). Full pytest 319 passed / 1 skipped
+(no regression). `bench_suite`: batchnorm PASS 0.132ms vs cuda 0.050 (2.62×),
+nbody PASS 0.121ms vs cuda 0.044 (2.75×) — both land in the reduce-bound "close to
+CUDA" band, not the matmul-heavy 7–20× band. Coverage 11/18 → 13/18.
+
+**Reproduce:** `. ./env.sh && PYTHONPATH=$PWD/python .venv/bin/python
+tools/bench_suite/run_suite.py --only batchnorm nbody`.

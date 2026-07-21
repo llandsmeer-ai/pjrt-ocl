@@ -350,6 +350,50 @@ static void vmo_layernorm_seg(__global uchar *arena, __global uchar **iop, const
             dst[base + j] = (As[j] - mu) * rs;
 }
 
+/* TOP_RED_STRIDED: partial-axis reduce over a contiguous interior/prefix axis
+ * block. Input viewed (outer, red, inner); out[o*inner+i] = reduce_r
+ * in[(o*red+r)*inner+i]. p0=n_out (outer*inner), p1=red, p2=inner (stride),
+ * p3=kind. THREAD-PER-OUTPUT, EW-style: this tile covers outputs
+ * [tile*EW_TS, min((tile+1)*EW_TS, n_out)), work-items grid-stride within it and
+ * each fully reduces one output serially over `red` strided elements. No
+ * workgroup barriers (dodges the PoCL 5.0 region-formation traps entirely). */
+static void vmo_redstrided_tile(__global uchar *arena, __global uchar **iop, const task_t t,
+                            uint tile, uint dt, uint lid, uint lsz)
+{
+    const uint n_out = t.p0, red = t.p1, inner = t.p2, kind = t.p3;
+    const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n_out);
+    if (dt == DT_I32 || dt == DT_U32) {
+        __global const int *a = AP(const int, t.a);
+        __global int *d = AP(int, t.dst);
+        for (uint g = lo + lid; g < hi; g += lsz) {
+            const uint o = g / inner, i = g % inner;
+            const uint base = o * red * inner + i;
+            int acc = kind == 0 ? 0 : kind == 1 ? INT_MIN : kind == 2 ? INT_MAX : 1;
+            for (uint r = 0; r < red; ++r) {
+                const int v = a[base + r * inner];
+                acc = kind == 0 ? acc + v : kind == 1 ? max(acc, v)
+                    : kind == 2 ? min(acc, v) : acc * v;
+            }
+            d[g] = acc;
+        }
+    } else {
+        __global const float *a = AP(const float, t.a);
+        __global float *d = AP(float, t.dst);
+        for (uint g = lo + lid; g < hi; g += lsz) {
+            const uint o = g / inner, i = g % inner;
+            const uint base = o * red * inner + i;
+            float acc = kind == 0 ? 0.0f : kind == 1 ? -INFINITY
+                      : kind == 2 ? INFINITY : 1.0f;
+            for (uint r = 0; r < red; ++r) {
+                const float v = a[base + r * inner];
+                acc = kind == 0 ? acc + v : kind == 1 ? fmax(acc, v)
+                    : kind == 2 ? fmin(acc, v) : acc * v;
+            }
+            d[g] = acc;
+        }
+    }
+}
+
 static void vmo_reduce_comb_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint dt,
                              uint lid)
 {

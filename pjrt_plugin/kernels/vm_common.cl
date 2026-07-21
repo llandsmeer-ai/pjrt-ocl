@@ -91,7 +91,13 @@ enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
         * materialized score matrix. a=Q b=K p0=V dst=out; p1=H p2=T; p3=aux
         * descriptor [H,T,C,hd,scale,causal,qv,kv,vv]. Kernel: vmo_flash_attn
         * (ops/attention.cl); recognizer: lowering _fuse_attention. */
-       TOP_FLASH_ATTN = 14 };
+       TOP_FLASH_ATTN = 14,
+       /* Partial-axis reduce over a contiguous interior/prefix axis block.
+        * Input viewed (outer, red, inner); out[o*inner+i] = reduce_r
+        * in[(o*red+r)*inner+i]. p0=n_out (outer*inner), p1=red, p2=inner (stride),
+        * p3=kind. EW-style output tiling (EW_TS outputs per tile, grid-stride,
+        * no workgroup barriers). Kernel: vmo_redstrided_tile. */
+       TOP_RED_STRIDED = 15 };
 enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,
        SUB_ABS, SUB_FLOOR, SUB_CEIL, SUB_SIGN, SUB_FILL, SUB_IOTA_FLAT,

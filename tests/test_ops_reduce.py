@@ -109,7 +109,7 @@ def test_max_large_multichunk():
     check(lambda x: jnp.max(x), arr(60000, hi=1000))
 
 
-# --- rejection: partial-axis reductions are out of coverage -----------------
+# --- rejection: only NON-CONTIGUOUS axis sets remain out of coverage --------
 
 def _lower(f, *args):
     from oputil import to_artifact
@@ -117,14 +117,39 @@ def _lower(f, *args):
 
 
 @pytest.mark.parametrize("f", [
-    lambda x: jnp.sum(x, axis=0),       # non-suffix (outer axis): needs transpose
-    lambda x: jnp.max(x, axis=0),
-    lambda x: jnp.sum(x, axis=1),       # middle axis of rank-3, not a suffix
+    lambda x: jnp.sum(x, axis=(0, 2)),  # non-contiguous {0,2}: needs transpose
+    lambda x: jnp.max(x, axis=(0, 2)),
 ])
-def test_partial_axis_rejected(f):
-    # non-suffix axis sets still need a permuting transpose first (not yet done)
+def test_noncontiguous_axis_rejected(f):
+    # a non-contiguous axis set still needs a permuting transpose first
     with pytest.raises(LoweringError):
         _lower(f, arr(3, 4, 5))
+
+
+# --- partial-axis (prefix / interior) reduce via OP_REDUCE_STRIDED ----------
+
+@pytest.mark.parametrize("shape,axis", [
+    ((3, 4), 0),                         # prefix axis of rank-2 (batchnorm idiom)
+    ((5, 6), 0),
+    ((2, 3, 4), 0),                      # prefix axis of rank-3
+    ((2, 3, 4), 1),                      # interior axis of rank-3 (nbody idiom)
+    ((2, 3, 4), (0, 1)),                 # contiguous prefix block, inner=4
+    ((4, 5, 2), 1),
+])
+@pytest.mark.parametrize("red", ["sum", "max", "min"])
+def test_partial_axis_strided_matches_numpy(shape, axis, red):
+    """Interior / prefix partial-axis reductions now lower to the strided
+    partial-axis reduce tile op; both validators must match jax."""
+    fn = {"sum": jnp.sum, "max": jnp.max, "min": jnp.min}[red]
+    prog = check(lambda x: fn(x, axis=axis), arr(*shape))
+    # confirm it actually used the strided tile op (not seg / two-phase)
+    assert any(t.tile_op == scheduler.TILE_RED_STRIDED
+               for t in prog.schedule.tasks)
+
+
+def test_batchnorm_mean_axis0():
+    # batchnorm's reduce: mean over the BATCH axis (axis 0), keepdims
+    check(lambda x: jnp.mean(x, axis=0, keepdims=True), arr(8, 16, hi=4))
 
 
 @pytest.mark.parametrize("shape,axis", [

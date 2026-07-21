@@ -46,7 +46,8 @@ import math
 from .. import lowering as L
 from .. import opsem
 from ..scheduler import (Task, TILE_REDUCE_PART, TILE_REDUCE_COMB, TILE_RED_SEG,
-                         TILE_SOFTMAX_SEG, TILE_LAYERNORM_SEG, TILE_SIZE)
+                         TILE_RED_STRIDED, TILE_SOFTMAX_SEG, TILE_LAYERNORM_SEG,
+                         TILE_SIZE)
 
 # reduction kinds (docs/vmprogram.md v2.1 REDUCE table)
 SUM, MAX, MIN, PROD = 0, 1, 2, 3
@@ -158,24 +159,41 @@ def _reduce(ctx, op):
 
     in_buf = ctx.buf_for(op.operands[0])
 
-    # Partial reduction over a CONTIGUOUS INNERMOST suffix of axes (softmax /
-    # layernorm reduce the last axis): output element o = reduce of the seg
-    # contiguous inputs at [o*seg, (o+1)*seg). One TILE_RED_SEG task, tiled over
-    # the n_out outputs. Non-suffix axis sets still need a permuting transpose
-    # first (deferred).
+    # Partial reduction over a CONTIGUOUS axis block [k, k+m). Viewing the
+    # row-major input as (outer, red, inner):
+    #   outer = prod(shape[:k]), red = prod(shape[k:k+m]), inner = prod(shape[k+m:])
+    #   out[o*inner + i] = reduce_r in[(o*red + r)*inner + i]
+    # Two sub-cases:
+    #   inner == 1  (block is the innermost suffix) -> TILE_RED_SEG (softmax /
+    #               layernorm idiom, contiguous segments, whole-WG local tree).
+    #   inner  > 1  (interior or prefix block: batchnorm axis-0, nbody axis-1)
+    #               -> OP_REDUCE_STRIDED, a strided partial-axis reduce.
+    # A NON-contiguous axis set (e.g. {0,2} of a rank-3) would need a permuting
+    # transpose first — still rejected (deferred).
     if dims != list(range(in_rank)):
-        if dims != list(range(in_rank - len(dims), in_rank)):
+        k = dims[0]
+        m = len(dims)
+        if dims != list(range(k, k + m)):
             raise L.LoweringError(
-                f"reduce: only full or innermost-suffix reductions are "
+                f"reduce: only full or contiguous-axis-block reductions are "
                 f"supported; got dimensions={dims} of rank-{in_rank} (a "
-                "non-suffix axis set needs a transpose first — not yet done).")
-        seg = 1
+                "non-contiguous axis set needs a transpose first — not yet done).")
+        red = 1
         for d in dims:
-            seg *= in_shape[d]
-        n_out = n_in // seg
+            red *= in_shape[d]
+        inner = 1
+        for ax in range(k + m, in_rank):
+            inner *= in_shape[ax]
+        n_out = n_in // red
         out = ctx.new_buffer(n_out, in_dt)
-        ctx.emit(L.Instr(L.OP_REDUCE_SEG, dst=out, a=in_buf, b=in_buf,
-                         n=n_out, imm=(kind << 28) | seg))
+        if inner == 1:
+            # innermost suffix -> segmented reduce (seg == red)
+            ctx.emit(L.Instr(L.OP_REDUCE_SEG, dst=out, a=in_buf, b=in_buf,
+                             n=n_out, imm=(kind << 28) | red))
+        else:
+            # interior / prefix block -> strided partial-axis reduce
+            ctx.emit(L.Instr(L.OP_REDUCE_STRIDED, dst=out, a=in_buf, b=in_buf,
+                             n=n_out, imm=(kind << 28) | red, imm2=inner))
         ctx.value_to_buf[op.results[0]] = out
         return
 
@@ -318,6 +336,61 @@ def _redseg_sim(task, entry, rt):
 opsem.register(L.OP_REDUCE_SEG, to_task=_redseg_to_task, interp=_redseg_interp,
                reads=_reduce_reads)
 opsem.register_tile_sim(TILE_RED_SEG, _redseg_sim)
+
+
+# --- strided partial-axis reduce (interior / prefix axis block) --------------
+# Input viewed as (outer, red, inner). n = n_out (outer*inner), imm = (kind<<28)
+# | red, imm2 = inner. out[o*inner + i] = reduce_r in[(o*red + r)*inner + i].
+
+def _redstrided_decode(imm: int) -> tuple[int, int]:
+    return imm >> 28, imm & 0x0FFFFFFF          # kind, red
+
+
+def _redstrided_to_task(ins) -> Task:
+    kind, red = _redstrided_decode(ins.imm)
+    inner = ins.imm2
+    # p0 = n_out (tiling), p1 = red (count), p2 = inner (stride), p3 = kind
+    return Task(TILE_RED_STRIDED, dst=ins.dst, a=ins.a, b=0,
+                p0=ins.n, p1=red, p2=inner, p3=kind)
+
+
+def _redstrided_interp(ins, rt) -> None:
+    kind, red = _redstrided_decode(ins.imm)
+    inner = ins.imm2
+    n_out = ins.n
+    outer = n_out // inner
+    src = rt.view(ins.a, outer * red * inner).reshape(outer, red, inner)
+    rt.view(ins.dst, n_out)[:] = _reduce_np_axis1(src, kind).reshape(-1)
+
+
+def _reduce_np_axis1(arr, kind):
+    if kind == SUM:
+        return arr.sum(1)
+    if kind == MAX:
+        return arr.max(1)
+    if kind == MIN:
+        return arr.min(1)
+    return arr.prod(1)
+
+
+def _redstrided_sim(task, entry, rt):
+    n_out, red, inner, kind = task.p0, task.p1, task.p2, task.p3
+    src = rt.view(task.a)
+    out = rt.view(task.dst)
+    ts = rt.tile_size
+    tile_lo = entry.tile_lo * ts
+    tile_hi = min(entry.tile_hi * ts, n_out)
+    for g in range(tile_lo, tile_hi):
+        o = g // inner
+        i = g % inner
+        base = o * red * inner + i
+        vals = src[base:base + red * inner:inner]
+        out[g] = _reduce_np(vals, kind)
+
+
+opsem.register(L.OP_REDUCE_STRIDED, to_task=_redstrided_to_task,
+               interp=_redstrided_interp, reads=_reduce_reads)
+opsem.register_tile_sim(TILE_RED_STRIDED, _redstrided_sim)
 
 
 # --- fused segmented norms (softmax / layernorm core), §19 -------------------

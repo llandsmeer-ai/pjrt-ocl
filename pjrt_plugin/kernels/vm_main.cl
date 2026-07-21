@@ -38,6 +38,7 @@ static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
         case TOP_DYN_SCATTER: vmo_dyn_scatter_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
         case TOP_RED_WINDOW:  vmo_redwin_tile(arena, iop, aux, t, tile, dt, lid, lsz); break;
         case TOP_RED_SEG:  vmo_redseg_tile(arena, iop, t, tile, dt, As, lid, lsz); break;
+        case TOP_RED_STRIDED: vmo_redstrided_tile(arena, iop, t, tile, dt, lid, lsz); break;
         case TOP_SOFTMAX_SEG:   vmo_softmax_seg(arena, iop, t, tile, As, Bs, lid, lsz); break;
         case TOP_LAYERNORM_SEG: vmo_layernorm_seg(arena, iop, t, tile, As, Bs, lid, lsz); break;
         case TOP_MAP_REGION: vmo_map_region(arena, iop, aux, t, tile, lid, lsz); break;
