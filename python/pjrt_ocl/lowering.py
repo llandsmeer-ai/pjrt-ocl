@@ -549,6 +549,23 @@ def _lower_constant(ctx: _Ctx, op):
         ctx.const_scalar[op.results[0]] = float(np.asarray(arr).reshape(-1)[0])
 
 
+def _lower_sdy_identity(ctx: _Ctx, op):
+    """Shardy sharding hints are no-ops on our single OpenCL device: every
+    sdy op that carries a value through (sharding_constraint / reshard) is the
+    identity here, so alias each result to its like-typed operand. `sdy.mesh`
+    (module-level, no results) and other result-less sdy ops simply do nothing.
+    General infra: this is what makes ANY sharded JAX program lowerable — the
+    dialect is registered in deserialize_artifact, and its value-carrying ops
+    collapse to identity here (brax/MJX emit sdy.sharding_constraint)."""
+    for res, operand in zip(op.results, op.operands):
+        ctx.value_to_buf[res] = ctx.buf_for(operand)
+
+
+OP_HANDLERS["sdy.sharding_constraint"] = _lower_sdy_identity
+OP_HANDLERS["sdy.reshard"] = _lower_sdy_identity
+OP_HANDLERS["sdy.mesh"] = _lower_sdy_identity          # module-level, no results
+
+
 @_handles("func.return")
 def _lower_return(ctx: _Ctx, op):
     # v1 has no COPY opcode: results are whatever buffer produced the value.
@@ -2665,12 +2682,39 @@ def lower_module(module) -> VMProgram:
     )
 
 
+def _register_optional_dialects(context) -> None:
+    """Register dialects that ride along in a portable artifact as no-ops on a
+    single device but whose ops the deserializer must still be able to parse.
+
+    Shardy ('sdy') is the one that matters in practice: any sharded JAX program
+    (jax.jit under a mesh, shard_map, with_sharding_constraint) serializes its
+    sharding hints as sdy ops (sdy.sharding_constraint / mesh / manual_computation)
+    into the VHLO artifact. On our single OpenCL device these are identity — but
+    without the dialect registered, deserialize_portable_artifact aborts with
+    "dialect 'sdy' is unknown" before we ever see the compute. brax/MuJoCo-MJX
+    hit exactly this. Register the dialect if jaxlib ships its bindings (it does
+    since the Shardy migration); the later stablehlo walk skips sdy ops via the
+    handlers in pjrt_ocl.ops (they carry no tensor result we consume)."""
+    try:
+        from jaxlib.mlir._mlir_libs import _sdy
+    except Exception:  # noqa: BLE001 — older jaxlib without Shardy: nothing to do
+        return
+    try:
+        _sdy.register_dialect(context, load=True)
+    except Exception:  # noqa: BLE001 — best-effort; deserialize reports if needed
+        pass
+
+
 def deserialize_artifact(artifact: bytes):
     """VHLO portable artifact bytes -> stablehlo ir.Module (auto-upgraded)."""
     from jaxlib.mlir import ir
     from jaxlib.mlir.dialects import stablehlo
-    # No explicit dialect registration needed (poc/03 NOTES #5).
-    return stablehlo.deserialize_portable_artifact(ir.Context(), artifact)
+    # No explicit dialect registration needed for stablehlo (poc/03 NOTES #5);
+    # sdy (and any other sharding dialects) must be registered up front so the
+    # portable-artifact deserializer can parse their ops (identity on one device).
+    context = ir.Context()
+    _register_optional_dialects(context)
+    return stablehlo.deserialize_portable_artifact(context, artifact)
 
 
 def lower_artifact(artifact: bytes) -> VMProgram:
