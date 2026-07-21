@@ -1287,3 +1287,63 @@ Verified: 252/252 pytest on NVIDIA AND PoCL; chained bench + transformer rerun (
 Residual gaps after this: matmul tile ceiling (survey R3), small-op/barrier-chain overhead
 (survey R1/R2). EW at 2M sits ~2x off CUDA's L2-resident chain speed (7.7 vs 3.5 µs) — a
 deeper unroll may close some; diminishing returns vs R2 fusion.
+
+## 37. Diverse workload testbench: coverage + perf survey vs native CUDA (2026-07-21)
+
+**What/why.** Built `tools/bench_suite/` — 18 seeded, f32, jitted workloads spanning AI
+(MLP, CNN, LSTM, GRU, transformer, attention, layernorm, batchnorm, embedding+softmax) and
+scientific/physics (2D heat stencil, N-body, RK4 Lorenz, logistic map, Monte-Carlo π, FFT,
+spring-mass chain, Hodgkin-Huxley neuron, a **real brax** `inverted_pendulum` reset+step) — to
+measure how far the transformer-tuned backend generalizes, and to let real failures rank the M3
+op-coverage backlog. `run_suite.py` runs each workload through OUR OpenCL VM and native JAX CUDA
+in separate subprocesses (backend is process-global), catches lowering failures, extracts the
+missing op, compares outputs, and emits `docs/workload-coverage.md`. This is a survey — no
+plugin/product code changed.
+
+**Result: 11/18 run on our backend (61%), all numerically correct vs CUDA** (allclose
+atol/rtol 2e-2; the "max rel" blowups are near-zero-reference artifacts, not real error).
+
+**Perf spread (passers, ours/CUDA gap):** median **~7x**, range **0.81x–18.7x**.
+- *Near/beating CUDA (≤~3x):* layernorm **0.81x** (the §19 fused-reduce idiom — the one place we
+  win), logistic_map **1.03x** and other `while`/`scan` loops (per-iteration barrier overhead
+  dominates BOTH sides so the ratio collapses), attention 2.4x, spring_mass 3.2x.
+- *Far (≥~7x):* transformer **18.7x**, LSTM/GRU 7–8x, heat2d 7.9x, rk4 7.3x, hh_neuron 11.9x —
+  matmul-heavy or long small-op/scan chains, exactly where XLA fuses elementwise runs and calls
+  cuBLAS/TF32 while we pay per-instruction barriers + un-fused arena traffic. Consistent with the
+  §14/§36 transformer picture; the survey shows it holds across workload classes.
+
+**Coverage gaps, ranked by workloads unlocked (the M3 test-driven priority list):**
+1. **partial-axis reduce** (2: batchnorm, nbody) — we support only full or innermost-suffix
+   reductions (§ reduce). A reduce over axis 0 / a middle axis is rejected at lowering. Cheapest
+   high-value win: a permuting gather before REDUCE, or a strided REDUCE tile op. Also the single
+   most common "almost worked" idiom (mean/var/sum over a non-last axis).
+2. **stablehlo.convolution** (1 here: cnn; would also unlock any real CNN / brax-vision) — no
+   conv in the library at all.
+3. **stablehlo.gather** (1 here: embedding_softmax; ALSO required by brax's step HLO) —
+   data-dependent indexing; only `dynamic_slice` exists today.
+4. **stablehlo.shift_right_logical** (1: monte_carlo) — threefry RNG lowers to bit-shifts we
+   lack, so *any* `jax.random` workload fails. Small op, unlocks the whole RNG/Monte-Carlo class.
+5. **complex dtype** (1: fft) — FFT emits `complex<f32>`; our arena has no complex storage. FFT
+   op itself also absent. Large lift; low priority.
+6. **platform allowlist** (1: brax_step) — NOT a lowering gap: brax/mujoco **reject our custom
+   PJRT platform at env-construction** (`Unsupported device: OclDevice … platform "NVIDIA CUDA"`),
+   before any op dispatches. So brax can't target us without a host-side patch; even if it could,
+   its step needs gather + scatter + case + atan (confirmed from the CUDA stablehlo dump). A
+   hand-written spring-mass analogue (`spring_mass`, PASS 3.2x) represents the physics class.
+
+**Install/compat findings.** `brax` 0.14.2 installs cleanly under jax 0.10.2 and runs a real env
+on CUDA. `jaxley` 0.13.0 installs but hits a **version wall at runtime** under jax 0.10.2:
+`jnp.clip(a_max=…)` (removed kwarg) → `TypeError` inside `jaxley.solver_gate.save_exp`. Recorded,
+not fought; the `hh_neuron` hand-written Hodgkin-Huxley analogue (PASS 11.9x) covers that class.
+
+**Honest bottom line.** The backend **generalizes in coverage** — every f32 elementwise / plain
+matmul / suffix-reduce / scan-or-while program that dodges the six gaps above simply runs and is
+correct, across AI and scientific workloads. But its **tuning generalizes narrowly**: only the
+layernorm/softmax fused-reduce idiom it was optimized for lands at CUDA parity; everything
+matmul- or loop-heavy sits 7–20x behind. The top ROI item by breadth is **partial-axis reduce**
+(unlocks 2 immediately, is the most common near-miss), then **gather** (2 real workloads counting
+brax) and **threefry shift ops** (unlocks the entire RNG class from one small op).
+
+**Reproduce:** `. ./env.sh && .venv/bin/python tools/bench_suite/run_suite.py --md
+docs/workload-coverage.md` (add `--only <names>` for a subset). Verified: full 18-workload run
+reproduces 11 PASS / 7 FAIL with stable gaps across two runs.
