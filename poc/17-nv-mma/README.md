@@ -99,3 +99,28 @@ pure-matmul fast path (24→53 TF/s), and `PJRT_OCL_MM_HYBRID=1` routes a full
 program's big TF32 matmul phases to it on the host-dispatch engine. **large
 transformer 27.7→19.1 ms (1.45×), gap to CUDA 7.5×→5.2×**; base regresses
 (overhead-bound, M=512 too small). Opt-in, not merged. Detail: decisions.md §36.
+
+## §38 update — the tf32 57 ceiling is BROKEN by fp16/bf16 WMMA (~92 TF/s)
+
+`mma17_hp.cl` + `bench17hp.c` (`make bench17hp && ./bench17hp`). The §35/§36
+"~57 TF/s is THE sync ceiling" was measured **only on tf32 m16n16k8**. Switching
+the MMA inputs to **fp16/bf16 (m16n16k16, 2× tensor rate)** and using a
+**thinner accumulator-per-thread** tile (256×128 W8×4 = 1024 threads → 32 acc
+regs/thr vs 64 → 3–4 WG/SM instead of 2) reaches:
+
+| config | 2048³ | 4096³ | precision |
+|--------|-------|-------|-----------|
+| tf32 128×128 (§36 ceiling) | 47 | 57 | 10-bit mant |
+| **f16 256×128 W8×4** | **72** | **92** | 10-bit mant (= tf32), max_abs 3e-3 |
+| bf16 256×128 W8×4 | 71 | 91 | 7-bit mant, max_abs 2.7e-2 |
+| cuBLAS tf32 | 116 | 133 | — |
+
+**1.6× over the tf32 ceiling at tf32-equivalent accuracy** (fp16 and tf32 share a
+10-bit mantissa; fp16 only has a smaller exponent range). §36's "register-file-
+capped, latency the RF can't buy" was a tf32-specific artifact: fp16 halves
+fragment reg pressure *and* doubles compute headroom, so the wide/thin tile's
+extra occupancy finally converts to latency hiding. Gotchas found:
+`wmma.load.shared.{f16,bf16}` **faults (-36) unless smem is 16-byte aligned**
+(`__attribute__((aligned(16)))`); f16 A/B = 8 .b32 regs, bf16 = 4. cp.async
+**independently re-confirmed dead** (`make run-probe`). PoC-only; not integrated
+(needs an f16 input path + range guards). Full detail: docs/decisions.md §38.

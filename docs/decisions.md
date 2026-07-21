@@ -2692,3 +2692,89 @@ brax) and **threefry shift ops** (unlocks the entire RNG class from one small op
 **Reproduce:** `. ./env.sh && .venv/bin/python tools/bench_suite/run_suite.py --md
 docs/workload-coverage.md` (add `--only <names>` for a subset). Verified: full 18-workload run
 reproduces 11 PASS / 7 FAIL with stable gaps across two runs.
+
+## 38. The tf32 "57 TF/s ceiling" is BROKEN by fp16/bf16 WMMA: ~92 TF/s (2026-07-21)
+
+Adversarial re-attack on §35/§36, which concluded ~57 TF/s is THE sync WMMA
+ceiling on this OpenCL→PTX path, "register-file-capped at 2 WG/SM, latency the
+RF can't buy". That conclusion was drawn **entirely on tf32 m16n16k8** inputs.
+The untried lever: **switch the MMA input precision to fp16/bf16** (m16n16k16),
+which on Blackwell tensor cores runs at **2× the tf32 rate**, while the f32
+accumulator (the thing that actually caps residency) is byte-identical.
+`poc/17-nv-mma/mma17_hp.cl` + `bench17hp.c` (arena stays f32; staging converts
+f32→{f16,bf16} into smem; same D-fragment store map as the tf32 kernel).
+
+### Result: fp16 WMMA reaches 72/92 TF/s @2048/4096 — 1.5–1.6× over the tf32 57
+Best-of-7, warmed, RTX PRO 6000 Blackwell sm_120, verified (exact-int + random
+f32 accuracy). C=A@B, 2·N³ FLOPs (same accounting as §36):
+
+| config | 2048³ | 4096³ | acc/thr | max_abs @1024³ |
+|--------|-------|-------|---------|----------------|
+| tf32 128×128 W4×2 (§36 ceiling) | 47 | **57** | 64 | ~3e-3 |
+| **f16 256×128 W8×4 BK16 NBUF2** | **72.3** | **91.9** | 32 | **3.1e-3** |
+| f16 256×128 W16×2 | 70.4 | 89.7 | 32 | — |
+| f16 256×128 W8×4 NBUF3 | 70.4 | 91.2 | 32 | — |
+| f16 128×128 W4×4 (512t) | 69.4 | 85.4 | 32 | — |
+| bf16 256×128 W8×4 | 70.7 | 90.8 | 32 | 2.7e-2 |
+| cuBLAS tf32 (ref) | 116 | 133 | — | — |
+
+**Two things had to combine — and this is why §36 missed it:**
+1. **fp16/bf16 inputs (2× tensor rate).** At the *same* 128×128 W4×2 shape §36
+   used, bf16 gives **56.8 @4096 — identical to tf32**. That looks like it
+   confirms the latency wall... but it's a red herring: that shape is pinned at
+   the accumulator-register cliff either way.
+2. **A thinner accumulator-per-thread (more warps per tile).** The win is
+   256×128 with **W8×4 = 1024 threads**, so the 256×128 f32 accumulator is
+   spread over 4× the threads → **32 acc-regs/thread instead of 64** → 2 WG/SM
+   becomes 3–4 WG/SM → the latency §36 said "the RF can't buy" *is* now bought.
+   With tf32 that same wide shape is compute-bound and stalls at ≤57; fp16's 2×
+   rate keeps it off the compute wall so the extra occupancy actually converts.
+
+So §36's "register-file-capped, latency unbuyable" was a **tf32-specific**
+artifact, not a hard property of the ICD's WMMA path. fp16 both halves fragment
+register pressure *and* doubles compute headroom, and 256×128/1024-thread turns
+that into real latency hiding. **57 → 92 TF/s @4096 (1.6×), 47 → 72 @2048.**
+
+### Precision: f16 here ≈ tf32, NOT "lower precision"
+tf32 and fp16 both carry a **10-bit mantissa**; fp16 only differs by a smaller
+5-bit exponent (max ~65504). Measured max_abs @1024³ random: **f16 3.1e-3 vs the
+tf32 kernel's ~3e-3 — equal.** bf16 (7-bit mantissa) is ~10× coarser (2.7e-2).
+So the 1.6× f16 win is at **tf32-equivalent accuracy** as long as inputs fit
+f16's range (activations O(1–100) do; the f32 accumulator handles the sum). This
+makes f16 a genuine, usable lever — not a precision cheat.
+
+### The alignment trap (why a naïve port faults, -36)
+`wmma.load.*.shared.{f16,bf16}` **faults at runtime (CL_INVALID_COMMAND_QUEUE,
+-36)** unless the smem matrix base is **16-byte aligned**. The tf32 float-smem
+kernel satisfied this incidentally; a `__local ushort[]` half-smem does not, and
+ptxas accepts the PTX either way — it only dies on execute (isolated with
+`-DNOLOAD`: staging alone runs; adding the wmma.load kills it). Fix:
+`__local __attribute__((aligned(16)))`. Also: legacy WMMA f16 A/B fragment = **8
+.b32 regs** (mma form `.f32.f32`, a/b implicit), bf16 = **4 .b32 regs** (`.f32.
+bf16.bf16.f32`) — ptxas rejects the wrong count with "Argument vector size
+mismatch". Both documented in `mma17_hp.cl`.
+
+### cp.async: independently RE-confirmed dead (fresh run of probe)
+`make run-probe`: scalar + st.shared CONTROL CORRECT; every async form
+(cp.async.cg / .ca / +fence.proxy.async / wait_group-spin / mbarrier.try_wait)
+**WRONG, 1024/1024 mismatch**. §35 stands: the async-copy unit is not wired up
+in the OpenCL runtime. So the remaining gap to cuBLAS (92 vs 133 tf32; vs ~260
+f16) is still the multistage global-latency pipeline that only cp.async buys —
+but the *sync* ceiling is now 92, not 57.
+
+### DECISION (§14a): PoC-only finding; NOT integrated
+This is a **ceiling measurement**, poc/17 only — no product code touched. It
+overturns the §36 "57 is final" claim and re-baselines the honest standalone
+tensor ceiling at **~92 TF/s (fp16, tf32-precision)**. Integration into the
+plugin's `mm_tc` is **future work, deliberately not done here**: it needs an f16
+input path (convert-on-stage or an f16 arena lane) and range/overflow guards, and
+the §36 hybrid-dispatch overhead question is unchanged. The value banked now: the
+portable-tensor ceiling on this ICD is 1.6× higher than the project believed, at
+no accuracy cost, via fp16 + wide/thin-accumulator tiling. fp8 (4× rate,
+m16n16k32) is the next untested rung but its 3–4-bit mantissa is unusable for
+this backend's tf32-exact contract — not pursued.
+
+**Reproduce:** `cd poc/17-nv-mma && make bench17hp && ./bench17hp` (full sweep);
+`ACC=1 ONLY="256x128 W8x4 BK16 NBUF2" ./bench17hp` (accuracy);
+`make run-probe` (cp.async re-check). Gates: winner verifies exact-int +
+max_abs 3e-3 random-f32; degenerate RF=0 configs now caught by zeroed-C verify.

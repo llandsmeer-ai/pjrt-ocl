@@ -17,3 +17,6 @@ tools/bench_plot.png
 tools/bench_plot.csv
 build-dev/
 pjrt_plugin/build-dev/
+poc/17-nv-mma/bench17
+poc/17-nv-mma/bench17hp
+poc/17-nv-mma/probe
