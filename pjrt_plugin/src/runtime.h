@@ -53,7 +53,8 @@ enum TileOp : uint32_t {
   kTopMapRegion = 13,  // §27 register-resident map-region (PoC; -DVMO_REGION_POC)
   kTopFlashAttn = 14,  // §34 fused flash-attention (online softmax; p0 = V buffer)
   kTopRedStrided = 15, // partial-axis reduce over interior/prefix axis block
-  kMaxTileOp = kTopRedStrided,
+  kTopGatherIndex = 16,  // §38 general data-dependent gather (stablehlo.gather)
+  kMaxTileOp = kTopGatherIndex,
 };
 // dtype packed in tile_op bits 8-15 (matches python DT_* / vm_common.cl).
 enum VmDtype : uint32_t {

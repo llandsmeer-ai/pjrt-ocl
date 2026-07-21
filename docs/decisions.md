@@ -2731,3 +2731,34 @@ CUDA" band, not the matmul-heavy 7–20× band. Coverage 11/18 → 13/18.
 
 **Reproduce:** `. ./env.sh && PYTHONPATH=$PWD/python .venv/bin/python
 tools/bench_suite/run_suite.py --only batchnorm nbody`.
+## 38. SHIPPED: general data-dependent gather (stablehlo.gather → OP_GATHER_INDEX) — unlocks embedding_softmax (2026-07-21)
+
+**What/why.** Closes coverage gap #3 (§37). Before this, the only gather we had was
+`OP_GATHER_STRIDED` — a *compile-time-affine view* (broadcast/transpose/slice/reverse). Real
+gathers (embedding lookup `emb[ids]`, `take`, brax's step) need each output element's operand
+base offset to come from a **runtime start_indices tensor**. New op `OP_GATHER_INDEX` /
+`kTopGatherIndex` (tile op 15) does exactly that, fully general over stablehlo's gather
+`dimension_numbers`.
+
+**Design.** The whole gather reduces to a flat per-output-element affine form the kernel
+evaluates (all row-major, one output element per grid-stride step):
+`op_off(i) = Σ_e coord_e(i)·op_stride[e] + Σ_k clamp(S_k, 0, dim−slice)·idx_op_stride[k]`,
+`S_k = start_indices[Σ_e coord_e(i)·si_stride[e] + k·si_vec_stride]`, then `dst[i]=operand[op_off]`.
+The two stride arrays are disjoint (op_stride≠0 only on OFFSET output dims, si_stride≠0 only on
+BATCH output dims), so both sums accumulate in one decode loop with no per-dim branch. The lowering
+(`ops/gather_index.py`) computes op_stride/si_stride/idx_op_stride/clamp_max/si_vec_stride from the
+dnums (offset_dims↔non-collapsed operand dims; batch output dims↔start_indices batch dims;
+start_index_map↔operand dims). Whole-element copy ⇒ dtype-agnostic (esz mover, i32/i64 indices).
+Reuses the dynamic_slice **loader-patch** trick: the start_indices location can't be known at
+lowering time (arena reuse moves offsets; inputs live in I/O ports), so aux carries the buffer id
+and the C++ loader patches the byte-offset/port-handle word at load (`elem_off`); the dep on the
+indices buffer rides in `reads_hint`.
+
+**Verified.** New `tests/test_ops_gather.py` (6 cases: 1D embedding, embedding+softmax,
+2D index batch, i64 indices, two-component (row,col) scalar gather, clip/OOB clamping) — both
+numpy validators PASS. Full pytest **307 passed / 1 skipped** (was 301). E2e through the real
+plugin: raw `emb[ids]` is **bit-exact** vs numpy on NVIDIA (TF32 + MEGA_TC=0 f32-exact) and PoCL
+CPU; `embedding_softmax` end-to-end allclose vs jax-CPU (maxabs 5e-6 TF32, 2e-8 exact, 1.5e-8
+PoCL). `bench_suite --only embedding_softmax`: now **PASS, ours 0.078 ms vs CUDA 0.072 ms =
+1.08x**, correct=close — coverage now **12/18**. (The 1.08x is a small-op program; the gather is a
+copy-bound view, so it rides at CUDA parity like the other reduce/loop-bound passers.)

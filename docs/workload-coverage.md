@@ -4,6 +4,7 @@ Diverse AI + scientific-computing workloads run through our OpenCL VM (`JAX_PLAT
 
 **Coverage: 13/18 workloads run on our backend (72%).**  *(partial-axis reduce
 landed — batchnorm + nbody now PASS via OP_REDUCE_STRIDED, §38.)*
+**Coverage: 12/18 workloads run on our backend (67%).**  (§38: general stablehlo.gather shipped — embedding_softmax now PASS.)
 
 ## Coverage + perf
 
@@ -18,6 +19,8 @@ landed — batchnorm + nbody now PASS via OP_REDUCE_STRIDED, §38.)*
 | layernorm | AI | PASS | 0.055 | 0.068 | 0.81x | close (1.6e-03) | layernorm (reduce over last axis) |
 | batchnorm | AI | PASS | 0.132 | 0.050 | 2.62x | close (2.3e-07) | batchnorm (reduce over axis 0) — via OP_REDUCE_STRIDED |
 | embedding_softmax | AI | **FAIL** | - | 0.069 | - | - | `stablehlo.gather` — missing stablehlo.gather (cuda: PASS); embedding lookup + softmax classifier |
+| batchnorm | AI | **FAIL** | - | 0.056 | - | - | `reduce(partial-axis)` — partial-axis reduce (cuda: PASS); batchnorm (reduce over axis 0) |
+| embedding_softmax | AI | PASS | 0.078 | 0.072 | 1.08x | close | embedding lookup + softmax classifier (§38 general gather) |
 | heat2d | SCI | PASS | 2.574 | 0.325 | 7.93x | close (0.0e+00) | 2D heat-equation stencil (roll+EW, scan) |
 | nbody | SCI | PASS | 0.121 | 0.044 | 2.75x | close (5.5e-06) | N-body gravity step (pairwise + reduce over axis 1) — via OP_REDUCE_STRIDED |
 | rk4_ode | SCI | PASS | 8.935 | 1.232 | 7.25x | close (0.0e+00) | RK4 Lorenz integrator (scan) |
@@ -40,6 +43,12 @@ Each row: how many suite workloads that op/feature would unlock, and which.
 | 3 | `stablehlo.shift_right_logical` | 1 | monte_carlo |
 | 4 | `complex-dtype` | 1 | fft |
 | 5 | `platform-allowlist` | 1 | brax_step |
+| 1 | `reduce(partial-axis)` | 2 | batchnorm, nbody |
+| 2 | `stablehlo.convolution` | 1 | cnn |
+| ~~3~~ | ~~`stablehlo.gather`~~ | ~~1~~ | ~~embedding_softmax~~ — SHIPPED §38 (OP_GATHER_INDEX) |
+| 4 | `stablehlo.shift_right_logical` | 1 | monte_carlo |
+| 5 | `complex-dtype` | 1 | fft |
+| 6 | `platform-allowlist` | 1 | brax_step |
 
 ## Bottom line (generalization read)
 

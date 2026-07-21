@@ -43,6 +43,7 @@ static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
         case TOP_LAYERNORM_SEG: vmo_layernorm_seg(arena, iop, t, tile, As, Bs, lid, lsz); break;
         case TOP_MAP_REGION: vmo_map_region(arena, iop, aux, t, tile, lid, lsz); break;
         case TOP_FLASH_ATTN: vmo_flash_attn(arena, iop, aux, t, tile, As, Bs, lid, lsz); break;
+        case TOP_GATHER_INDEX: vmo_gather_index_tile(arena, iop, aux, t, tile, esz, lid, lsz); break;
 #ifdef VMO_PROBE_REGS
         /* §27 register-budget probe. VMO_PROBE_REGS float accumulators kept
          * SIMULTANEOUSLY live across the k-loop, seeded from and reduced back to
