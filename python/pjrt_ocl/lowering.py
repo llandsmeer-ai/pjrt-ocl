@@ -158,6 +158,9 @@ OP_GATHER_INDEX = 60     # §38 general data-dependent gather (stablehlo.gather)
 OP_SHL = 61              # stablehlo.shift_left (int32/uint32) (61-63: 59/60 taken)
 OP_SHR_L = 62            # stablehlo.shift_right_logical (zero-fill)
 OP_SHR_A = 63            # stablehlo.shift_right_arithmetic (sign-fill)
+OP_CONV = 64             # stablehlo.convolution (direct N-D NHWC/HWIO conv, §39):
+                         # a=input, b=weights, aux=descriptor word-offset
+                         # (sdim,Cin,Cout, out/win/stride/pad_low/dil/in spatial dims)
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -191,6 +194,7 @@ OP_NAMES = {
     OP_FLASH_ATTN: "flash_attn",
     OP_REDUCE_STRIDED: "reduce_strided", OP_GATHER_INDEX: "gather_index",
     OP_SHL: "shl", OP_SHR_L: "shr_l", OP_SHR_A: "shr_a",
+    OP_CONV: "convolution",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
