@@ -125,7 +125,12 @@ enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
         * 0.5*x*(1+tanh(0.7978845608*(x+0.044715*x^3))) per element in registers,
         * one global read + one write. Routed as a unary subop (vmo_ew_is_un()
         * range-extended) so it rides the existing TILE_EW float4 fast path. */
-       SUB_GELU };
+       SUB_GELU,
+       /* integer shifts (i32/u32 only; threefry RNG uses SHL|SHR_L). Appended at
+        * the tail so existing subop values are unchanged. SHR_L is logical
+        * (zero-fill, unsigned view); SHR_A is arithmetic (sign-fill). Dedicated
+        * dispatch in vmo_ew_tile_i32. */
+       SUB_SHL, SUB_SHR_L, SUB_SHR_A };
 
 #define ENT_NOP     0xFFFFFFFFu
 #define ENT_BARRIER 0xFFFFFFFEu

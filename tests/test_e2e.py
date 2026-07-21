@@ -18,6 +18,7 @@ BODY = pathlib.Path(__file__).parent / "_e2e_body.py"
 WHILE_BODY = pathlib.Path(__file__).parent / "_while_e2e_body.py"
 MATMUL_HOST_BODY = pathlib.Path(__file__).parent / "_matmul_host_e2e_body.py"
 DYNSLICE_BODY = pathlib.Path(__file__).parent / "_dynslice_e2e_body.py"
+RANDOM_BODY = pathlib.Path(__file__).parent / "_random_e2e_body.py"
 
 
 def _run_body(body: pathlib.Path, marker: str, extra_env: dict | None = None
@@ -37,6 +38,20 @@ def _run_body(body: pathlib.Path, marker: str, extra_env: dict | None = None
 @pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
 def test_e2e_subprocess():
     _run_body(BODY, "E2E PASS")
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_random_subprocess():
+    """jax.random (threefry2x32) end-to-end: the ui64-counter shift/xor/iota
+    path must reproduce XLA's RNG bit-exactly (golden captured from the CPU
+    backend). Unlocks the whole jax.random / Monte-Carlo workload class."""
+    _run_body(RANDOM_BODY, "RANDOM E2E PASS")
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_random_host_dispatch():
+    """Same, under the host-dispatch engine (portable clFinish-per-phase)."""
+    _run_body(RANDOM_BODY, "RANDOM E2E PASS", {"PJRT_OCL_ENGINE": "host"})
 
 
 @pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")

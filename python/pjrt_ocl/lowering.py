@@ -155,6 +155,9 @@ OP_REDUCE_STRIDED = 59   # partial-axis reduce over a CONTIGUOUS interior/prefix
 OP_GATHER_INDEX = 60     # §38 general data-dependent gather (stablehlo.gather):
                          # a=operand, aux=descriptor word-offset, reads start_indices
                          # (its buffer id rides in aux + reads_hint). (60: 59 = REDUCE_STRIDED)
+OP_SHL = 61              # stablehlo.shift_left (int32/uint32) (61-63: 59/60 taken)
+OP_SHR_L = 62            # stablehlo.shift_right_logical (zero-fill)
+OP_SHR_A = 63            # stablehlo.shift_right_arithmetic (sign-fill)
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -186,7 +189,9 @@ OP_NAMES = {
     OP_GELU: "gelu",
     OP_MAP_REGION: "map_region",
     OP_FLASH_ATTN: "flash_attn",
-    OP_REDUCE_STRIDED: "reduce_strided",    OP_GATHER_INDEX: "gather_index",}
+    OP_REDUCE_STRIDED: "reduce_strided", OP_GATHER_INDEX: "gather_index",
+    OP_SHL: "shl", OP_SHR_L: "shr_l", OP_SHR_A: "shr_a",
+}
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
 # arena_bytes u64 as before (docs/vmprogram.md "v2 deltas").
@@ -611,6 +616,7 @@ _EW_INPLACE_SAFE = frozenset({
     OP_COS_F32, OP_TAN_F32, OP_ROUND_NEAREST_EVEN_F32, OP_ROUND_NEAREST_AFZ_F32,
     OP_COPY_F32, OP_CONVERT, OP_BITCAST, OP_CMP_F32, OP_SELECT_F32, OP_AND,
     OP_OR, OP_XOR, OP_NOT, OP_IS_FINITE, OP_AFFINE_F32,
+    OP_SHL, OP_SHR_L, OP_SHR_A,
 })
 
 

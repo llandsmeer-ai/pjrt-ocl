@@ -57,12 +57,12 @@ EW_SUB_COPY = 7
 
 # --- stablehlo.iota -----------------------------------------------------
 
-def _emit_iota(ctx, out_shape, dim: int) -> int:
+def _emit_iota(ctx, out_shape, dim: int, dtype: int = L.DT_F32) -> int:
     n = math.prod(out_shape) if out_shape else 1
     rank = len(out_shape)
     aux_words = [rank] + list(out_shape) + [dim]
     aux_off = ctx.add_aux(aux_words)
-    dst = ctx.new_buffer(n)
+    dst = ctx.new_buffer(n, dtype)
     ctx.emit(L.Instr(L.OP_IOTA_DIM, dst=dst, n=n, aux=aux_off))
     return dst
 
@@ -70,14 +70,16 @@ def _emit_iota(ctx, out_shape, dim: int) -> int:
 @L.handles("stablehlo.iota")
 def _iota(ctx, op):
     from jaxlib.mlir import ir
-    # iota has no operands: shape comes only from the result type.
-    out_shape, _, _ = L.tensor_info(op.results[0].type)
+    # iota has no operands: shape comes only from the result type. The dtype
+    # matters: integer iota (int32/uint32, e.g. the threefry RNG counter) must
+    # write integer coordinates, not their f32 bit-pattern.
+    out_shape, _, dtype = L.tensor_info(op.results[0].type)
     dim = int(ir.IntegerAttr(op.attributes["iota_dimension"]).value)
     if not (0 <= dim < len(out_shape)):
         raise L.LoweringError(
             f"stablehlo.iota: iota_dimension {dim} out of range for rank "
             f"{len(out_shape)}")
-    dst = _emit_iota(ctx, out_shape, dim)
+    dst = _emit_iota(ctx, out_shape, dim, dtype)
     ctx.value_to_buf[op.results[0]] = dst
 
 
@@ -112,7 +114,7 @@ def _iota_interp(ins, rt):
     n = ins.n
     out = rt.view(ins.dst, n)
     val = _iota_coords(ins.aux, rt, np.arange(n))
-    out[:] = val.astype(np.float32)
+    out[:] = val   # cast to the dst buffer's own dtype (f32 or int32/uint32)
 
 
 def _iota_reads(ins) -> set[int]:
@@ -128,7 +130,7 @@ def _iota_tile_sim(task, entry, rt):
     if lo >= hi:
         return
     val = _iota_coords(task.p0, rt, np.arange(lo, hi))
-    rt.view(task.dst)[lo:hi] = val.astype(np.float32)
+    rt.view(task.dst)[lo:hi] = val   # dst buffer dtype (f32 or int32/uint32)
 
 
 opsem.register(L.OP_IOTA_DIM, to_task=_iota_to_task, interp=_iota_interp,

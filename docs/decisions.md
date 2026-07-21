@@ -2762,3 +2762,43 @@ CPU; `embedding_softmax` end-to-end allclose vs jax-CPU (maxabs 5e-6 TF32, 2e-8 
 PoCL). `bench_suite --only embedding_softmax`: now **PASS, ours 0.078 ms vs CUDA 0.072 ms =
 1.08x**, correct=close — coverage now **12/18**. (The 1.08x is a small-op program; the gather is a
 copy-bound view, so it rides at CUDA parity like the other reduce/loop-bound passers.)
+## 38. jax.random unlocked — integer shifts + a real ui64 path (threefry) — 2026-07-21
+
+**Goal (§37 top-ROI-by-breadth item).** `jax.random.*` was the biggest single-op coverage gap:
+the whole Monte-Carlo / RNG class (`monte_carlo` FAILed with `FAIL(threefry/shift)`). One family
+of ops was expected to unlock it. It took **three** fixes, not one — the "just add shift_left"
+framing was wrong.
+
+**What threefry2x32 actually lowers to (measured, `jax.random.bits(PRNGKey(0),(8,),u32)`):**
+`iota` → `multiply` → `shift_right_logical` on a **`tensor<8xui64>` counter**, then `convert`
+ui64→ui32 into two 32-bit words, then the rotate mixing `shift_left | shift_right_logical` +
+`xor`/`add` on ui32. So the dependencies were: (a) the two shift ops, (b) **integer iota**, and
+(c) **a real 8-byte DT_I64 elementwise path**.
+
+**Three bugs found, in order (each masked the next):**
+1. *Missing shifts.* Added `stablehlo.shift_left / shift_right_logical / shift_right_arithmetic`
+   as `OP_SHL/SHR_L/SHR_A` → EW subops `SUB_SHL/SHR_L/SHR_A` (appended at the **tail** of
+   `vm_common.cl`'s enum so existing subop values don't shift — the python side hardcodes them).
+   SHR_L is logical (unsigned view, zero-fill); device masks the count to 31/63. Verified
+   bit-exact vs the CPU backend. *Result: uniform still statistically wrong (pi≈3.57).*
+2. *iota wrote f32 bits into integer buffers.* `_emit_iota` used `new_buffer(n)` (default DT_F32)
+   and the device tile wrote `(float)val`, so `arange(u32)` produced `0x3F800000`(=1.0f) instead
+   of 1. Made iota dtype-aware end-to-end (lowering carries the result dtype; device `vmo_iota_tile`
+   writes int/long/float by `dt`; python validators drop the forced `.astype(f32)`).
+   *Result: still wrong — first half of the counter right, second half collapsed to a constant.*
+3. *DT_I64 fell through to the f32 EW tile* (`ew.cl` `switch(dt) … default: f32`). The **ui64**
+   counter + its `multiply`/`shift_right_logical` were being run as float32 — total garbage above
+   the low mantissa. Added `vmo_ew_tile_i64` (mirrors the i32 tile on `long`/`ulong`, 8-byte),
+   an i64 case in the EW switch, i64 in the iota tile, and an **integer-only** i64↔i32 branch in
+   `vmo_convert_tile` (keeps the exact low 32 bits — the double intermediate loses them past 2^53,
+   and the no-fp64 path didn't handle i64 at all).
+
+**Verified.** threefry bits **bit-exact vs the CPU-backend golden** on BOTH NVIDIA and PoCL, and
+under BOTH engines (megakernel + host-dispatch) and MEGA_TC=0. `monte_carlo` now **PASS**
+(pi=3.147, correct=close, finite) — gap 15.9x vs CUDA, but this is a **coverage add** (unlocks the
+entire jax.random class), not a perf play. `jax.random.normal(20000)` is finite and ~N(0,1)
+(ULP-level float diff on ndtri only). pytest **311 passed** / 1 skipped (was 301), no regressions.
+New tests: `tests/test_ops_shift.py` (validator layer) + `tests/test_e2e.py::test_e2e_random_*`
+(device, golden bit-exact). **Lesson:** a "one small op" coverage item can hide a whole dtype tier
+— jax emits a ui64 counter even with x64 disabled, so RNG needed 64-bit integer EW, not just the
+shift opcodes.
