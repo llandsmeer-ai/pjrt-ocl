@@ -467,7 +467,16 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
       cl_int me;
       rt->mm_tc_kernel_ = clCreateKernel(rt->tc_mega_program_, "mm_tc", &me);
       if (me != CL_SUCCESS) rt->mm_tc_kernel_ = nullptr;
+      // §38: the standalone fp16 WMMA SGEMM lives in the same NV_PTX program.
+      // Non-fatal if absent — the tf32 mm_tc / SGEMM remain the fallback.
+      cl_int fe;
+      rt->mm_tc_fp16_kernel_ = clCreateKernel(rt->tc_mega_program_, "mm_tc_fp16", &fe);
+      if (fe != CL_SUCCESS) rt->mm_tc_fp16_kernel_ = nullptr;
     }
+    // §38 opt-in: PJRT_OCL_MM_FP16=1 routes big matmuls (LaunchMatmul fast path
+    // + MM_HYBRID phases) through the fp16 WMMA tile instead of tf32 mm_tc.
+    if (const char* e = std::getenv("PJRT_OCL_MM_FP16"); e && e[0] && e[0] != '0')
+      rt->mm_fp16_ = true;
     // Advertise 128 to the scheduler ONLY if the 128x128 TF32 kernel is the one
     // that will execute (built AND non-null). If it failed, mma_t_ stays 64 and
     // the portable fallback runs a matching 64x64 schedule.
@@ -614,6 +623,7 @@ OclRuntime::~OclRuntime() {
   if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
   if (mm_kernel_) clReleaseKernel(mm_kernel_);
   if (mm_tc_kernel_) clReleaseKernel(mm_tc_kernel_);
+  if (mm_tc_fp16_kernel_) clReleaseKernel(mm_tc_fp16_kernel_);
   if (gemv_kernel_) clReleaseKernel(gemv_kernel_);
   if (mm_pack_kernel_) clReleaseKernel(mm_pack_kernel_);
   if (mm_packed_kernel_) clReleaseKernel(mm_packed_kernel_);
@@ -1009,12 +1019,23 @@ bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
   // §36: on GPU/TF32 prefer the standalone WMMA SGEMM (mm_tc, ~47/57 TF/s) over
   // the scalar mm2 SGEMM (~21/24 TF/s). Same (M,N,K,dst,a,b) ABI; grid-strided.
   const bool use_tc = !is_gemv && rt_->is_gpu() && rt_->mm_tc_kernel();
+  // §38: PJRT_OCL_MM_FP16=1 prefers the fp16 WMMA tile (~72/92 TF/s) over the
+  // tf32 mm_tc (~47/57). Different tile geometry: 256x128 W8x4 = 1024 threads.
+  const bool use_fp16 = use_tc && rt_->mm_fp16();
   cl_kernel k = is_gemv ? rt_->gemv_kernel()
-                        : (use_tc ? rt_->mm_tc_kernel() : rt_->mm_kernel());
+                        : (use_fp16 ? rt_->mm_tc_fp16_kernel()
+                                    : (use_tc ? rt_->mm_tc_kernel()
+                                              : rt_->mm_kernel()));
   size_t gsz, lsz;
   if (is_gemv) {
     lsz = 256;
     gsz = (mm_M_ + lsz - 1) / lsz * lsz;
+  } else if (use_fp16) {
+    constexpr uint32_t kTM = 256, kTN = 128;   // must match MHP_TM/MHP_TN
+    const size_t tiles_m = (mm_M_ + kTM - 1) / kTM;
+    const size_t tiles_n = (mm_N_ + kTN - 1) / kTN;
+    lsz = 1024;                                // MHP_NTHREADS (W8x4)
+    gsz = tiles_m * tiles_n * lsz;             // one 1024-thread WG per 256x128 tile
   } else if (use_tc) {
     constexpr uint32_t kTM = 128, kTN = 128;   // must match MMTC_TM/MMTC_TN
     const size_t tiles_m = (mm_M_ + kTM - 1) / kTM;
@@ -1344,8 +1365,10 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       }
     return !mm_tasks.empty();
   };
+  // §38: prefer the fp16 WMMA tile (256x128 W8x4, 1024 threads) when opted in.
+  const bool hy_fp16 = rt_->mm_fp16();
   auto enqueue_mm_tc = [&](const VmTask& tk) -> bool {
-    cl_kernel km = rt_->mm_tc_kernel();
+    cl_kernel km = hy_fp16 ? rt_->mm_tc_fp16_kernel() : rt_->mm_tc_kernel();
     clSetKernelArg(km, 0, sizeof(arena_), &arena_);
     for (int pt = 0; pt < kNIoPorts; ++pt) {
       cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
@@ -1358,8 +1381,9 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     clSetKernelArg(km, 12, sizeof(uint32_t), &tk.dst);
     clSetKernelArg(km, 13, sizeof(uint32_t), &tk.a);
     clSetKernelArg(km, 14, sizeof(uint32_t), &tk.b);
-    const size_t tiles_m = (M + 127) / 128, tiles_n = (N + 127) / 128;
-    size_t lsz = 256, gsz = tiles_m * tiles_n * lsz;
+    const uint32_t tm = hy_fp16 ? 256 : 128, tn = 128;
+    const size_t tiles_m = (M + tm - 1) / tm, tiles_n = (N + tn - 1) / tn;
+    size_t lsz = hy_fp16 ? 1024 : 256, gsz = tiles_m * tiles_n * lsz;
     if (clEnqueueNDRangeKernel(q, km, 1, nullptr, &gsz, &lsz, 0, nullptr,
                                nullptr) != CL_SUCCESS) {
       *err = "host-dispatch: mm_tc (hybrid) launch failed";

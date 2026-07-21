@@ -142,6 +142,14 @@ class OclRuntime {
   // §36 standalone TF32 tensor-core SGEMM (poc/17); null unless the NVIDIA
   // VMO_NV_PTX program built. Preferred over mm_kernel_ (SGEMM) on GPU/TF32.
   cl_kernel mm_tc_kernel() const { return mm_tc_kernel_; }
+  // §38 standalone fp16 tensor-core SGEMM (poc/17 mma17_hp.cl); null unless the
+  // VMO_NV_PTX program built. ~72/92 TF/s @2048/4096 vs mm_tc's ~47/57 (2x
+  // tensor rate, tf32-equal 10-bit mantissa). Opt-in via PJRT_OCL_MM_FP16=1
+  // (mm_fp16()) — it narrows the staged A/B inputs to fp16 (max_normal ~65504),
+  // fine for normalized activations; the f32 accumulator is unchanged.
+  cl_kernel mm_tc_fp16_kernel() const { return mm_tc_fp16_kernel_; }
+  // True when PJRT_OCL_MM_FP16=1 AND the fp16 WMMA kernel built (GPU/NV_PTX).
+  bool mm_fp16() const { return mm_fp16_ && mm_tc_fp16_kernel_; }
   cl_kernel gemv_kernel() const { return gemv_kernel_; }
   // CPU-only (VMO_CPU_TILES builds; null on GPU): packed+blocked SGEMM.
   cl_kernel mm_pack_kernel() const { return mm_pack_kernel_; }
@@ -231,6 +239,8 @@ class OclRuntime {
   cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
   cl_kernel mm_kernel_ = nullptr;      // standalone SGEMM (pure-matmul fast path)
   cl_kernel mm_tc_kernel_ = nullptr;   // §36 standalone TF32 WMMA (NV_PTX only)
+  cl_kernel mm_tc_fp16_kernel_ = nullptr;  // §38 standalone fp16 WMMA (NV_PTX only)
+  bool mm_fp16_ = false;               // PJRT_OCL_MM_FP16=1: prefer fp16 WMMA
   cl_kernel gemv_kernel_ = nullptr;    // width-1 matmul (both device classes)
   cl_kernel mm_pack_kernel_ = nullptr;    // CPU only: B panel packing
   cl_kernel mm_packed_kernel_ = nullptr;  // CPU only: packed 6x16 KC-swept

@@ -2887,3 +2887,43 @@ this backend's tf32-exact contract — not pursued.
 `ACC=1 ONLY="256x128 W8x4 BK16 NBUF2" ./bench17hp` (accuracy);
 `make run-probe` (cp.async re-check). Gates: winner verifies exact-int +
 max_abs 3e-3 random-f32; degenerate RF=0 configs now caught by zeroed-C verify.
+
+## 38a. fp16 WMMA tile INTEGRATED into mm_tc (PJRT_OCL_MM_FP16=1) (2026-07-21)
+
+§38's PoC ceiling is now **product code**. The winning `256×128 W8×4` fp16 tile
+(mma17_hp.cl HP=1) ships as `mm_tc_fp16` in `pjrt_plugin/kernels/vm_main.cl`
+(inside the same `VMO_NV_PTX` program as the tf32 `mm_tc`, so inline-PTX never
+touches the portable build). It stages the f32 arena inputs into 16-byte-aligned
+fp16 smem (`vstore_half`), runs `wmma.mma.m16n16k16.f32.f32` with an f32
+accumulator, stores f32 — i.e. only the A/B *inputs* are narrowed. Wiring
+(`runtime.cc`): built alongside `mm_tc`; `bool mm_fp16_` set from
+`PJRT_OCL_MM_FP16=1`; `mm_fp16()` gates both consumers — the pure-matmul fast
+path (`LaunchMatmul`, GPU/TF32) and the `PJRT_OCL_MM_HYBRID=1` host-dispatch
+split (`enqueue_mm_tc`) — each switching kernel AND geometry (256×128, 1024-thread
+WG vs tf32's 128×128, 256-thread). **Strictly opt-in; default path byte-identical.**
+
+### Measured (RTX PRO 6000 Blackwell, in-plugin, tf32→fp16)
+| workload | tf32 | fp16 | speedup | gap→CUDA |
+|---|---|---|---|---|
+| matmul 2048³ (fast path) | 43 TF/s | 64 TF/s | 1.49× | — |
+| matmul 4096³ (fast path) | 52 TF/s | 81 TF/s | 1.54× | — |
+| transformer **base** (hybrid) | 7.01 ms | 6.07 ms | 1.15× | 15.9×→13.8× |
+| transformer **large** (hybrid) | 21.2 ms | 18.4 ms | 1.15× | 5.74×→**4.98×** |
+
+(4096 in-plugin 81 vs poc standalone 92: real-plugin median-of-10 vs bench
+best-of-7 warmed clocks.) **Correctness:** transformer `--check` PASS both configs
+(max_abs 1.2e-3 base / 2.9e-3 large — tf32-equivalent ~1e-3); matmul mean_rel
+~2e-3 = tf32; edge shapes (K∤16, M/N∤tile, M=1) all allclose(2e-2,5e-2). Small
+bench_suite workloads (mlp/attention) unchanged — below the hybrid M≥512/N≥512/
+K≥256 routing threshold, so no fp16 dispatch, no regression.
+
+### Range caveat (why opt-in, not default)
+fp16 shares tf32's 10-bit mantissa (equal precision) but max_normal ~65504. The
+f32 accumulator never overflows; only an individual A/B **input** magnitude >65504
+would clip. Safe for the normalized activations in these workloads (verified), but
+a workload with large raw inputs must keep tf32 — hence a flag, not the default.
+fp8 (4× rate) remains unusable (3–4-bit mantissa breaks the tf32-exact contract).
+
+**Reproduce:** `PJRT_OCL_MM_FP16=1 PJRT_OCL_MM_HYBRID=1` on
+`tools/bench_transformer.py --config {base,large} [--check]` and the pure `x@y`
+fast path; A/B against the same commands without `PJRT_OCL_MM_FP16`.

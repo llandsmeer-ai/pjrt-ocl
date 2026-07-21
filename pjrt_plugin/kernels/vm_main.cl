@@ -652,4 +652,143 @@ __kernel void mm_tc(__global uchar *arena, VMO_IO_PARAMS,
         }
     }
 }
+
+/* §38 fp16 tensor-core SGEMM (poc/17-nv-mma mma17_hp.cl, HP=1). Same ABI/role
+ * as mm_tc but the MMA inputs are fp16 (m16n16k16) instead of tf32 (m16n16k8):
+ * fp16 runs at 2x the tf32 tensor rate on Blackwell and — crucially — halves
+ * fragment register pressure, so the wide/thin 256x128 W8x4 tile (32 acc regs/
+ * thread, 3-4 WG/SM vs the tf32 tile's 2) finally converts extra occupancy into
+ * latency hiding: ~72/92 TF/s @2048/4096 vs the tf32 ceiling's ~47/57 (§38).
+ * PRECISION: fp16 shares tf32's 10-bit mantissa (same accuracy, ~1e-3 rel) but a
+ * smaller exponent range (max_normal ~65504) — the f32 accumulator is identical,
+ * only the staged A/B inputs are narrowed, so accumulation does not overflow;
+ * only an individual input magnitude >65504 would clip (guarded by opting in via
+ * PJRT_OCL_MM_FP16 for normalized workloads). smem MUST be 16-byte aligned or
+ * wmma.load.shared.f16 faults (-36). Gated behind PJRT_OCL_MM_FP16=1 in the host. */
+#define MHP_TM 256
+#define MHP_TN 128
+#define MHP_BK 16
+#define MHP_PAD 8
+#define MHP_LDS (MHP_BK + MHP_PAD)
+#define MHP_WM 8               /* warp grid rows */
+#define MHP_WN 4               /* warp grid cols; 32 warps == 1024 threads */
+#define MHP_NTHREADS (MHP_WM * MHP_WN * 32)
+#define MHP_RF  (MHP_TM / (MHP_WM * 16))   /* 2 */
+#define MHP_TNW (MHP_TN / (MHP_WN * 16))   /* 2 */
+#define MHP_KSUB (MHP_BK / 16)             /* 1 */
+
+#define MHP_LOAD_A(f, ptr, stride)                                             \
+    asm volatile("{ .reg .u64 sp; cvta.to.shared.u64 sp, %8;\n"                \
+        "wmma.load.a.sync.aligned.m16n16k16.shared.row.f16"                    \
+        " {%0,%1,%2,%3,%4,%5,%6,%7}, [sp], %9; }"                              \
+        : "=r"((f)[0]),"=r"((f)[1]),"=r"((f)[2]),"=r"((f)[3]),                 \
+          "=r"((f)[4]),"=r"((f)[5]),"=r"((f)[6]),"=r"((f)[7])                  \
+        : "l"(ptr),"r"(stride))
+#define MHP_LOAD_B(f, ptr, stride)                                             \
+    asm volatile("{ .reg .u64 sp; cvta.to.shared.u64 sp, %8;\n"                \
+        "wmma.load.b.sync.aligned.m16n16k16.shared.col.f16"                    \
+        " {%0,%1,%2,%3,%4,%5,%6,%7}, [sp], %9; }"                              \
+        : "=r"((f)[0]),"=r"((f)[1]),"=r"((f)[2]),"=r"((f)[3]),                 \
+          "=r"((f)[4]),"=r"((f)[5]),"=r"((f)[6]),"=r"((f)[7])                  \
+        : "l"(ptr),"r"(stride))
+#define MHP_MMA(acc, a, b)                                                     \
+    asm volatile("wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32\n"           \
+        "{%0,%1,%2,%3,%4,%5,%6,%7},\n"                                         \
+        "{%8,%9,%10,%11,%12,%13,%14,%15},\n"                                   \
+        "{%16,%17,%18,%19,%20,%21,%22,%23},\n"                                 \
+        "{%0,%1,%2,%3,%4,%5,%6,%7};"                                           \
+        : "+f"((acc)[0]),"+f"((acc)[1]),"+f"((acc)[2]),"+f"((acc)[3]),         \
+          "+f"((acc)[4]),"+f"((acc)[5]),"+f"((acc)[6]),"+f"((acc)[7])          \
+        : "r"((a)[0]),"r"((a)[1]),"r"((a)[2]),"r"((a)[3]),                     \
+          "r"((a)[4]),"r"((a)[5]),"r"((a)[6]),"r"((a)[7]),                     \
+          "r"((b)[0]),"r"((b)[1]),"r"((b)[2]),"r"((b)[3]),                     \
+          "r"((b)[4]),"r"((b)[5]),"r"((b)[6]),"r"((b)[7]))
+
+__attribute__((reqd_work_group_size(MHP_NTHREADS, 1, 1)))
+__kernel void mm_tc_fp16(__global uchar *arena, VMO_IO_PARAMS,
+                         const uint M, const uint N, const uint K,
+                         const uint dsth, const uint ah, const uint bh)
+{
+    VMO_IO_ARRAY;
+    __local __attribute__((aligned(16))) ushort As[2 * MHP_TM * MHP_LDS];
+    __local __attribute__((aligned(16))) ushort Bs[2 * MHP_TN * MHP_LDS];
+    __global const float *A = AP(const float, ah);
+    __global const float *B = AP(const float, bh);
+    __global float *C = AP(float, dsth);
+
+    const uint tiles_n = (N + MHP_TN - 1) / MHP_TN;
+    const uint tiles_m = (M + MHP_TM - 1) / MHP_TM;
+    const uint total = tiles_m * tiles_n;
+    const uint lid = get_local_id(0);
+    const uint warp = lid >> 5, lane = lid & 31;
+    const uint wm = warp % MHP_WM, wn = warp / MHP_WM;
+    const uint nlanes = get_num_groups(0);
+
+    for (uint tile = get_group_id(0); tile < total; tile += nlanes) {
+        const uint tr = tile / tiles_n, tc = tile % tiles_n;
+        const uint row0 = tr * MHP_TM, col0 = tc * MHP_TN;
+        float acc[MHP_RF][MHP_TNW][8];
+        for (int i = 0; i < MHP_RF; i++)
+            for (int j = 0; j < MHP_TNW; j++)
+                for (int e = 0; e < 8; e++) acc[i][j][e] = 0.0f;
+
+#define MHP_STAGE(BUF, K0)                                                     \
+        do {                                                                  \
+            __local ushort *As_ = As + (size_t)(BUF) * MHP_TM * MHP_LDS;      \
+            __local ushort *Bs_ = Bs + (size_t)(BUF) * MHP_TN * MHP_LDS;      \
+            for (uint idx = lid; idx < MHP_TM * MHP_BK; idx += MHP_NTHREADS) {\
+                const uint m = idx / MHP_BK, kk = idx % MHP_BK;               \
+                const uint gr = row0 + m, gk = (K0) + kk;                     \
+                float v = (gr < M && gk < K) ? A[(size_t)gr * K + gk] : 0.f;  \
+                vstore_half(v, 0, (__local half *)&As_[m * MHP_LDS + kk]);    \
+            }                                                                 \
+            for (uint idx = lid; idx < MHP_TN * MHP_BK; idx += MHP_NTHREADS) {\
+                const uint n = idx / MHP_BK, kk = idx % MHP_BK;              \
+                const uint gk = (K0) + kk, gc = col0 + n;                     \
+                float v = (gk < K && gc < N) ? B[(size_t)gk * N + gc] : 0.f;  \
+                vstore_half(v, 0, (__local half *)&Bs_[n * MHP_LDS + kk]);    \
+            }                                                                 \
+        } while (0)
+
+#define MHP_COMPUTE(BUF)                                                       \
+        do {                                                                  \
+            __local ushort *As_ = As + (size_t)(BUF) * MHP_TM * MHP_LDS;      \
+            __local ushort *Bs_ = Bs + (size_t)(BUF) * MHP_TN * MHP_LDS;      \
+            for (uint ks = 0; ks < MHP_KSUB; ks++) {                          \
+                uint af[MHP_RF][8], bf[MHP_TNW][8];                            \
+                for (int i = 0; i < MHP_RF; i++)                              \
+                    MHP_LOAD_A(af[i], &As_[(wm*MHP_RF*16 + i*16)*MHP_LDS + ks*16], MHP_LDS); \
+                for (int j = 0; j < MHP_TNW; j++)                            \
+                    MHP_LOAD_B(bf[j], &Bs_[(wn*MHP_TNW*16 + j*16)*MHP_LDS + ks*16], MHP_LDS); \
+                for (int i = 0; i < MHP_RF; i++)                              \
+                    for (int j = 0; j < MHP_TNW; j++)                        \
+                        MHP_MMA(acc[i][j], af[i], bf[j]);                     \
+            }                                                                 \
+        } while (0)
+
+        uint buf = 0;
+        MHP_STAGE(0, 0);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint k0 = 0; k0 < K; k0 += MHP_BK) {
+            if (k0 + MHP_BK < K) MHP_STAGE(buf ^ 1u, k0 + MHP_BK);
+            MHP_COMPUTE(buf);
+            barrier(CLK_LOCAL_MEM_FENCE);
+            buf ^= 1u;
+        }
+#undef MHP_STAGE
+#undef MHP_COMPUTE
+
+        for (int i = 0; i < MHP_RF; i++)
+        for (int j = 0; j < MHP_TNW; j++) {
+            const uint gr0 = row0 + wm*MHP_RF*16 + i*16;
+            const uint gc0 = col0 + wn*MHP_TNW*16 + j*16;
+            for (int reg = 0; reg < 8; reg++) {
+                const uint r = (lane >> 2) + 8u * ((reg >> 1) & 1);
+                const uint c = (lane & 3) * 2 + (reg & 1) + 8u * (reg >> 2);
+                const uint gr = gr0 + r, gc = gc0 + c;
+                if (gr < M && gc < N) C[(size_t)gr * N + gc] = acc[i][j][reg];
+            }
+        }
+    }
+}
 #endif  /* VMO_NV_PTX */
