@@ -3054,3 +3054,52 @@ higher than §38 believed, and the bottleneck is now precisely characterized
 (halve the input bytes, not the MMA). **Reproduce:** `cd poc/17-nv-mma`,
 `make run-bench-mma` (mma.sync ties 92), `make run-bench-f16in` (107, `ACC=1` for
 accuracy), `make run-probe` (cp.async dead).
+
+## 40. CPU coverage + host-dispatch overhead: measured, and why we lose to XLA-CPU (2026-07-21)
+
+First full ours-on-PoCL vs native JAX-CPU run of the whole `tools/bench_suite`
+(`run_suite.py --cpu`, PoCL vs `JAX_PLATFORMS=cpu`, Ryzen 9 3900X 12c/24t, each in
+its own process). Scoreboard: `docs/workload-coverage-cpu.md`.
+
+- **Coverage 16/18** (fft = complex dtype; brax_step = platform allowlist). Same two
+  fails as NVIDIA; monte_carlo now PASSES on CPU too (§38 shift path). Correctness is
+  **f32-tight** — every passer clears `allclose(atol=rtol=1e-3)`, max rel ≤ 3e-3 (most
+  ≤ 1e-6). PoCL has no TF32, so this is the bit-honest backend.
+- **Perf: 0/16 reach ≤1× XLA-CPU.** Closest cnn 7.2×, layernorm 12×, attention 16×;
+  median **105×**; loop laggards spring_mass 4717×, hh_neuron 2656×, rk4 2311×,
+  logistic_map 1203×, heat2d 535×, gru 331×, lstm 189×.
+- ✅ **Instrument added: `PJRT_OCL_PHASE_STATS=1`** prints, per Execute, phases /
+  kernel-enqueues / seg-writes / drains(clFinish) from `LaunchHostDispatch`. Gated on
+  env, inert otherwise; runtime_test + region tests green.
+- ❌ **The per-phase `clFinish` is NOT the bottleneck — it is already fully batched.**
+  The seg-tab ring enqueues all phases back-to-back with ONE non-blocking write/group and
+  drains only at while-cond reads / ring-wrap(256) / end. logistic_map = 200 iters, **1
+  drain**. rk4 = 2501 phases, 10 drains, all pure ring-wrap; removing them saves nothing
+  (in-order queue is throughput-bound on the enqueues). "Batch phases between clFinish" is
+  exhausted.
+- ❌ **The wall is the per-phase kernel ENQUEUE — a fixed ~75–85 µs PoCL launch floor,
+  and it is neither grid- nor workgroup-count sensitive.** Barrier-free EW `fori_loop`:
+  ~78 µs/iter at B=256 vs ~86 µs/iter at B=65536 (256× data, launch still dominates).
+  logistic_map ~16 ms at `PJRT_OCL_VM_LANES`=2/4/8/24 alike. So `clEnqueueNDRangeKernel`
+  itself is the cost; the only lever is enqueue *count*. Two regimes in µs/enqueue:
+  loop laggards sit at the ~80 µs floor (enqueue-count-bound, `phases≈iters×body_phases`);
+  matmul graphs (transformer 4080, mlp 2800 µs/enq) are throughput-bound with few phases.
+- 🧭 **Thesis answered — the single-program design does NOT beat XLA-CPU on loops, and
+  can't here.** (1) XLA-CPU compiles the whole scan/loop to ONE native function → zero
+  per-op dispatch on the reference side, so our "avoid dispatch" edge is worth 0×. (2) Our
+  host-dispatch still pays a launch per phase because PoCL has no safe device barrier (a
+  phase boundary = a launch boundary), reintroducing exactly the per-op cost via the
+  portability fallback. The structural cut is **barrier elision for lane-local loops**
+  (§10a, designed, not built): a pure-elementwise carry (logistic_map, hh_neuron) has no
+  cross-lane flow → all body barriers are spurious → the whole `iters×body` phase stream
+  runs in ONE launch. Collapses logistic_map 201→1 enqueue (~10–100× local win) — but the
+  single-launch floor (~80 µs launch + readback + clFinish ≈ 150–200 µs) is still ~10×
+  XLA-CPU's 14 µs. Correctness-critical (mis-certified cross-lane loop races) ⇒ gated PoC,
+  not a default change. Neighbour stencils (spring_mass/heat2d) and matmul bodies
+  (lstm/gru) are NOT lane-local and get no benefit.
+- **Read:** on a 12-core CPU XLA-CPU runs most of these in single-digit-to-tens of µs —
+  below our single *launch* floor — so ≤1× is unreachable with host-dispatch regardless of
+  the enqueue-count fix. The bankable CPU result is correctness/coverage (16/18, f32-exact),
+  not perf. Perf work should target the enqueue-count fix only where it changes the
+  qualitative story (loop laggards from ~1000× to ~10×), not chase a win that the launch
+  floor forecloses.
