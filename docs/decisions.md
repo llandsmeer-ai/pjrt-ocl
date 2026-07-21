@@ -2361,3 +2361,94 @@ serial-block transformer it is a small win, not the frontier's payoff. Prologue
 (stage 4) deliberately NOT built this session: it targets the remaining 24 *even
 cheaper* LN-affine EW phases, so its e2e ceiling is below the epilogue's — not worth
 the strided-load risk until a flash-attention-class lever lands (§14a).
+
+## 35. NVIDIA cp.async multi-stage tensor-core matmul — cp.async is DEAD on this ICD; standalone tile clears the PoC gate but does NOT transfer to the megakernel (2026-07-21, poc/17)
+
+**Goal.** Close the matmul gap (in-megakernel TF32 ~18-20 TFLOP/s vs cuBLAS
+116-133, §31/§10d) with the one thing that requires leaving portable OpenCL: a
+cuBLAS-class WMMA tile — a **multi-stage register-blocked pipeline with
+`cp.async`** (async global→shared copy via inline PTX) so weight loads overlap
+tensor-core compute and the smem-bandwidth bottleneck (§31) is relieved.
+NVIDIA-only behind `VMO_NV_PTX`; portable path untouched. PoC-gated first
+(poc/17-nv-mma). Hardware: RTX PRO 6000 Blackwell (sm_120), driver 595.71.05.
+
+### RESULT 1 (the blocker): cp.async does not EXECUTE on this OpenCL ICD
+`poc/17/probe.c` — the driver **emits correct PTX** (dumped binary:
+`.target sm_120`, `.version 9.2`, literal `cp.async.cg.shared.global [%r1],[%rd2],16;`
++ `cp.async.commit_group; cp.async.wait_group 0;`), ptxas accepts it, the kernel
+runs — **but the async copy never delivers data.** Every completion form is WRONG
+(1024/1024 mismatch): `.cg`+`wait_group 0`, `.ca`, `+fence.proxy.async.shared::cta`,
+`wait_group`+200k-iter spin (rules out a wait-only bug), and
+`cp.async.mbarrier.arrive`+`mbarrier.try_wait`. The CONTROL — a **synchronous
+`st.shared` through the IDENTICAL `cvta.to.shared`-derived shared address** — is
+CORRECT (0 mismatch). So the shared-address mapping is fine and **cp.async itself
+is the broken primitive**: the NVIDIA *OpenCL* runtime does not wire up the
+Ampere+ async-copy unit (a CUDA-only path here). **The deep software pipeline
+cuBLAS-class GEMM needs cannot be built through OpenCL→PTX on this driver** — the
+§14a "the path can't express it, and here is the measurement" outcome.
+
+### RESULT 2: the WMMA ceiling WITHOUT cp.async (synchronous staging), standalone
+`poc/17/bench17` — standalone tf32 m16n16k8 tile (NO megakernel barrier, so free
+of the co-residency cap), best-of-7, warmed clocks:
+
+| tile | 2048³ TF/s | 4096³ TF/s |
+|------|-----------|-----------|
+| 64×64  1-buf (== in-megakernel tile shape) | 27.2 | 29.6 |
+| 128×64 2-buf | 37.7 | 46.2 |
+| **128×128 BK16 2-buf (the knee)** | **47.5** | **55.2** |
+| 128×128 BK32 2-buf | 25.1 | 30.7 |
+| 256×128 (any buf) | ~33 | ~38 |
+| cuBLAS | 116.5 | 133.3 |
+
+**The 128×128 synchronous double-buffered tile CLEARS the ≥40-60 gate at
+47.5/55.2 TF/s** (2.5-3× the in-megakernel tile). But the win is (a) tile
+**intensity** (128×128 register accumulator), not async staging — synchronous
+double-buffer (ILP overlap of `ld.global` with the tensor cores) is all that is
+available and it already helps (128×64: 1-buf 35.6 → 2-buf 46.2 at 4096); (b)
+**still ~2.4× under cuBLAS** (no 3-4 stage latency-hidden pipeline without
+cp.async; tf32 m16n16k8 is a smaller MMA than cuBLAS's; no smem swizzle beyond
+the §10d LDS pad).
+
+### RESULT 3: the standalone ceiling does NOT transfer into the megakernel
+`poc/17/mmbench.py` on the real plugin (`PJRT_OCL_MM_KERNEL=0`, matmul stays in
+the VM), reproduces §31 exactly:
+
+| in-megakernel matmul | 2048³ | 4096³ |
+|----------------------|-------|-------|
+| 64-tile (shipped default) | 19.3 | 17.4 |
+| 128×128 + pipe (`MEGA_BIGTILE`+`MEGA_PIPE`, §31) | 14.2 | 14.0 |
+
+The **identical 128×128 tile is 55 TF/s standalone but 14 in-megakernel.** The
+gap is entirely the megakernel structure: the cross-workgroup spin-barrier forces
+all lanes co-resident (the 64-accumulator tile crosses the 128-reg cliff → 188
+lanes, no oversubscription to hide latency, §27) and the whole-VM register budget
+is a max over every op path. A dedicated kernel pays none of this. cp.async was
+the sanctioned lever to relieve that latency/smem-BW bottleneck in-megakernel —
+and it does not work here.
+
+### DECISION (§14a): do NOT integrate, do NOT change the default; keep it honest
+- cp.async — the mechanism the whole thesis required — is **non-functional** on
+  this OpenCL ICD (RESULT 1).
+- Wiring the 128×128 tile into the megakernel is an **already-measured
+  regression** (§31, re-confirmed RESULT 3): 14 vs 19 TF/s and base e2e ~1.9×
+  worse, because its speed is a dedicated-kernel property the co-residency barrier
+  destroys.
+- The genuine remaining lever is the **hybrid split** (route the big
+  projection/FFN matmuls to a dedicated 128×128 TF32 kernel — poc/17's 55-TF/s
+  tile — while the persistent megakernel keeps every non-matmul phase). §10d
+  measured plain host-dispatch as overhead-bound (+12.5 ms/large); the hybrid
+  needs per-segment megakernel relaunch (arena persists → feasible) and a
+  batch-aware standalone kernel. Large architectural change, deferred — but poc/17
+  now supplies the standalone kernel it would dispatch to and its measured ceiling.
+
+**Portability + gates confirmed (nothing shipped touched — poc/17 is standalone):**
+default pytest **289 passed / 1 skipped**; `runtime_test` PASS; NVIDIA TF32
+`--check` tiny/small/base/large **PASS** (max_abs 1.3e-4…3.0e-3, TF32 tol);
+NVIDIA portable `MEGA_TC=0` f32-exact (max_abs 2.4e-6); PoCL portable f32-exact
+(7.2e-7). Default e2e unchanged: base 5.41 ms (gap 12.2× vs CUDA 0.44), large
+27.3 ms (gap 7.4× vs CUDA 3.67). **NOT merged — reported for review.**
+
+**Reproduce:** `cd poc/17-nv-mma && make && ./probe` (cp.async verdict) `&&
+./bench17` (standalone ceiling); `JAX_PLATFORMS=opencl PJRT_OCL_MM_KERNEL=0
+python mmbench.py 4096` (in-megakernel; add `PJRT_OCL_MEGA_BIGTILE=1
+PJRT_OCL_MEGA_PIPE=1 PJRT_OCL_MMA_T=128` for the big tile).
