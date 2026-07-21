@@ -1433,12 +1433,8 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       }
       n_write++;
       cl_kernel k = rt_->vm_seg_kernel();
-<<<<<<< HEAD
       size_t lsz = seg_lsz_, gsz = size_t{n} * lsz;
-=======
-      size_t lsz = 256, gsz = size_t{n} * lsz;
       n_kenq += staged;
->>>>>>> worktree-wf_cf11f3b6-849-3
       for (uint32_t i = 0; i < staged; ++i) {
         const cl_uint seg_base = (ring + i) * n;  // uint2 index of the slot
         clSetKernelArg(k, 5 + kNIoPorts, sizeof(seg_base), &seg_base);
