@@ -149,8 +149,20 @@ class OclRuntime {
   // (mm_fp16()) — it narrows the staged A/B inputs to fp16 (max_normal ~65504),
   // fine for normalized activations; the f32 accumulator is unchanged.
   cl_kernel mm_tc_fp16_kernel() const { return mm_tc_fp16_kernel_; }
+  // §39 fp16-INPUT tile: reads A/B pre-packed as fp16 from device scratch (half
+  // the staging bytes of the f32-arena mm_tc_fp16) + its f32->fp16 pack kernel.
+  // ~107/76 TF/s @4096/2048 vs mm_tc_fp16's ~85/67. Same NV_PTX program.
+  cl_kernel mm_tc_fp16p_kernel() const { return mm_tc_fp16p_kernel_; }
+  cl_kernel pack_f16_kernel() const { return pack_f16_kernel_; }
   // True when PJRT_OCL_MM_FP16=1 AND the fp16 WMMA kernel built (GPU/NV_PTX).
   bool mm_fp16() const { return mm_fp16_ && mm_tc_fp16_kernel_; }
+  // True when the §39 packed fp16 path (pack + fp16-input tile) should be used:
+  // mm_fp16() enabled, both kernels built, and not disabled via
+  // PJRT_OCL_MM_FP16_PACK=0 (kept as an A/B escape hatch to the f32-arena tile).
+  bool mm_fp16_pack() const {
+    return mm_fp16() && mm_tc_fp16p_kernel_ && pack_f16_kernel_ &&
+           mm_fp16_pack_;
+  }
   cl_kernel gemv_kernel() const { return gemv_kernel_; }
   // CPU-only (VMO_CPU_TILES builds; null on GPU): packed+blocked SGEMM.
   cl_kernel mm_pack_kernel() const { return mm_pack_kernel_; }
@@ -198,6 +210,16 @@ class OclRuntime {
   // persistent spin-barrier deadlocks (imbalance-starvation, docs/decisions.md
   // #1 / poc/07); OFF for GPUs. Overridable via PJRT_OCL_ENGINE=host|mega|auto.
   bool host_dispatch() const { return host_dispatch_; }
+  // True when host-dispatch was forced SOLELY by PJRT_OCL_MM_HYBRID on a GPU
+  // that can also run the megakernel (fence + vm kernel). Such programs may fall
+  // back to the (faster on small/latency-bound work) megakernel per-program when
+  // they contain no routable big-matmul phase — otherwise HYBRID's host-dispatch
+  // penalty regresses matmul-light programs (e.g. transformer base 5.4->8.3 ms).
+  bool hybrid_forces_hd() const { return hybrid_forces_hd_; }
+  bool can_use_megakernel() const {
+    return info_.is_gpu && info_.has_device_fence &&
+           (vm_tc_kernel_ || vm_kernel_);
+  }
   // True for OpenCL GPU devices. Matmul launch GEOMETRY keys on this (not on
   // host_dispatch): the mm2 kernel is correct only under its GPU tiled
   // geometry on a GPU, so a fence-less GPU that runs the host EW engine must
@@ -252,7 +274,10 @@ class OclRuntime {
   cl_kernel mm_kernel_ = nullptr;      // standalone SGEMM (pure-matmul fast path)
   cl_kernel mm_tc_kernel_ = nullptr;   // §36 standalone TF32 WMMA (NV_PTX only)
   cl_kernel mm_tc_fp16_kernel_ = nullptr;  // §38 standalone fp16 WMMA (NV_PTX only)
+  cl_kernel mm_tc_fp16p_kernel_ = nullptr; // §39 fp16-INPUT WMMA (packed scratch)
+  cl_kernel pack_f16_kernel_ = nullptr;    // §39 f32->fp16 pack for the above
   bool mm_fp16_ = false;               // PJRT_OCL_MM_FP16=1: prefer fp16 WMMA
+  bool mm_fp16_pack_ = false;          // PJRT_OCL_MM_FP16_PACK=1 enables §39 (wash)
   cl_kernel gemv_kernel_ = nullptr;    // width-1 matmul (both device classes)
   cl_kernel mm_pack_kernel_ = nullptr;    // CPU only: B panel packing
   cl_kernel mm_packed_kernel_ = nullptr;  // CPU only: packed 6x16 KC-swept
@@ -267,6 +292,7 @@ class OclRuntime {
   size_t local_size_ = 64;
   size_t seg_lsz_ = 256;   // host-dispatch tile work-group size (CPU: see seg_lsz())
   bool host_dispatch_ = false;
+  bool hybrid_forces_hd_ = false;  // host-dispatch forced only by MM_HYBRID
   std::mutex mu_;  // serializes execute (single in-order queue)
   std::mutex pool_mu_;
   std::unordered_map<size_t, std::vector<cl_mem>> buf_pool_;
@@ -321,11 +347,23 @@ class LoadedProgram {
   bool EnqueuePackedMM(cl_command_queue q, uint32_t M, uint32_t N, uint32_t K,
                        uint32_t dst, uint32_t a, uint32_t bh, cl_mem bp,
                        uint32_t p6, uint32_t p7, std::string* err);
+  // §39 fp16-INPUT matmul: pack A(MxK)/B(KxN) f32->fp16 into device scratch with
+  // padded leading dims (mm_f16a_/mm_f16b_, grown lazily), then run the
+  // fp16-input WMMA tile. Halves staging bytes (~107 vs ~85 TF/s @4096) and pads
+  // to break the power-of-2 (K=2048) cache aliasing that dips the f32-arena tile.
+  bool EnqueueFp16Matmul(cl_command_queue q, uint32_t M, uint32_t N, uint32_t K,
+                         uint32_t dst, uint32_t ah, uint32_t bh,
+                         std::string* err);
   // Trace mode: lazily creates the per-lane profiling queues (one per lane so
   // lanes run concurrently, like workgroups of one launch do).
   bool EnsureTraceQueues(std::string* err);
   OclRuntime* rt_ = nullptr;  // borrowed; client outlives executables
   VmProgram prog_;
+  // Per-program engine: normally == rt_->host_dispatch(), but a program that
+  // HYBRID forced onto host-dispatch yet has NO routable big-matmul phase falls
+  // back to the megakernel (host-dispatch's per-phase penalty would otherwise
+  // regress matmul-light programs). Computed at load; see the load body.
+  bool host_dispatch_ = false;
   size_t seg_lsz_ = 256;      // per-program host-dispatch lsz (see seg_lsz())
   // §36 hybrid: tasks with dst/a/b patched to arena byte-offsets / port handles
   // (prog_.tasks keeps raw buffer ids). The mm_tc dispatch needs the patched
@@ -346,6 +384,13 @@ class LoadedProgram {
   // is safe). Sized at load time to the largest routable matmul's K*N.
   cl_mem hy_bp_ = nullptr;
   size_t hy_bp_bytes_ = 0;
+  // §39 fp16-input matmul scratch: A packed as fp16 (M x lda) and B (K x ldb).
+  // Grown lazily to the largest matmul seen; reused across the program (in-order
+  // queue serializes pack -> tile -> next). Released with the program.
+  cl_mem mm_f16a_ = nullptr;
+  size_t mm_f16a_bytes_ = 0;
+  cl_mem mm_f16b_ = nullptr;
+  size_t mm_f16b_bytes_ = 0;
   std::vector<cl_command_queue> trace_queues_;  // trace mode, one per lane
 
   // Zero-copy I/O ports (docs/decisions.md): up to kNIoPorts input/output
