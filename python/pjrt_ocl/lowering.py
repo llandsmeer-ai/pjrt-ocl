@@ -249,6 +249,11 @@ class Instr:
     # itself lives in the (serialized) aux pool and the kernel finds it via p6.
     epi: int = 0        # epilogue descriptor aux word-offset (+1; 0 = none)
     epi_res: int = 0    # epilogue second-input (residual/bias) buffer id
+    # OP_MAP_REGION multi-input handles (§28 follow-up): the FULL ordered list of
+    # region input buffer ids (len ≤ 8). Rides task fields a,b,p2..p7 (all
+    # loader-patched). NOT serialized: the scheduler reads it in-memory to build
+    # the task + its dependency read-set; the tensor validator reads it too.
+    region_inputs: tuple = ()
 
 
 def _pad8(out: bytearray) -> None:
@@ -1647,6 +1652,8 @@ _REGION_KIND = {
 # Kernel per-thread slot budget (ops/region.cl REGION_NSLOTS). The recognizer's
 # budget may be set lower via env to force the over-budget split in tests.
 _REGION_NSLOTS = 8
+# Max region inputs (ops/region.cl REGION_MAXIN): a, b, p2..p7 task fields.
+_REGION_MAXIN = 8
 
 
 def _region_budget() -> int:
@@ -1757,6 +1764,50 @@ def _region_phase_map(ctx: _Ctx, main_len: int) -> dict[int, int]:
     return tphase
 
 
+def _region_phase_map_scoped(ctx: _Ctx, main_len: int) -> dict[int, int]:
+    """Like _region_phase_map, but also phases every loop-body sub-list so
+    region fusion can fire INSIDE a while/for body (§28's "next step": the
+    laggard scan/loop workloads run a long serial per-iteration EW chain that
+    never leaves the body sub-range, so root-only fusion never sees it).
+
+    Each scope (root + every FOR/WHILE body, nested included) is phased with the
+    SAME scheduler `_build_levels` that drives the barrier layout, then given a
+    DISJOINT phase-number band so the within-phase gate in _fuse_region can only
+    connect ops that are co-scheduled in ONE barrier phase of the SAME sub-list
+    — never a root op to a body op, never across two bodies. Loop carries stay
+    excluded by the global multi-writer test in _fuse_region (a carry is written
+    by its root init-copy AND its body commit ⇒ multi ⇒ never a region member or
+    the fused read's definition), so a region only ever produces fresh in-body
+    SSA temporaries and reads carries/inputs read-only — the previous iteration's
+    value, exactly as the decomposed chain does."""
+    from . import scheduler as S
+
+    class _PV:
+        pass
+    pv = _PV()
+    pv.instrs = ctx.instrs
+    pv.buffers = ctx.buffers
+    pv.main_len = main_len
+    sc = S._Scheduler(pv, S.DeviceConfig.from_env(), 1)
+    tphase: dict[int, int] = {}
+    base = 0
+
+    def _do(indices: list[int]) -> None:
+        nonlocal base
+        levels = sc._build_levels(indices)
+        for ph, (kind, payload) in enumerate(levels):
+            if kind == "compute":
+                for idx in payload:
+                    tphase[idx] = base + ph
+        base += len(levels) + 1          # disjoint band per scope
+
+    _do(list(range(main_len)))
+    for ins in ctx.instrs:
+        if ins.op in (OP_FOR, OP_WHILE) and ins.imm:
+            _do(list(range(ins.n, ins.n + ins.imm)))
+    return tphase
+
+
 def _fuse_region(ctx: _Ctx, main_len: int) -> None:
     """Recognize maximal map-regions — WITHIN-PHASE connected runs of pure-map
     f32 EW ops (elementwise + affine) bounded by cross-lane ops and the
@@ -1777,7 +1828,31 @@ def _fuse_region(ctx: _Ctx, main_len: int) -> None:
     instrs = ctx.instrs
     outs = set(ctx.outputs)
     budget = _region_budget()
-    phase = _region_phase_map(ctx, main_len)
+    # PJRT_OCL_FUSE_REGION_LOOP (default on): also fuse inside while/for bodies —
+    # the serial per-iteration EW chains of scan/loop workloads live in the body
+    # sub-range and root-only fusion never reaches them (§28 follow-up).
+    loop_fuse = os.environ.get("PJRT_OCL_FUSE_REGION_LOOP", "1") != "0"
+    if not loop_fuse:
+        phase = _region_phase_map(ctx, main_len)
+    else:
+        phase = _region_phase_map_scoped(ctx, main_len)
+    # Loop-body index ranges. A region inside a body is barrier-ISOLATED (a
+    # map-region is a phase boundary), so it only pays off when it collapses a
+    # LONG lane-local chain — a body's whole EW chain runs in one barrier-free
+    # phase, and replacing a short run of it with a region that needs its own
+    # phase can add barriers for little op-count win (rk4's 3–7-op cones). Gate
+    # loop-body cones on a minimum size; the root has no such penalty (its
+    # regions sit between shaped-op phase boundaries that exist anyway) and is
+    # ungated. PJRT_OCL_REGION_LOOP_MIN overrides the threshold.
+    body_ranges = [(ins.n, ins.n + ins.imm) for ins in instrs
+                   if ins.op in (OP_FOR, OP_WHILE) and ins.imm] if loop_fuse else []
+    try:
+        loop_min = int(os.environ.get("PJRT_OCL_REGION_LOOP_MIN", "8"))
+    except ValueError:
+        loop_min = 8
+
+    def _in_loop_body(idx: int) -> bool:
+        return any(lo <= idx < hi for lo, hi in body_ranges)
 
     # unique writer of each buffer (multi-write buffers, e.g. loop carries, are
     # excluded from regions — the fused reads must see one definition).
@@ -1841,24 +1916,89 @@ def _fuse_region(ctx: _Ctx, main_len: int) -> None:
                     readers_out[b] = readers_out.get(b, 0) + 1
         live_outs = [m for m in members
                      if instrs[m].dst in outs or readers_out.get(instrs[m].dst)]
-        live_bufs = {instrs[m].dst for m in live_outs}
-        if len(live_bufs) != 1:
-            continue                              # single-output v1 gate
-        out_buf = next(iter(live_bufs))
-        subregions = _split_region(instrs, members, out_buf, budget)
-        if subregions is None:
-            continue                              # can't fit/split → leave decomposed
-        # a split into only singletons replaces plain EW ops with regions 1:1 —
-        # no phase/round-trip win; leave the decomposed chain untouched.
-        if max(len(s) for s, _ in subregions) < 2:
-            continue
-        for sub_members, sub_out in subregions:
-            _emit_region(ctx, sub_members, sub_out)
+        live_dsts = {instrs[m].dst for m in live_outs}
+        # ROOT regions keep the pre-existing behavior (single live output, ≤2
+        # inputs) so tuned root scheduling is byte-unchanged. LOOP-BODY regions
+        # (§28 follow-up) get the new lever: split a multi-output connected
+        # component into one single-output sub-region per live output = its
+        # backward fan-in cone (stopping at — and reading as inputs — other live
+        # outputs and members SHARED by ≥2 cones, which stay decomposed). Every
+        # emitted region still has ONE writer/output, so the scheduler/arena/
+        # liveness are untouched; up to REGION_MAXIN inputs let a carry's whole
+        # rate chain collapse (HH neuron's new_m/new_h/new_n/new_V).
+        in_body = _in_loop_body(members[0])
+        maxin = _REGION_MAXIN if in_body else 2
+        if in_body:
+            cones = _output_cones(instrs, members, mset, produced, live_dsts)
+        elif len(live_dsts) == 1:
+            cones = [(members, next(iter(live_dsts)))]
+        else:
+            continue                              # root single-output gate
+        for cone_members, out_buf in cones:
+            if len(cone_members) < 2:
+                continue
+            # loop-body cones must be long enough to earn their barrier phase.
+            if in_body and len(cone_members) < loop_min:
+                continue
+            subregions = _split_region(instrs, cone_members, out_buf, budget, maxin)
+            if subregions is None:
+                continue                          # can't fit/split → decomposed
+            # a split into only singletons replaces plain EW ops with regions
+            # 1:1 — no phase/round-trip win; leave that cone decomposed.
+            if max(len(s) for s, _ in subregions) < 2:
+                continue
+            for sub_members, sub_out in subregions:
+                _emit_region(ctx, sub_members, sub_out)
 
 
-def _split_region(instrs, members: list[int], out_buf: int, budget: int):
+def _output_cones(instrs, members: list[int], mset: set, produced: set,
+                  live_dsts: set):
+    """Split a connected map-region component into one single-output sub-region
+    per live output. Each is the output's backward fan-in cone within the
+    component, stopping at (reading as inputs) other live outputs and any member
+    SHARED by ≥2 output cones. Shared members stay decomposed EW ops producing
+    real buffers, so every emitted region has exactly one writer/output — the
+    scheduler/arena/liveness never see a multi-write. Returns [(cone_members
+    (SSA order), out_buf), ...]."""
+    dstof = {instrs[m].dst: m for m in members}   # unique writer within comp
+    live_out_members = [m for m in members if instrs[m].dst in live_dsts]
+
+    def cone_of(om: int, stop_dsts: set) -> set:
+        seen: set = set()
+        stack = [om]
+        while stack:
+            m = stack.pop()
+            if m in seen:
+                continue
+            seen.add(m)
+            for b in _region_operands(instrs[m]):
+                if b in produced and b not in stop_dsts:
+                    w = dstof.get(b)
+                    if w is not None and w in mset and w != m:
+                        stack.append(w)
+        return seen
+
+    # raw cones (stop only at OTHER live outputs) to find shared members
+    fanin: dict[int, int] = {}
+    for om in live_out_members:
+        O = instrs[om].dst
+        for m in cone_of(om, live_dsts - {O}):
+            fanin[m] = fanin.get(m, 0) + 1
+    shared = {instrs[m].dst for m, c in fanin.items()
+              if c > 1 and instrs[m].dst not in live_dsts}
+
+    result = []
+    for om in sorted(live_out_members):
+        O = instrs[om].dst
+        cm = sorted(cone_of(om, (live_dsts - {O}) | shared))
+        result.append((cm, O))
+    return result
+
+
+def _split_region(instrs, members: list[int], out_buf: int, budget: int,
+                  maxin: int = 2):
     """Partition `members` (SSA order) into consecutive single-output sub-regions
-    each ≤2 inputs / ≤budget slots. Returns [(sub_members, out_buf), ...] in
+    each ≤maxin inputs / ≤budget slots. Returns [(sub_members, out_buf), ...] in
     order, or None if it cannot be split cleanly (→ fall back to decomposed).
     A sub-region's output is the member whose dst is read outside the sub-region
     (later members or externally); a clean cut needs exactly one such value."""
@@ -1888,7 +2028,7 @@ def _split_region(instrs, members: list[int], out_buf: int, budget: int):
         trial = cur + [m]
         _, inputs = analyze(trial)
         slot = _region_slots(trial, instrs, inputs, out_buf)
-        fits = len(inputs) <= 2 and slot is not None
+        fits = len(inputs) <= maxin and slot is not None
         if fits:
             cur = trial
             continue
@@ -1901,7 +2041,8 @@ def _split_region(instrs, members: list[int], out_buf: int, budget: int):
         produced_here.add(cut[1])
         cur = [m]
         _, inputs = analyze(cur)
-        if len(inputs) > 2 or _region_slots(cur, instrs, inputs, out_buf) is None:
+        if (len(inputs) > maxin
+                or _region_slots(cur, instrs, inputs, out_buf) is None):
             return None
     if cur:
         subs.append((cur, out_buf))
@@ -1931,7 +2072,8 @@ def _finalize_sub(instrs, sub: list[int], members: list[int], next_i: int,
 def _emit_region(ctx: _Ctx, members: list[int], out_buf: int) -> None:
     """Encode one single-output sub-region into the aux pool + emit OP_MAP_REGION
     at the output-producing member's index; NOP the rest. members: SSA order,
-    ≤2 external inputs, fits the slot budget (guaranteed by _split_region)."""
+    ≤REGION_MAXIN external inputs, fits the slot budget (guaranteed by
+    _split_region). Inputs ride task fields a,b,p2..p7 (region_inputs, ordered)."""
     instrs = ctx.instrs
     produced = {instrs[m].dst for m in members}
     inputs: list[int] = []
@@ -1942,16 +2084,14 @@ def _emit_region(ctx: _Ctx, members: list[int], out_buf: int) -> None:
                 seen.add(b)
                 inputs.append(b)
     slot = _region_slots(members, instrs, inputs, out_buf)
-    assert slot is not None and len(inputs) <= 2
+    assert slot is not None and len(inputs) <= _REGION_MAXIN
 
-    in0 = inputs[0]
-    in1 = inputs[1] if len(inputs) == 2 else None
     n = instrs[members[0]].n
-    # descriptor: [in0_slot, in1_slot, n_micro, out_slot] + n_micro×6 words
-    desc = [slot[in0],
-            slot[in1] if in1 is not None else _REGION_NONE,
-            len(members),
-            slot[out_buf]]
+    # descriptor: [n_in, out_slot, n_micro, in_slot×n_in] + n_micro×6 words
+    #   + in_handle×n_in (buffer ids, for the tensor validator after re-parse;
+    #   the device/schedule-sim read the handles from the task's a,b,p2..p7).
+    desc = [len(inputs), slot[out_buf], len(members)]
+    desc += [slot[b] for b in inputs]
     for m in members:
         ins = instrs[m]
         kind, arity = _REGION_KIND[ins.op]
@@ -1966,14 +2106,16 @@ def _emit_region(ctx: _Ctx, members: list[int], out_buf: int) -> None:
             b_slot = a_slot
             s_bits, t_bits = 0, 0
         desc += [kind, slot[ins.dst], a_slot, b_slot, s_bits, t_bits]
+    desc += list(inputs)                 # trailing input handles (validator a)
     aux_off = ctx.add_aux(desc)
 
     out_idx = max(m for m in members if instrs[m].dst == out_buf)
-    b_field = in1 if in1 is not None else in0
+    in0 = inputs[0]
+    b_field = inputs[1] if len(inputs) >= 2 else in0
     for m in members:
         instrs[m] = Instr(OP_NOP)
     instrs[out_idx] = Instr(OP_MAP_REGION, dst=out_buf, a=in0, b=b_field, n=n,
-                            aux=aux_off)
+                            aux=aux_off, region_inputs=tuple(inputs))
 
 
 def _fuse_matmul_views(ctx: _Ctx) -> None:

@@ -33,6 +33,9 @@ stablehlo.gather → embedding_softmax PASS.)*
 | spring_mass | PHYS | PASS | 3.513 | 1.110 | 3.16x | close (0.0e+00) | spring-mass chain (brax analogue, scan) |
 | hh_neuron | PHYS | PASS | 15.321 | 1.292 | 11.86x | close (1.3e-04) | Hodgkin-Huxley neuron (jaxley analogue, scan) |
 | brax_step | PHYS | **FAIL** | - | 0.309 | - | - | `jax-threefry-ui32-verifier` — §41: layer-1 MJX device allowlist bypassed + layer-2 sdy dialect FIXED; now blocked by a JAX-internal opencl-platform threefry lowering bug (`@_threefry_split` ui32 vs i32 in combined reset+step; CPU/CUDA lower fine). mjx physics also needs reduce-and / scatter / erf_inv (cuda: PASS) |
+| spring_mass | PHYS | PASS | 3.048 | 1.120 | 2.72x | close (0.0e+00) | spring-mass chain (brax analogue, scan) — §41 loop-body region fusion (scan body 15-op cone → 1 region) |
+| hh_neuron | PHYS | PASS | 4.970 | 1.285 | 3.87x | close (1.3e-04) | Hodgkin-Huxley neuron (jaxley analogue, scan) — §41 multi-input loop-body region fusion (body 78→14 ops; was 11.86x) |
+| brax_step | PHYS | **FAIL** | - | 0.309 | - | - | `platform-allowlist` — host lib rejects OpenCL PJRT platform (device allowlist) (cuda: PASS); brax inverted_pendulum reset+step (real env); step HLO also needs gather/scatter/case/atan |
 
 ## Ranked missing-op priority (M3 test-driven order)
 
