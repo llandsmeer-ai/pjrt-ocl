@@ -400,7 +400,8 @@ static void vmo_ew_tile_i32(__global uchar *arena, __global uchar **iop, const t
     __global const int *a = AP(const int, t.a), *b = AP(const int, t.b);
     if (sub == SUB_FILL) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (int)t.p2; return; }
     if (sub == SUB_IOTA_FLAT) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (int)i; return; }
-    const int needs_y = (sub <= SUB_POW) || sub == SUB_AND || sub == SUB_OR || sub == SUB_XOR;
+    const int needs_y = (sub <= SUB_POW) || sub == SUB_AND || sub == SUB_OR || sub == SUB_XOR
+                        || sub == SUB_SHL || sub == SUB_SHR_L || sub == SUB_SHR_A;
     for (uint i = lo + lid; i < hi; i += lsz) {
         const int x = a[i], y = needs_y ? b[i] : 0;
         int r;
@@ -413,6 +414,48 @@ static void vmo_ew_tile_i32(__global uchar *arena, __global uchar **iop, const t
         case SUB_SIGN: r = x > 0 ? 1 : (x < 0 ? -1 : 0); break;
         case SUB_AND: r = x & y; break;   case SUB_OR: r = x | y; break;
         case SUB_XOR: r = x ^ y; break;   case SUB_NOT: r = ~x; break;
+        /* Shifts: mask count to 31 (C/OpenCL leave count>=width undefined; jax
+         * threefry only shifts by <32 anyway, but the mask keeps it defined).
+         * SHR_L is logical via the unsigned view; SHR_A is arithmetic. */
+        case SUB_SHL:   r = (int)((uint)x << ((uint)y & 31u)); break;
+        case SUB_SHR_L: r = (int)((uint)x >> ((uint)y & 31u)); break;
+        case SUB_SHR_A: r = x >> (y & 31); break;
+        default: r = x; break;
+        }
+        d[i] = r;
+    }
+}
+
+/* int64/uint64 (8-byte) elementwise. Mirrors vmo_ew_tile_i32 on `long`. The
+ * threefry RNG counter is ui64 (iota -> multiply -> shift_right_logical by 32 ->
+ * convert to ui32), so this path must exist for jax.random. Shifts mask the
+ * count to 63; SHR_L is logical (unsigned view), SHR_A arithmetic. */
+static void vmo_ew_tile_i64(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
+                        uint lid, uint lsz)
+{
+    const uint sub = t.p0, n = t.p1;
+    const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
+    __global long *d = AP(long, t.dst);
+    __global const long *a = AP(const long, t.a), *b = AP(const long, t.b);
+    if (sub == SUB_FILL) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (long)(int)t.p2; return; }
+    if (sub == SUB_IOTA_FLAT) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (long)i; return; }
+    const int needs_y = (sub <= SUB_POW) || sub == SUB_AND || sub == SUB_OR || sub == SUB_XOR
+                        || sub == SUB_SHL || sub == SUB_SHR_L || sub == SUB_SHR_A;
+    for (uint i = lo + lid; i < hi; i += lsz) {
+        const long x = a[i], y = needs_y ? b[i] : 0;
+        long r;
+        switch (sub) {
+        case SUB_ADD: r = x + y; break;   case SUB_MUL: r = x * y; break;
+        case SUB_SUB: r = x - y; break;   case SUB_DIV: r = y ? x / y : 0; break;
+        case SUB_MAX: r = max(x, y); break; case SUB_MIN: r = min(x, y); break;
+        case SUB_COPY: r = x; break;      case SUB_NEG: r = -x; break;
+        case SUB_ABS: r = abs(x); break;
+        case SUB_SIGN: r = x > 0 ? 1 : (x < 0 ? -1 : 0); break;
+        case SUB_AND: r = x & y; break;   case SUB_OR: r = x | y; break;
+        case SUB_XOR: r = x ^ y; break;   case SUB_NOT: r = ~x; break;
+        case SUB_SHL:   r = (long)((ulong)x << ((ulong)y & 63u)); break;
+        case SUB_SHR_L: r = (long)((ulong)x >> ((ulong)y & 63u)); break;
+        case SUB_SHR_A: r = x >> (y & 63); break;
         default: r = x; break;
         }
         d[i] = r;
@@ -491,6 +534,25 @@ static void vmo_convert_tile(__global uchar *arena, __global uchar **iop, const 
 {
     const uint n = t.p1;
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
+    /* Integer-only conversions between i64 and i32/u32 go through `long` (not the
+     * double intermediate below), so truncation keeps the exact low 32 bits even
+     * when the value exceeds 2^53 — required by threefry's ui64->ui32 word split.
+     * Widening i32/u32->i64 sign/zero-extends per the signless-int convention. */
+    const int a_is_i64 = (adt == DT_I64);
+    const int d_is_i64 = (dt == DT_I64);
+    const int a_is_i32 = (adt == DT_I32 || adt == DT_U32 || adt == DT_BOOL);
+    const int d_is_i32 = (dt == DT_I32 || dt == DT_U32);
+    if ((a_is_i64 || a_is_i32) && (d_is_i64 || d_is_i32)) {
+        for (uint i = lo + lid; i < hi; i += lsz) {
+            long v = a_is_i64 ? AP(const long, t.a)[i]
+                   : (adt == DT_U32) ? (long)(uint)AP(const int, t.a)[i]
+                   : (adt == DT_BOOL) ? (long)AP(const uchar, t.a)[i]
+                   : (long)AP(const int, t.a)[i];
+            if (d_is_i64) AP(long, t.dst)[i] = v;
+            else          AP(int, t.dst)[i] = (int)v;   /* low 32 bits */
+        }
+        return;
+    }
     for (uint i = lo + lid; i < hi; i += lsz) {
 #ifdef cl_khr_fp64
         double v;
@@ -584,6 +646,7 @@ static void vmo_ew_tile(__global uchar *arena, __global uchar **iop,
     if (t.p0 == SUB_ISFINITE) { vmo_isfinite_tile(arena, iop, t, tile, adt, lid, lsz); return; }
     switch (dt) {
     case DT_I32: case DT_U32: vmo_ew_tile_i32(arena, iop, t, tile, lid, lsz); break;
+    case DT_I64:              vmo_ew_tile_i64(arena, iop, t, tile, lid, lsz); break;
     case DT_BOOL:             vmo_ew_tile_bool(arena, iop, t, tile, lid, lsz); break;
     case DT_F16:              vmo_ew_tile_f16(arena, iop, t, tile, lid, lsz); break;
     case DT_BF16:             vmo_ew_tile_bf16(arena, iop, t, tile, lid, lsz); break;

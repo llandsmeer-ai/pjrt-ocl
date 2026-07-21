@@ -78,6 +78,11 @@ SUB_XOR = 37
 SUB_NOT = 38
 # Mixed dtype: float operand -> bool result (own dispatch, like SUB_CMP):
 SUB_ISFINITE = 39
+# Integer shifts (i32/u32; own dispatch in ew_tile_i32, appended after SUB_GELU
+# in vm_common.cl's enum — value 42/43/44). threefry RNG uses SHL and SHR_L.
+SUB_SHL = 42
+SUB_SHR_L = 43
+SUB_SHR_A = 44
 
 # predicate ints, matching OP_CMP_F32's documented convention and vm2.cl's
 # SUB_CMP switch on t.p2 (0 EQ,1 NE,2 LT,3 LE,4 GT, default(5) GE).
@@ -180,6 +185,31 @@ def _logical_not(x):
     return np.bitwise_not(x)
 
 
+# Integer shifts. Operands and result share dtype (i32 or u32 for threefry).
+# The count is masked to 31 so it matches the device (ops/ew.cl masks `& 31`),
+# keeping counts >= width well-defined on both sides. Result dtype is preserved.
+_UWIDTH = {np.dtype("int32"): np.uint32, np.dtype("uint32"): np.uint32,
+           np.dtype("int64"): np.uint64, np.dtype("uint64"): np.uint64}
+
+
+def _shift_left(x, y):
+    uw = _UWIDTH[x.dtype]
+    cnt = (y.astype(uw) & uw(31))
+    return (x.astype(uw) << cnt).astype(x.dtype)
+
+
+def _shift_right_logical(x, y):
+    uw = _UWIDTH[x.dtype]
+    cnt = (y.astype(uw) & uw(31))
+    return (x.astype(uw) >> cnt).astype(x.dtype)
+
+
+def _shift_right_arithmetic(x, y):
+    # arithmetic (sign-propagating) shift on the signed view, count masked to 31
+    cnt = (y.astype(np.int32) & np.int32(31))
+    return (x.astype(np.int32) >> cnt).astype(x.dtype)
+
+
 _BINOPS = [
     ("stablehlo.divide", L.OP_DIV_F32, SUB_DIV, np.divide),
     ("stablehlo.maximum", L.OP_MAX_F32, SUB_MAX, np.maximum),
@@ -196,6 +226,12 @@ _BINOPS = [
     ("stablehlo.and", L.OP_AND, SUB_AND, np.bitwise_and),
     ("stablehlo.or", L.OP_OR, SUB_OR, np.bitwise_or),
     ("stablehlo.xor", L.OP_XOR, SUB_XOR, np.bitwise_xor),
+    # integer shifts (i32/u32); threefry2x32 RNG uses shift_left|shift_right_logical
+    ("stablehlo.shift_left", L.OP_SHL, SUB_SHL, _shift_left),
+    ("stablehlo.shift_right_logical", L.OP_SHR_L, SUB_SHR_L,
+     _shift_right_logical),
+    ("stablehlo.shift_right_arithmetic", L.OP_SHR_A, SUB_SHR_A,
+     _shift_right_arithmetic),
 ]
 
 _UNOPS = [
