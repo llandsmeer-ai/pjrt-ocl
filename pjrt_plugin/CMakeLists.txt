@@ -20,6 +20,7 @@ set(VM_CL_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/scatter.cl
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/dynslice.cl
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/reduce_window.cl
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/conv.cl
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/region.cl
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops/attention.cl
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vm_main.cl)

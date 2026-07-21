@@ -2927,3 +2927,50 @@ fp8 (4× rate) remains unusable (3–4-bit mantissa breaks the tf32-exact contra
 **Reproduce:** `PJRT_OCL_MM_FP16=1 PJRT_OCL_MM_HYBRID=1` on
 `tools/bench_transformer.py --config {base,large} [--check]` and the pure `x@y`
 fast path; A/B against the same commands without `PJRT_OCL_MM_FP16`.
+## 39. stablehlo.convolution — direct N-D conv (OP_CONV / TILE_CONV) — cnn unlocked (2026-07-21)
+
+The last big AI coverage gap from the §37 survey (ranked missing-op #2 after the §38
+reduce work): `stablehlo.convolution` (cnn workload — conv2d+relu+global-avg-pool, the
+flax `nn.Conv` idiom). No conv at all before this; the loader raised
+LoweringError("unsupported op").
+
+**What/why chosen — direct conv tile op, not im2col.** Two routes were on the table:
+(a) im2col — materialize a [B·OH·OW, KH·KW·Cin] patch matrix via gather + reshape and
+call the existing tuned OP_DOT; (b) a direct conv tile op that grid-strides the output
+and accumulates the window inline. Chose **(b)**: it mirrors the existing
+`reduce_window` (pooling) op almost exactly (same aux layout style, same EW-style output
+tiling, one new opcode + one small kernel), needs **no** big intermediate arena buffer,
+and is entirely self-contained (no interaction with the MMA fast-paths / view-fusion
+machinery). im2col would have been faster on large-channel convs (routes into TF32
+matmul) but pulls in a materialization pass and a much larger blast radius — deferred as
+a future perf lever if a conv-heavy workload ever demands it.
+
+**Coverage (intentionally the canonical case).** Input NHWC-style [b, spatial…, f],
+kernel HWIO-style [spatial…, i, o], output NHWC. Spatial rank 1..4. Supports window
+strides, SAME/VALID/explicit non-negative padding, and rhs (kernel) dilation. Rejected
+with a clean LoweringError (fails loud, never miscomputes): non-f32 dtype;
+feature_group_count/batch_group_count != 1 (grouped/depthwise); lhs (base) dilation
+(transposed conv); window reversal; negative padding; any non-canonical
+dimension_numbers layout. Verified the grouped-conv path rejects with
+"feature_group_count != 1 unsupported".
+
+**Wiring.** `OP_CONV=64` / `TILE_CONV=17` / `TOP_CONV=17` / `kTopConv=17`. aux =
+[sdim, Cin, Cout, out_spatial[sdim], win[sdim], stride[sdim], pad_low[sdim], dil[sdim],
+in_spatial[sdim]]. a=input b=weights p0=aux p1=n_out; EW-style tiling (n_tiles =
+ceil(n_out/EW_TS)). Each output element serially accumulates
+`sum_{win,ic} in[b,osp*stride+win*dil-pad,ic] * w[win,ic,oc]`, skipping padding-halo
+taps. Kernel `vmo_conv_tile` (kernels/ops/conv.cl); loader ops/conv.py (typed
+`shlo.ConvDimensionNumbers` downcast to read the layout); numpy interp + schedule-sim
+validators both registered.
+
+**Verified.** 8 conv variants (SAME/VALID × unit/strided, rhs-dilation, 1x1, 1-D)
+f32-exact (max rel ~2e-7) on **both PoCL and NVIDIA**. New tests/test_ops_conv.py (8
+tests, all three paths — real device via jax reference + both python simulators) pass;
+full pytest **343 passed** (was 335) / 1 skipped on PoCL. bench_suite **cnn FAIL→PASS**,
+correct vs CUDA (close), ours 0.334ms vs cuda 0.104ms → **gap 3.20x** (well inside the
+suite's 0.81–18.7x band, near the "close" tier — a naive direct conv on a 3-channel
+32×32 input is memory-bound, not the matmul route).
+
+**Reproduce:** `. ./env.sh && PYTHONPATH=$PWD/python
+PJRT_OCL_PLUGIN_PATH=$PWD/pjrt_plugin/build/libpjrt_ocl.so .venv/bin/python
+tools/bench_suite/run_suite.py --only cnn`.

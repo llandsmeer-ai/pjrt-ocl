@@ -63,6 +63,9 @@ TILE_RED_STRIDED = 15    # partial-axis reduce over interior/prefix axis block:
                          # out[o*inner+i]=reduce_r in[(o*red+r)*inner+i] (p0=n_out,
                          # p1=red, p2=inner, p3=kind); EW-style output tiling
 TILE_GATHER_INDEX = 16   # §38 general data-dependent gather (16: 15 = TILE_RED_STRIDED)
+TILE_CONV = 17           # §39 direct N-D convolution (NHWC input / HWIO kernel):
+                         # out[b,osp,oc]=sum_{win,ic} in[b,isp,ic]*w[win,ic,oc].
+                         # a=input b=weights p0=aux word-offset p1=n_out; EW-style tiling
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -171,7 +174,7 @@ class Task:
     def n_tiles(self) -> int:
         if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM, TILE_SCATTER,
                              TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW,
-                             TILE_MAP_REGION, TILE_GATHER_INDEX):
+                             TILE_MAP_REGION, TILE_GATHER_INDEX, TILE_CONV):
             return max(1, math.ceil(self.p1 / TILE_SIZE))
         if self.tile_op == TILE_RED_STRIDED:
             return max(1, math.ceil(self.p0 / TILE_SIZE))   # p0 = n_out, EW-style

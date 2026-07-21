@@ -54,7 +54,8 @@ enum TileOp : uint32_t {
   kTopFlashAttn = 14,  // §34 fused flash-attention (online softmax; p0 = V buffer)
   kTopRedStrided = 15, // partial-axis reduce over interior/prefix axis block
   kTopGatherIndex = 16,  // §38 general data-dependent gather (stablehlo.gather)
-  kMaxTileOp = kTopGatherIndex,
+  kTopConv = 17,       // §39 direct N-D convolution (NHWC input / HWIO kernel)
+  kMaxTileOp = kTopConv,
 };
 // dtype packed in tile_op bits 8-15 (matches python DT_* / vm_common.cl).
 enum VmDtype : uint32_t {
