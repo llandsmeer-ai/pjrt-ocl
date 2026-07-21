@@ -1302,6 +1302,12 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
   uint32_t ring = 0;    // first slot of the currently staged group
   uint32_t staged = 0;  // phases staged since the last flush
 
+  // Perf instrumentation (PJRT_OCL_PHASE_STATS): count phases, kernel enqueues,
+  // seg_tab writes and drains (clFinish) per Execute — the host-dispatch cost
+  // model. Printed to stderr at the end of the walk.
+  static const bool phase_stats = std::getenv("PJRT_OCL_PHASE_STATS") != nullptr;
+  uint64_t n_kenq = 0, n_write = 0, n_drain = 0;
+
   struct Frame { uint32_t pc, end, widx; int phase; };
   std::vector<std::vector<Frame>> st(n);
   for (uint32_t L = 0; L < n; ++L)
@@ -1425,8 +1431,14 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         *err = "host-dispatch: seg_tab upload failed";
         return false;
       }
+      n_write++;
       cl_kernel k = rt_->vm_seg_kernel();
+<<<<<<< HEAD
       size_t lsz = seg_lsz_, gsz = size_t{n} * lsz;
+=======
+      size_t lsz = 256, gsz = size_t{n} * lsz;
+      n_kenq += staged;
+>>>>>>> worktree-wf_cf11f3b6-849-3
       for (uint32_t i = 0; i < staged; ++i) {
         const cl_uint seg_base = (ring + i) * n;  // uint2 index of the slot
         clSetKernelArg(k, 5 + kNIoPorts, sizeof(seg_base), &seg_base);
@@ -1444,6 +1456,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         *err = "host-dispatch: clFinish (drain) failed";
         return false;
       }
+      n_drain++;
       ring = 0;
     }
     return true;
@@ -1615,6 +1628,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         release_tevs();
         return false;
       }
+      n_drain++;  // the blocking cond read is itself a drain
       ring = 0;  // the blocking read drained the in-order queue: ring is free
       for (uint32_t L = 0; L < n; ++L) {
         Frame& f = st[L].back();
@@ -1691,6 +1705,12 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     }
     release_tevs();
   }
+  if (phase_stats)
+    std::fprintf(stderr,
+                 "[phase_stats] phases=%u kernel_enq=%llu seg_writes=%llu "
+                 "drains=%llu n_lanes=%u\n",
+                 phase_i, (unsigned long long)n_kenq,
+                 (unsigned long long)n_write, (unsigned long long)n_drain, n);
   return true;
 }
 
