@@ -22,6 +22,12 @@ CONFIGS = {
     "small": (256, 4, 1024, 4, 128),
     "base":  (512, 8, 2048, 6, 256),
     "large": (1024, 16, 4096, 6, 512),
+    # LONG-CONTEXT decode (§34 flash-attention target regime): base model dims,
+    # a growing KV-cache context C. Attention scores are C-wide, so flash's
+    # payoff (never materializing the (1×C) score row) scales with C.
+    "base_c1k": (512, 8, 2048, 6, 1024),
+    "base_c2k": (512, 8, 2048, 6, 2048),
+    "base_c4k": (512, 8, 2048, 6, 4096),
 }
 
 

@@ -205,6 +205,11 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
     // MMA operand VIEW aux-offsets (+1; 0 = contiguous) index the aux pool.
     if (base_op == kTopMma && (t.p4 > n_aux || t.p5 > n_aux))
       return fail("mma view aux offset out of range");
+    // §34 flash-attention: p0 = V buffer id, p3 = descriptor aux word-offset
+    // (9 words: H,T,C,hd,scale,causal,qv,kv,vv).
+    if (base_op == kTopFlashAttn &&
+        (t.p0 >= n_buffers || uint64_t(t.p3) + 9 > n_aux))
+      return fail("flash-attn V id / aux offset out of range");
   }
   uint32_t barrier_count_ref = 0;
   bool first_lane = true;
@@ -691,10 +696,16 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
     t.b = elem_off(t.b);
     if ((t.tile_op & 0xFFu) == kTopEw && t.p0 == kEwSubSelect)
       t.p3 = elem_off(t.p3);
+    // §34 flash-attention: the V-cache buffer rides in p0 as a buffer id (a=Q,
+    // b=K, p0=V); resolve it to a byte offset / port exactly like dst/a/b. p3
+    // (the aux descriptor word-offset) and p1/p2 (H,T) are NOT buffers.
+    if ((t.tile_op & 0xFFu) == kTopFlashAttn)
+      t.p0 = elem_off(t.p0);
     // §33 R2c: a matmul epilogue's second input (residual/bias) rides in p7 as a
     // buffer id; resolve it to a byte offset / port exactly like dst/a/b. Only
-    // meaningful when p6 (the epilogue descriptor) is present.
-    if (t.p6)
+    // meaningful when p6 (the epilogue descriptor) is present. Gated on the MMA
+    // tile op so other ops may use p6/p7 for non-buffer fields.
+    if ((t.tile_op & 0xFFu) == kTopMma && t.p6)
       t.p7 = elem_off(t.p7);
   }
 

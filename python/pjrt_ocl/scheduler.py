@@ -58,6 +58,7 @@ TILE_RED_SEG = 10     # segmented reduce: out[o] = reduce(in[o*seg : (o+1)*seg])
 TILE_SOFTMAX_SEG = 11    # fused softmax over the innermost seg elems (§19)
 TILE_LAYERNORM_SEG = 12  # fused layernorm core over the innermost seg elems (§19)
 TILE_MAP_REGION = 13     # §27/§28 register-resident fused map-region (one phase)
+TILE_FLASH_ATTN = 14     # §34 fused flash-attention (online softmax; one WG per head,query)
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -176,6 +177,8 @@ class Task:
             return 1
         if self.tile_op in (TILE_RED_SEG, TILE_SOFTMAX_SEG, TILE_LAYERNORM_SEG):
             return max(1, self.p0)            # ONE segment per tile (p0 = n_out)
+        if self.tile_op == TILE_FLASH_ATTN:
+            return max(1, self.p1 * self.p2)  # ONE workgroup per (head, query row)
         raise ScheduleError(f"n_tiles: unknown tile_op {self.tile_op}")
 
 

@@ -85,7 +85,13 @@ enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
         * input, one store), collapsing a K-op EW chain into one barrier-free
         * phase. p0=aux descriptor word-offset, p1=n. Kernel: vmo_map_region
         * (ops/region.cl); recognizer: lowering _fuse_region. */
-       TOP_MAP_REGION = 13 };
+       TOP_MAP_REGION = 13,
+       /* §34 fused flash-attention: one workgroup per (head,query) streams the
+        * KV cache with online softmax — QKᵀ→scale→softmax→AV in ONE phase, no
+        * materialized score matrix. a=Q b=K p0=V dst=out; p1=H p2=T; p3=aux
+        * descriptor [H,T,C,hd,scale,causal,qv,kv,vv]. Kernel: vmo_flash_attn
+        * (ops/attention.cl); recognizer: lowering _fuse_attention. */
+       TOP_FLASH_ATTN = 14 };
 enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,
        SUB_ABS, SUB_FLOOR, SUB_CEIL, SUB_SIGN, SUB_FILL, SUB_IOTA_FLAT,
