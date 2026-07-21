@@ -148,6 +148,9 @@ OP_MAP_REGION = 57       # §27/§28 register-resident fused map-region: a=in0, 
 OP_FLASH_ATTN = 58       # §34 fused flash-attention (online softmax): a=Q b=K src,
                          # imm2=V src, n=H, imm=T, aux=descriptor word-offset
                          # ([H,T,C,hd,scale,causal,qv,kv,vv]); dst=out
+OP_GATHER_INDEX = 59     # §38 general data-dependent gather (stablehlo.gather):
+                         # a=operand, aux=descriptor word-offset, reads start_indices
+                         # (its buffer id rides in aux + reads_hint)
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -179,6 +182,7 @@ OP_NAMES = {
     OP_GELU: "gelu",
     OP_MAP_REGION: "map_region",
     OP_FLASH_ATTN: "flash_attn",
+    OP_GATHER_INDEX: "gather_index",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the

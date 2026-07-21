@@ -200,7 +200,8 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
       return fail("select pred id out of range");
     if ((base_op == kTopGather || base_op == kTopIotaDim ||
          base_op == kTopDynGather || base_op == kTopDynScatter ||
-         base_op == kTopRedWindow) && t.p0 >= n_aux)
+         base_op == kTopRedWindow || base_op == kTopGatherIndex) &&
+        t.p0 >= n_aux)
       return fail("task aux offset out of range");
     // MMA operand VIEW aux-offsets (+1; 0 = contiguous) index the aux pool.
     if (base_op == kTopMma && (t.p4 > n_aux || t.p5 > n_aux))
@@ -730,6 +731,21 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
   std::vector<int32_t> aux = p.aux;
   for (const VmTask& t : p.tasks) {  // unpatched copy: dyn p0 = aux offset
     const uint32_t base_op = t.tile_op & 0xFFu;
+    if (base_op == kTopGatherIndex) {
+      // §38 general gather aux header: [out_rank, nidx, si_vec_stride, is64,
+      // idx_byteoff(placeholder), idx_bufid, ...]. The start_indices buffer
+      // location (word 4) is patched here from its buffer id (word 5), exactly
+      // like dynamic_slice's start scalars — arena offsets / port handles are
+      // only known at load time. The kernel reads it through AP().
+      const size_t x = t.p0;
+      if (x + 6 > aux.size()) {
+        *err = "LoadedProgram: gather-index aux block out of range";
+        return nullptr;
+      }
+      aux[x + 4] = static_cast<int32_t>(
+          elem_off(static_cast<uint32_t>(aux[x + 5])));
+      continue;
+    }
     if (base_op != kTopDynGather && base_op != kTopDynScatter) continue;
     const size_t x = t.p0;
     const int32_t rank = aux[x];

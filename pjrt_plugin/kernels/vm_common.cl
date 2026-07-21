@@ -91,7 +91,14 @@ enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
         * materialized score matrix. a=Q b=K p0=V dst=out; p1=H p2=T; p3=aux
         * descriptor [H,T,C,hd,scale,causal,qv,kv,vv]. Kernel: vmo_flash_attn
         * (ops/attention.cl); recognizer: lowering _fuse_attention. */
-       TOP_FLASH_ATTN = 14 };
+       TOP_FLASH_ATTN = 14,
+       /* §38 general data-dependent gather (stablehlo.gather): each output
+        * element reads its operand base offset from a runtime start_indices
+        * buffer. aux header [out_rank, nidx, si_vec_stride, is64, idx_byteoff,
+        * idx_bufid] then out_dims/op_stride/si_stride[out_rank],
+        * idx_op_stride/clamp_max[nidx]. Kernel: vmo_gather_index_tile
+        * (ops/gather.cl); handler: ops/gather_index.py. */
+       TOP_GATHER_INDEX = 15 };
 enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,
        SUB_ABS, SUB_FLOOR, SUB_CEIL, SUB_SIGN, SUB_FILL, SUB_IOTA_FLAT,

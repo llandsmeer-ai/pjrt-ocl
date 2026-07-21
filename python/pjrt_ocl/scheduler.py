@@ -59,6 +59,7 @@ TILE_SOFTMAX_SEG = 11    # fused softmax over the innermost seg elems (§19)
 TILE_LAYERNORM_SEG = 12  # fused layernorm core over the innermost seg elems (§19)
 TILE_MAP_REGION = 13     # §27/§28 register-resident fused map-region (one phase)
 TILE_FLASH_ATTN = 14     # §34 fused flash-attention (online softmax; one WG per head,query)
+TILE_GATHER_INDEX = 15   # §38 general data-dependent gather (stablehlo.gather)
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -107,6 +108,7 @@ _COST_KEYS = {
     TILE_EW: "ew_tile_us",
     TILE_MMA: "mma_tile_us",
     TILE_GATHER: "gather_tile_us",
+    TILE_GATHER_INDEX: "gather_tile_us",
     TILE_REDUCE_PART: "reduce_tile_us",
     TILE_REDUCE_COMB: "reduce_tile_us",
     TILE_IOTA_DIM: "ew_tile_us",
@@ -166,7 +168,7 @@ class Task:
     def n_tiles(self) -> int:
         if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM, TILE_SCATTER,
                              TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW,
-                             TILE_MAP_REGION):
+                             TILE_MAP_REGION, TILE_GATHER_INDEX):
             return max(1, math.ceil(self.p1 / TILE_SIZE))
         if self.tile_op == TILE_MMA:
             return (math.ceil(self.p0 / MMA_T) * math.ceil(self.p1 / MMA_T)
