@@ -110,6 +110,11 @@ class Instr:
     imm: int
     aux: int = 0
     imm2: int = 0       # OP_AFFINE_F32's t bits (8th instr word); 0 otherwise
+    # OP_MAP_REGION multi-input handles are NOT serialized in the tensor instr
+    # (they ride the schedule task's a,b,p2..p7 + the aux descriptor's trailing
+    # handle words); a re-parsed instr keeps the default and the region
+    # validator recovers the inputs from the aux descriptor.
+    region_inputs: tuple = ()
 
 
 @dataclasses.dataclass

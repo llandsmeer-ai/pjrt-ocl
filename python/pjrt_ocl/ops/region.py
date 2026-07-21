@@ -6,10 +6,18 @@ whose intermediates stay in per-thread float4 slots (one global load per input,
 one store). This module registers the scheduler mapping (→ TILE_MAP_REGION), the
 two validators (tensor interp + schedule simulator) and the dependency read-set.
 
+Multi-input (§28 follow-up): a region takes up to 8 inputs, carried in the FULL
+ordered `ins.region_inputs` tuple and mapped onto task fields a, b, p2..p7 (all
+loader-patched to byte offsets / ports). This lets a multi-output connected
+component split into one single-output sub-region per live output (its fan-in
+cone) — the per-iteration EW chains of scan/loop bodies (HH neuron's
+new_m/new_h/new_n/new_V) collapse into a few regions instead of ~78 tile-ops.
+
 The numpy micro-op interpreter here MUST match ops/region.cl's vmo_region_micro
 (same builtins) so both validators agree with the device on the re-parsed
 bytecode. Descriptor layout (u32 words at ins.aux), mirroring the kernel:
-    [0]=in0_slot  [1]=in1_slot (0xFFFF=unused)  [2]=n_micro  [3]=out_slot
+    [0]=n_in  [1]=out_slot  [2]=n_micro
+    [3 .. 3+n_in) = in_slot[k]     (slot each of the n_in inputs loads into)
     n_micro × { kind, dst_slot, a_slot, b_slot, s_bits, t_bits }
 """
 from __future__ import annotations
@@ -19,9 +27,6 @@ import numpy as np
 from .. import lowering as L
 from .. import opsem
 from ..scheduler import Task, TILE_MAP_REGION
-
-# SUB_* region micro-op kinds (match vm_common.cl / lowering._REGION_KIND).
-_REGION_NONE = 0xFFFF
 
 
 def _f32(bits: int) -> np.float32:
@@ -47,17 +52,17 @@ def _apply(kind: int, x, y, s, t):
     raise NotImplementedError(f"region micro-op kind {kind}")
 
 
-def _run_region(aux, desc: int, a: np.ndarray, b: np.ndarray | None) -> np.ndarray:
-    """Interpret the micro-program at `aux[desc:]` over f32 input arrays a[, b].
-    Returns the region output array (f32), same length as a."""
-    in0_slot = aux[desc + 0] & 0xFFFF
-    in1_slot = aux[desc + 1] & 0xFFFF
+def _run_region(aux, desc: int, ins_arrs: list[np.ndarray]) -> np.ndarray:
+    """Interpret the micro-program at `aux[desc:]` over the ordered input arrays
+    `ins_arrs` (one per region input). Returns the region output array (f32)."""
+    n_in = aux[desc + 0]
+    out_slot = aux[desc + 1]
     n_micro = aux[desc + 2]
-    out_slot = aux[desc + 3]
-    R: dict[int, np.ndarray] = {in0_slot: a.astype(np.float32)}
-    if in1_slot != _REGION_NONE:
-        R[in1_slot] = b.astype(np.float32)
-    o = desc + 4
+    sbase = desc + 3
+    R: dict[int, np.ndarray] = {}
+    for k in range(n_in):
+        R[aux[sbase + k]] = ins_arrs[k].astype(np.float32)
+    o = sbase + n_in
     for _ in range(n_micro):
         kind = aux[o]
         ds, as_, bs = aux[o + 1], aux[o + 2], aux[o + 3]
@@ -67,21 +72,33 @@ def _run_region(aux, desc: int, a: np.ndarray, b: np.ndarray | None) -> np.ndarr
     return R[out_slot]
 
 
+# input handles ride task fields in this fixed order (matches ops/region.cl).
 def _to_task(ins) -> Task:
-    # a = in0, b = in1 (self-aliases a for single-input regions); p0 = descriptor
-    # word offset, p1 = element count. Loader resolves a/b/dst handles.
-    return Task(TILE_MAP_REGION, dst=ins.dst, a=ins.a, b=ins.b,
-                p0=ins.aux, p1=ins.n)
+    inp = list(getattr(ins, "region_inputs", ())) or [ins.a, ins.b]
+    fields = [inp[k] if k < len(inp) else inp[0] for k in range(8)]
+    a, b, p2, p3, p4, p5, p6, p7 = fields
+    # p0 = descriptor word offset, p1 = element count. Loader resolves a/b/p2..p7.
+    return Task(TILE_MAP_REGION, dst=ins.dst, a=a, b=b,
+                p0=ins.aux, p1=ins.n, p2=p2, p3=p3, p4=p4, p5=p5, p6=p6, p7=p7)
 
 
 def _reads(ins) -> set:
-    return {ins.a, ins.b}
+    return set(getattr(ins, "region_inputs", ())) or {ins.a, ins.b}
 
 
 def _interp(ins, rt) -> None:                # validator a (tensor interpreter)
-    a = rt.view(ins.a, ins.n)
-    b = rt.view(ins.b, ins.n) if ins.b != ins.a else None
-    rt.view(ins.dst, ins.n)[:] = _run_region(rt.aux, ins.aux, a, b)
+    # inputs from region_inputs when present (in-memory), else the trailing
+    # handle words of the descriptor (survives serialize/re-parse).
+    if getattr(ins, "region_inputs", ()):
+        inp = list(ins.region_inputs)
+    else:
+        desc = ins.aux
+        n_in = rt.aux[desc]
+        n_micro = rt.aux[desc + 2]
+        htail = desc + 3 + n_in + n_micro * 6
+        inp = [rt.aux[htail + k] for k in range(n_in)]
+    arrs = [rt.view(h, ins.n) for h in inp]
+    rt.view(ins.dst, ins.n)[:] = _run_region(rt.aux, ins.aux, arrs)
 
 
 def _sim(task, entry, rt) -> None:           # validator b (schedule simulator)
@@ -91,9 +108,10 @@ def _sim(task, entry, rt) -> None:           # validator b (schedule simulator)
     hi = min(entry.tile_hi * ts, n)
     if lo >= hi:
         return
-    a = rt.view(task.a)[lo:hi]
-    b = rt.view(task.b)[lo:hi] if task.b != task.a else None
-    rt.view(task.dst)[lo:hi] = _run_region(rt.aux, task.p0, a, b)
+    n_in = rt.aux[task.p0]
+    fields = [task.a, task.b, task.p2, task.p3, task.p4, task.p5, task.p6, task.p7]
+    arrs = [rt.view(fields[k])[lo:hi] for k in range(n_in)]
+    rt.view(task.dst)[lo:hi] = _run_region(rt.aux, task.p0, arrs)
 
 
 opsem.register(L.OP_MAP_REGION, to_task=_to_task, interp=_interp, reads=_reads)

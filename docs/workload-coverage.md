@@ -30,8 +30,8 @@ stablehlo.gather → embedding_softmax PASS.)*
 | logistic_map | SCI | PASS | 1.212 | 1.177 | 1.03x | close (0.0e+00) | logistic-map iteration (fori_loop/while) |
 | monte_carlo | SCI | **FAIL** | - | 0.049 | - | - | `stablehlo.shift_right_logical` — missing stablehlo.shift_right_logical (cuda: PASS); Monte-Carlo pi (threefry RNG) |
 | fft | SCI | **FAIL** | - | 0.047 | - | - | `complex-dtype` — complex dtype unsupported (cuda: PASS); 1D FFT magnitude (needs complex dtype + fft) |
-| spring_mass | PHYS | PASS | 3.513 | 1.110 | 3.16x | close (0.0e+00) | spring-mass chain (brax analogue, scan) |
-| hh_neuron | PHYS | PASS | 15.321 | 1.292 | 11.86x | close (1.3e-04) | Hodgkin-Huxley neuron (jaxley analogue, scan) |
+| spring_mass | PHYS | PASS | 3.048 | 1.120 | 2.72x | close (0.0e+00) | spring-mass chain (brax analogue, scan) — §41 loop-body region fusion (scan body 15-op cone → 1 region) |
+| hh_neuron | PHYS | PASS | 4.970 | 1.285 | 3.87x | close (1.3e-04) | Hodgkin-Huxley neuron (jaxley analogue, scan) — §41 multi-input loop-body region fusion (body 78→14 ops; was 11.86x) |
 | brax_step | PHYS | **FAIL** | - | 0.309 | - | - | `platform-allowlist` — host lib rejects OpenCL PJRT platform (device allowlist) (cuda: PASS); brax inverted_pendulum reset+step (real env); step HLO also needs gather/scatter/case/atan |
 
 ## Ranked missing-op priority (M3 test-driven order)

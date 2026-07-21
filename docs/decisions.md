@@ -3201,3 +3201,82 @@ its own process). Scoreboard: `docs/workload-coverage-cpu.md`.
   not perf. Perf work should target the enqueue-count fix only where it changes the
   qualitative story (loop laggards from ~1000× to ~10×), not chase a win that the launch
   floor forecloses.
+
+## 41. Multi-input map-region fusion INSIDE loop bodies — hh_neuron 12.6×→3.9× (2026-07-21)
+
+**Front:** the GPU loop laggards (`tools/bench_suite`, NVIDIA vs CUDA). Round-2
+profiling had pinned hh_neuron as a serial ~78-tile-op EW chain PER ITERATION
+over B=64 (VM_LANES flat ⇒ latency, not barriers: ~1 µs/tile-op × 78 × 200
+iters ≈ 15 ms). Lever: the §28 register-resident map-region, but applied INSIDE
+the while/for body and generalized past its single-output/≤2-input v1 gate.
+
+### What the body actually looks like (measured, `tools/dump` scratch)
+The HH scan body is ONE barrier-free phase of ~78 EW ops, all n=64, that
+root-only `_fuse_region` never sees (it scopes to `[0, main_len)`; the body
+sub-list lives at indices ≥ main_len). The whole body is ONE connected map
+component with **6 inputs (V,m,h,n,I,+) and 4 live outputs** (new V,m,h,n) —
+new_V reads new_m/new_h/new_n, tying every carry cone together — so it fails
+both the single-output and ≤2-input gates. Per-output cones, though, are small:
+new_m/new_h/new_n/new_V are single-output sub-DAGs of 11–18 ops, **2–5 inputs,
+peak 5–7 live slots** (≤ the shipped 8-slot budget).
+
+### What shipped (default ON; `PJRT_OCL_FUSE_REGION_LOOP=0` reverts)
+1. **Scoped phase map** (`_region_phase_map_scoped`): phases every while/for body
+   sub-list too (disjoint phase bands so the within-phase union-find never
+   crosses scopes). Loop carries stay excluded by the existing global
+   multi-writer test (a carry is written by its root init-copy AND its body
+   commit ⇒ multi ⇒ never a region member / never the fused read's definition),
+   so a region only ever produces fresh in-body SSA and reads carries read-only
+   — the previous iteration's value, exactly as the decomposed chain does. This
+   is the correctness key the round-1/2 blind attempts missed (they made
+   dependent multi-carry regions lane-local → WASH + one NaN).
+2. **Multi-input, single-output regions** (`ops/region.cl` rewrite): up to 8
+   inputs ride task fields a,b,p2..p7 (loader-patches p2..p7 for `kTopMapRegion`,
+   like the §38 gather-index aux-handle patch); descriptor `[n_in, out_slot,
+   n_micro, in_slot×n_in, micro×6, in_handle×n_in]`. 8-slot budget UNCHANGED, so
+   occupancy is untouched (no register-pressure risk).
+3. **Output-cone split** (`_output_cones`): a multi-output loop-body component is
+   split into one single-output region per live output = its backward fan-in
+   cone, stopping at (reading as inputs) other live outputs and members shared by
+   ≥2 cones (those stay decomposed). Every emitted region keeps ONE writer, so
+   the scheduler/arena/liveness are byte-unchanged.
+4. **Gated HARD.** New behavior (>2 inputs, output-cone split) fires ONLY in loop
+   bodies; ROOT regions keep the pre-existing single-output/≤2-input path
+   (transformer/attention/etc. byte-identical). Loop-body cones must be ≥
+   `PJRT_OCL_REGION_LOOP_MIN` (default 8) members to earn their barrier phase (a
+   map-region is a phase boundary; short cones would add barriers for little
+   op-count win — rk4's 3–7-op cones).
+
+### Result (NVIDIA, ours vs CUDA; correct=close, finite, bit-deterministic 3/3)
+- **hh_neuron 15.5 → 4.97 ms, 12.6× → 3.87×.** Body 78 → 14 ops (4 carry-cone
+  regions + remainder). The prize.
+- **spring_mass 3.51 → 3.05 ms, 3.16× → 2.72×** (bonus: its scan body EW chain is
+  one 15-op cone → 1 region).
+- rk4_ode / lstm / gru / heat2d / transformer / layernorm / attention / mlp /
+  nbody / logistic_map: **unchanged** (within noise). No regression anywhere.
+- Correct on BOTH engines: NVIDIA allclose(2e-2); PoCL/XLA-CPU allclose(1e-3),
+  f32-exact. Full pytest 344 pass (+1 skip).
+
+### Honest read on the OTHER 3 named laggards (NOT fixed — different walls)
+- **lstm 8.5× / gru 8.3×:** the scan is UNROLLED (T=24), so the body is already
+  root-fused; the wall is the per-step matmuls (x@Wx, h@Wh), the §29 matmul wall,
+  which this EW lever does not touch. Region fires but changes nothing.
+- **rk4 7.5×:** its Lorenz body is fragmented by `jnp.stack`/index gathers into 25
+  tiny phases; the per-output cones are only 3–7 ops, below the min-size gate, so
+  fusing them would add barriers > the op-count saving (measured a small
+  regression at min=2). Correctly gated OUT → left at baseline.
+
+### Two dead ends recorded (both correctness-driven reverts this session)
+- **map-region as a "map" op** (chain lane-local, no barrier): NaN on the GPU.
+  Cause: a region reads/writes in float4 (thread lid owns float4 lid) but a
+  VIEWED EW op (broadcast operand, e.g. `x/bcast(10)`) runs the SCALAR path
+  (thread lid owns scalar lid); with no fence between chained entries, one thread
+  reads another's data. Reverted — regions stay barrier-isolated. (The gain is
+  op-count collapse, not lane-local chaining.)
+- **divide-by-scalar-const → affine reciprocal fold** (to un-fragment the rate
+  chains `exp(-(V+40)/10)`): built (eager, then moved to a late pass to stop it
+  breaking `_fuse_norm`'s `mean = sum/seg` match), but MEASURED a WASH — with
+  multi-input output-cones the win is identical with the fold OFF (hh 4.97 vs 5.20
+  ms, noise; only a cosmetic static op-count drop 33→18). Per §14a "keep only if
+  it moves the needle", and since the reciprocal is not f32-exact, **dropped
+  entirely** — the win is 100% the region infrastructure.

@@ -439,7 +439,16 @@ class _Scheduler:
     def _is_map(self, i: int) -> bool:
         """Elementwise (map-type): output tile T reads only input tile T, so it
         chains on a lane. Everything that reshuffles tiles across lanes
-        (matmul/reduce/gather/scatter/broadcast/…) is a non-map TILE op."""
+        (matmul/reduce/gather/scatter/broadcast/…) is a non-map TILE op.
+
+        TILE_MAP_REGION is deliberately NOT map here even though it is element-
+        aligned: a region reads/writes in float4 units (thread lid owns float4
+        lid) while a VIEWED EW op (broadcast operand) runs the SCALAR path
+        (thread lid owns scalar lid). Chaining the two lane-local (no fence
+        between entries) would make one thread read another thread's data — a
+        race. Keeping regions on their own barrier phase avoids the mismatch;
+        the fusion win comes from op-count collapse, not from lane-local
+        chaining."""
         return self.tasks[self._task_for(i)].tile_op == TILE_EW
 
     def _build_levels(self, indices: list[int]):

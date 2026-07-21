@@ -196,6 +196,10 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
     if (dt > kDtMax) return fail("unknown dtype " + std::to_string(dt));
     for (uint32_t id : {t.dst, t.a, t.b})
       if (id >= n_buffers) return fail("task buffer id out of range");
+    // §28 multi-input region: p2..p7 are extra input buffer handles.
+    if (base_op == kTopMapRegion)
+      for (uint32_t id : {t.p2, t.p3, t.p4, t.p5, t.p6, t.p7})
+        if (id >= n_buffers) return fail("region input buffer id out of range");
     if (base_op == kTopEw && t.p0 == kEwSubSelect && t.p3 >= n_buffers)
       return fail("select pred id out of range");
     if ((base_op == kTopGather || base_op == kTopIotaDim ||
@@ -776,6 +780,18 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
     // tile op so other ops may use p6/p7 for non-buffer fields.
     if ((t.tile_op & 0xFFu) == kTopMma && t.p6)
       t.p7 = elem_off(t.p7);
+    // §28 follow-up: a multi-input map-region carries its extra inputs (beyond
+    // a/b) in p2..p7 as buffer handles; resolve them to byte offsets / ports
+    // like dst/a/b. The descriptor's n_in bounds how many the kernel reads, but
+    // resolving all of them is harmless (unused fields alias in0's handle).
+    if ((t.tile_op & 0xFFu) == kTopMapRegion) {
+      t.p2 = elem_off(t.p2);
+      t.p3 = elem_off(t.p3);
+      t.p4 = elem_off(t.p4);
+      t.p5 = elem_off(t.p5);
+      t.p6 = elem_off(t.p6);
+      t.p7 = elem_off(t.p7);
+    }
   }
 
   // Patch dynamic_slice/update start-scalar locations in the aux pool:
