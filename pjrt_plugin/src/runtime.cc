@@ -556,6 +556,12 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
       rt->ngroups_ = std::min(rt->ngroups_, measured_res);
   if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
+  // Host-dispatch tile work-group size. On CPU, lsz=1 removes the collaborative
+  // reduce-tree barriers (pessimal when a work-group is one serial CPU thread —
+  // see seg_lsz()); GPUs forced into host-dispatch keep 256. Env overrides both.
+  rt->seg_lsz_ = rt->info_.is_gpu ? 256 : 1;
+  if (const char* s = std::getenv("PJRT_OCL_CPU_LSZ"); s && s[0])
+    rt->seg_lsz_ = std::max(1, std::atoi(s));
   if (const char* v = std::getenv("PJRT_OCL_INFO"); v && v[0])
     std::fprintf(stderr,
                  "[pjrt-ocl] engine=%s in-program-matmul=%s lanes=%u "
@@ -649,6 +655,42 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
   lp->rt_ = rt;
   lp->prog_ = std::move(prog);
   const VmProgram& p = lp->prog_;
+
+  // Per-program host-dispatch work-group size. The runtime's preference
+  // (rt->seg_lsz(), default 1 on CPU) removes the collaborative reduce-tree
+  // barriers that are pure overhead when a work-group is one serial CPU thread.
+  // But some tile ops are collaborative — a barriered workgroup reduction that
+  // is INCORRECT at lsz=1 (flash-attention hits PoCL 5.0's barriered-loop
+  // miscompile, §18/§19a; matmul/conv assume lsz>1 lanes). Use the preferred
+  // lsz only when EVERY op is in the lsz=1-safe set; otherwise pin to 256. When
+  // PJRT_OCL_CPU_LSZ is set explicitly it is honored as-is (A/B lever).
+  {
+    static const bool cpu_lsz_env = [] {
+      const char* e = std::getenv("PJRT_OCL_CPU_LSZ");
+      return e && e[0];
+    }();
+    lp->seg_lsz_ = rt->seg_lsz();
+    if (!cpu_lsz_env && lp->seg_lsz_ < 256) {
+      auto safe_at_lsz1 = [](uint32_t op) {
+        switch (op) {
+          case kTopEw: case kTopGather: case kTopRedPart: case kTopRedComb:
+          case kTopIotaDim: case kTopScatter: case kTopDynGather:
+          case kTopDynScatter: case kTopRedSeg: case kTopSoftmaxSeg:
+          case kTopLayernormSeg:
+            return true;
+          // kTopRedStrided is EXCLUDED: its tiles hold up to EW_TS outputs, so a
+          // large partial-axis reduce is 1-2 tiles = little lane parallelism, and
+          // lsz=1 also removes the within-work-group work-item split PoCL relied
+          // on (measured: 8192x512 axis-0 reduce 58 -> 116 ms). Such programs keep
+          // lsz=256. (Small strided reduces are a wash either way.)
+          default:  // kTopMma, kTopFlashAttn, kTopConv, kTopRedWindow,
+            return false;  // kTopMapRegion, kTopGatherIndex, kTopRedStrided
+        }
+      };
+      for (const auto& t : p.tasks)
+        if (!safe_at_lsz1(t.tile_op & 0xFFu)) { lp->seg_lsz_ = 256; break; }
+    }
+  }
 
   // f64 gate: the VM's f64 path is compiled only under cl_khr_fp64, so on a
   // device without it an f64 program would silently fall back to f32. Refuse.
@@ -1307,7 +1349,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         return false;
       }
       cl_kernel k = rt_->vm_seg_kernel();
-      size_t lsz = 256, gsz = size_t{n} * lsz;
+      size_t lsz = seg_lsz_, gsz = size_t{n} * lsz;
       for (uint32_t i = 0; i < staged; ++i) {
         const cl_uint seg_base = (ring + i) * n;  // uint2 index of the slot
         clSetKernelArg(k, 5 + kNIoPorts, sizeof(seg_base), &seg_base);

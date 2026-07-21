@@ -180,16 +180,37 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
         float acc = kind == 0 ? 0.0f : kind == 1 ? -INFINITY
                   : kind == 2 ? INFINITY : 1.0f;
 #ifdef VMO_CPU_TILES
-        /* CPU: single flat accumulate loop — PoCL 5.0's parallel-region
-         * formation asserts (region_entry_barrier != NULL) on branchier CFG
-         * shapes ahead of the tree barriers below (same class as the early-
-         * return trap above). The ternary keeps the CFG loop-shaped. */
-        if (valid)
-            for (uint j = lid; j < seg; j += lsz) {
+        /* CPU (lsz=1, one WI per segment): lid 0 reduces the WHOLE contiguous
+         * segment with a float8 vector accumulator + scalar tail. Other lanes
+         * (only exist if PJRT_OCL_CPU_LSZ overrides lsz>1) contribute the
+         * identity, so the tree below stays correct for any lsz. Barrier-free
+         * per-segment vectorization is the CPU win (poc/09 / decisions #12):
+         * the collaborative tree is pure overhead when a work-group is one
+         * serial CPU thread. Branch is loop-shaped (PoCL region-former #18). */
+        if (valid && lid == 0) {
+            float8 a8 = (float8)(kind == 0 ? 0.0f : kind == 1 ? -INFINITY
+                                : kind == 2 ? INFINITY : 1.0f);
+            uint j = 0;
+            if (t.p3) {                       /* GEMV: row . vector, sum only */
+                for (; j + 8u <= seg; j += 8u)
+                    a8 += vload8(0, a + base + j) * vload8(0, bv + j);
+            } else {
+                for (; j + 8u <= seg; j += 8u) {
+                    const float8 v = vload8(0, a + base + j);
+                    a8 = kind == 0 ? a8 + v : kind == 1 ? fmax(a8, v)
+                       : kind == 2 ? fmin(a8, v) : a8 * v;
+                }
+            }
+            float h[8] = {a8.s0, a8.s1, a8.s2, a8.s3, a8.s4, a8.s5, a8.s6, a8.s7};
+            for (int k = 0; k < 8; ++k)
+                acc = (kind == 0 || t.p3) ? acc + h[k] : kind == 1 ? fmax(acc, h[k])
+                    : kind == 2 ? fmin(acc, h[k]) : acc * h[k];
+            for (; j < seg; ++j) {
                 const float v = t.p3 ? a[base + j] * bv[j] : a[base + j];
-                acc = kind == 0 ? acc + v : kind == 1 ? fmax(acc, v)
+                acc = (kind == 0 || t.p3) ? acc + v : kind == 1 ? fmax(acc, v)
                     : kind == 2 ? fmin(acc, v) : acc * v;
             }
+        }
 #else
         if (valid) {
             if (t.p3) {
@@ -253,6 +274,43 @@ static void vmo_softmax_seg(__global uchar *arena, __global uchar **iop, const t
     const int valid = o < n_out;          /* over-assigned tiles run the tree
                                            * on init values, skip the store. */
     const uint base = o * seg;
+#ifdef VMO_CPU_TILES
+    /* CPU (lsz=1): one WI owns the whole segment. Three barrier-free float8
+     * passes (max, exp+sum, scale) reading global directly — no __local
+     * staging, no tree. seg-wide row is L1-resident (<=1024 f32 = 4 KiB). */
+    if (!valid || lid != 0) return;
+    __global const float *a = AP(const float, t.a);
+    __global float *dst = AP(float, t.dst);
+    /* pass 1: max */
+    float8 m8 = (float8)(-INFINITY);
+    uint j = 0;
+    for (; j + 8u <= seg; j += 8u) m8 = fmax(m8, vload8(0, a + base + j));
+    float mx = fmax(fmax(fmax(m8.s0, m8.s1), fmax(m8.s2, m8.s3)),
+                    fmax(fmax(m8.s4, m8.s5), fmax(m8.s6, m8.s7)));
+    for (uint jj = j; jj < seg; ++jj) mx = fmax(mx, a[base + jj]);
+    /* pass 2: exp(x - mx) -> dst, accumulate sum */
+    float8 s8 = (float8)(0.0f);
+    const float8 mx8 = (float8)(mx);
+    j = 0;
+    for (; j + 8u <= seg; j += 8u) {
+        const float8 e = exp(vload8(0, a + base + j) - mx8);
+        vstore8(e, 0, dst + base + j);
+        s8 += e;
+    }
+    float sm = s8.s0 + s8.s1 + s8.s2 + s8.s3 + s8.s4 + s8.s5 + s8.s6 + s8.s7;
+    for (uint jj = j; jj < seg; ++jj) {
+        const float e = exp(a[base + jj] - mx);
+        dst[base + jj] = e;
+        sm += e;
+    }
+    /* pass 3: scale by 1/sum */
+    const float8 inv8 = (float8)(1.0f / sm);
+    j = 0;
+    for (; j + 8u <= seg; j += 8u)
+        vstore8(vload8(0, dst + base + j) * inv8, 0, dst + base + j);
+    for (uint jj = j; jj < seg; ++jj) dst[base + jj] *= 1.0f / sm;
+    return;
+#else
     const uint jN = SEG_UNIFORM(seg, lsz);
     __global const float *a = AP(const float, t.a);
     __global float *dst = AP(float, t.dst);
@@ -295,6 +353,7 @@ static void vmo_softmax_seg(__global uchar *arena, __global uchar **iop, const t
     for (uint j = lid; j < jN; j += lsz)
         if (valid && j < seg)
             dst[base + j] = As[j] / sm;
+#endif
 }
 
 /* TOP_LAYERNORM_SEG (§19): fused layernorm CORE over the innermost `seg` elems.
@@ -310,6 +369,39 @@ static void vmo_layernorm_seg(__global uchar *arena, __global uchar **iop, const
     const uint o = tile;
     const int valid = o < n_out;
     const uint base = o * seg;
+#ifdef VMO_CPU_TILES
+    /* CPU (lsz=1): one WI owns the whole segment. Two barrier-free float8
+     * passes (sum+sumsq, then normalize) reading global directly. */
+    if (!valid || lid != 0) return;
+    {
+        __global const float *a = AP(const float, t.a);
+        __global float *dst = AP(float, t.dst);
+        float8 p1 = (float8)(0.0f), p2 = (float8)(0.0f);
+        uint j = 0;
+        for (; j + 8u <= seg; j += 8u) {
+            const float8 v = vload8(0, a + base + j);
+            p1 += v;
+            p2 += v * v;
+        }
+        float s1 = p1.s0 + p1.s1 + p1.s2 + p1.s3 + p1.s4 + p1.s5 + p1.s6 + p1.s7;
+        float s2 = p2.s0 + p2.s1 + p2.s2 + p2.s3 + p2.s4 + p2.s5 + p2.s6 + p2.s7;
+        for (uint jj = j; jj < seg; ++jj) {
+            const float v = a[base + jj];
+            s1 += v;
+            s2 += v * v;
+        }
+        const float n = (float)seg;
+        const float mu = s1 / n;
+        const float rs = rsqrt(s2 / n - mu * mu + eps);
+        const float8 mu8 = (float8)(mu), rs8 = (float8)(rs);
+        j = 0;
+        for (; j + 8u <= seg; j += 8u)
+            vstore8((vload8(0, a + base + j) - mu8) * rs8, 0, dst + base + j);
+        for (uint jj = j; jj < seg; ++jj)
+            dst[base + jj] = (a[base + jj] - mu) * rs;
+    }
+    return;
+#else
     const uint jN = SEG_UNIFORM(seg, lsz);
     __global const float *a = AP(const float, t.a);
     __global float *dst = AP(float, t.dst);
@@ -348,6 +440,7 @@ static void vmo_layernorm_seg(__global uchar *arena, __global uchar **iop, const
     for (uint j = lid; j < jN; j += lsz)
         if (valid && j < seg)
             dst[base + j] = (As[j] - mu) * rs;
+#endif
 }
 
 /* TOP_RED_STRIDED: partial-axis reduce over a contiguous interior/prefix axis

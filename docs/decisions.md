@@ -3054,3 +3054,60 @@ higher than §38 believed, and the bottleneck is now precisely characterized
 (halve the input bytes, not the MMA). **Reproduce:** `cd poc/17-nv-mma`,
 `make run-bench-mma` (mma.sync ties 92), `make run-bench-f16in` (107, `ACC=1` for
 accuracy), `make run-probe` (cp.async dead).
+
+## 40. CPU tile path: per-program lsz=1 + barrier-free float8 norm/reduce (2026-07-21)
+
+Front: CPU (PoCL) elementwise + reduce + norm tiles vs native XLA-CPU, separate
+processes (`JAX_PLATFORMS=opencl PJRT_OCL_DEVICE=Portable` vs `=cpu`), Ryzen 9
+3900X (24 threads). Tools: `tools/bench_cpu.py` (target workloads), `tools/
+micro_cpu.py` (large tile-path microbenchmarks — the small workloads are
+latency/phase-bound, not tile-bound, so they hide the tile story).
+
+- ❌ **Root cause (measured): the collaborative reduce TREE is pessimal on a CPU
+  OpenCL runtime.** On PoCL a work-group is ONE CPU thread iterating its
+  work-items as a serial loop, with `barrier()` implemented by loop-splitting.
+  The host-dispatch engine launched every tile phase at `lsz=256`, so the
+  softmax/layernorm/redseg workgroup tree reduces ran 8 barrier-split loop passes
+  per segment on a single thread — pure overhead. Microbench (RED_SEG suffix
+  reduce, 8192×512, `reduce_rows_big`): `lsz=256` 2.17 ms vs `lsz=1` **0.30 ms —
+  7.2×** (interleaved A/B, min-of-4; confirms the task hypothesis "a per-thread
+  serial reduce beats the collaborative tree on CPU").
+- ✅ **FIX 1 — host-dispatch `lsz=1` on CPU (barrier-free, one WI per work-group).**
+  `OclRuntime::seg_lsz()` = 1 on non-GPU (was hardcoded 256 in LaunchHostDispatch;
+  `PJRT_OCL_CPU_LSZ` overrides for A/B). Each work-group becomes a single
+  work-item doing a whole tile / segment serially; the tree loops become no-ops;
+  parallelism comes from the n_lanes (=CU=24) work-groups. Also cuts PoCL's
+  per-work-item loop-setup cost for EW-heavy code (24 WIs/phase vs 6144): heat2d
+  94→47 ms, logistic_map 19.5→~10 ms, layernorm workload 4.4→1.1 ms. Flat EW/
+  reduce unchanged (still bandwidth-bound; add-16M 21.4 ms already BEATS XLA 26).
+- ✅ **FIX 2 — barrier-free float8 CPU bodies for redseg / softmax_seg /
+  layernorm_seg** (`kernels/ops/reduce.cl`, `#ifdef VMO_CPU_TILES`). lid 0 owns
+  the whole contiguous segment (L1-resident, ≤1024 f32) and does 1–3 vectorized
+  passes (redseg: float8 reduce; softmax: max / exp+sum / scale; layernorm:
+  sum+sumsq / normalize). No `__local` staging, no tree — reads global directly.
+  Correct at any lsz (identity for lanes>0 so the #else tree still folds them).
+  RED_SEG then 2.4→0.33 ms (adds ~1.3× on top of FIX 1; gap to XLA 20×→2.3×).
+- ⚠️ **`lsz=1` is NOT globally safe — flash-attention breaks at lsz=1.** PoCL 5.0
+  miscompiles `vmo_flash_attn`'s barriered key-tile loop at lsz=1 (100% wrong out;
+  the §18/§19a barriered-loop class), and in-VM MMA/conv assume lsz>1 lanes.
+  **Decision: per-PROGRAM lsz, chosen at Load** (`LoadedProgram::seg_lsz_`): use
+  the CPU preference (1) only when EVERY tile op is in the lsz=1-safe set {EW,
+  gather/scatter, dyn_gather/scatter, red_part/comb, red_seg, softmax_seg,
+  layernorm_seg, iota}; any collaborative op (mma, flash_attn, conv, red_window,
+  map_region, gather_index) pins the whole program to 256. Explicit
+  `PJRT_OCL_CPU_LSZ` bypasses the safety (A/B). Full pytest 343/1 green on PoCL,
+  flash + matmul included.
+- ⚠️ **RED_STRIDED deliberately EXCLUDED from the lsz=1 set.** Its tiles hold up
+  to EW_TS(=16384) outputs, so a large partial-axis reduce is 1–2 tiles = almost
+  no lane parallelism, and lsz=1 also removes the within-work-group WI split PoCL
+  was exploiting (measured 8192×512 axis-0 reduce ~2× SLOWER at lsz=1). Programs
+  containing it keep 256 (= baseline, no regression). Real fix = vectorize the
+  strided reduce over the contiguous inner dim + finer tiling; separate lever,
+  deferred (this case is 40–100×+ off XLA and noise-dominated at loadavg 16).
+- 🧭 **Remaining gap (honest):** large fused layernorm/softmax (4096×1024) stay
+  ~5–6× off XLA — NOT the reduce tree (now barrier-free) but the surrounding
+  affine EW + broadcast round-trips through the arena (the §23 register-resident
+  map-region lever). Flat reduce is a wash. **Reproduce:** `. ./env.sh`;
+  `PYTHONPATH=$PWD/python:$PWD/tools PJRT_OCL_PLUGIN_PATH=…/libpjrt_ocl.so
+  .venv/bin/python tools/bench_cpu.py` and `tools/micro_cpu.py <case> <label>`;
+  A/B any case with `PJRT_OCL_CPU_LSZ=256`.

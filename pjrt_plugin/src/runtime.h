@@ -181,6 +181,16 @@ class OclRuntime {
   // (PJRT_OCL_MMA_T); the two MUST agree so tile counts match. Default 64.
   cl_uint mma_t() const { return mma_t_; }
   size_t local_size() const { return local_size_; }
+  // Host-dispatch (CPU) work-group size for the vm2_seg tile launches. On PoCL
+  // a work-group is ONE CPU thread iterating its work-items as a serial loop
+  // with barriers implemented by loop-splitting, so the collaborative reduce
+  // trees (softmax/layernorm/redseg) are pure overhead. lsz=1 makes every
+  // work-group a single work-item (no barriers, no tree; each WI does a whole
+  // tile / segment serially — thread-per-segment for the norm tiles), which the
+  // VMO_CPU_TILES float8 bodies already vectorize. Parallelism comes from the
+  // n_lanes work-groups (= compute units). Default 1 on CPU; PJRT_OCL_CPU_LSZ
+  // overrides (256 restores the old collaborative geometry for A/B).
+  size_t seg_lsz() const { return seg_lsz_; }
   // Host-dispatch engine: the host drives control flow and enforces the
   // cross-workgroup barrier via clFinish between per-phase launches (no
   // in-kernel spin-barrier). Default ON for non-GPU (CPU) devices, where the
@@ -253,6 +263,7 @@ class OclRuntime {
   cl_uint ew_ts_ = 16384;  // EW tile elements (GPU: 4096; see ew_ts())
   cl_uint mma_t_ = 64;     // MMA tile edge (128 when TF32 big-tile built; mma_t())
   size_t local_size_ = 64;
+  size_t seg_lsz_ = 256;   // host-dispatch tile work-group size (CPU: see seg_lsz())
   bool host_dispatch_ = false;
   std::mutex mu_;  // serializes execute (single in-order queue)
   std::mutex pool_mu_;
@@ -270,6 +281,12 @@ class LoadedProgram {
   ~LoadedProgram();
 
   const VmProgram& prog() const { return prog_; }
+  // Host-dispatch tile work-group size for THIS program (see OclRuntime::seg_lsz).
+  // Computed at Load: the runtime's CPU preference (default 1) is used only when
+  // every tile op is correct at lsz=1; a program containing a collaborative op
+  // (matmul / flash-attention / conv — barriered workgroup reductions PoCL
+  // miscompiles or that assume lsz>1 lanes) is pinned to 256.
+  size_t seg_lsz() const { return seg_lsz_; }
 
   // Synchronous execute from HOST inputs to HOST outputs (H2D + D2H). Used by
   // runtime_test. inputs[i] must hold buffers[inputs[i]].size_bytes bytes.
@@ -301,6 +318,7 @@ class LoadedProgram {
   bool EnsureTraceQueues(std::string* err);
   OclRuntime* rt_ = nullptr;  // borrowed; client outlives executables
   VmProgram prog_;
+  size_t seg_lsz_ = 256;      // per-program host-dispatch lsz (see seg_lsz())
   // §36 hybrid: tasks with dst/a/b patched to arena byte-offsets / port handles
   // (prog_.tasks keeps raw buffer ids). The mm_tc dispatch needs the patched
   // handles; the persistent VM reads them from tasks_buf_ instead.
