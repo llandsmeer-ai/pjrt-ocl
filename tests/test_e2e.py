@@ -17,6 +17,7 @@ PLUGIN = REPO / "pjrt_plugin" / "build" / "libpjrt_ocl.so"
 BODY = pathlib.Path(__file__).parent / "_e2e_body.py"
 WHILE_BODY = pathlib.Path(__file__).parent / "_while_e2e_body.py"
 MATMUL_HOST_BODY = pathlib.Path(__file__).parent / "_matmul_host_e2e_body.py"
+MATMUL_HYBRID_BODY = pathlib.Path(__file__).parent / "_matmul_hybrid_e2e_body.py"
 DYNSLICE_BODY = pathlib.Path(__file__).parent / "_dynslice_e2e_body.py"
 RANDOM_BODY = pathlib.Path(__file__).parent / "_random_e2e_body.py"
 
@@ -77,6 +78,16 @@ def test_e2e_matmul_host_dispatch():
     the host engine used to launch CPU geometry and silently miscompute. On a
     GPU this exercises the fix; on CPU it just confirms the packed path."""
     _run_body(MATMUL_HOST_BODY, "MATMUL HOST E2E PASS", {"PJRT_OCL_ENGINE": "host"})
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_matmul_hybrid_host_dispatch():
+    """In-program matmul hybrid (docs/decisions.md §12a): a matmul EMBEDDED in a
+    larger program is peeled out of the megakernel to the packed mm2p / mm2p_epi
+    kernels (plain chained matmul and bias+relu epilogue). On CPU this is the
+    default; forcing host engine makes it run on any device."""
+    _run_body(MATMUL_HYBRID_BODY, "MATMUL HYBRID E2E PASS",
+              {"PJRT_OCL_ENGINE": "host"})
 
 
 @pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")

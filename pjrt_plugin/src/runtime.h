@@ -155,6 +155,7 @@ class OclRuntime {
   // CPU-only (VMO_CPU_TILES builds; null on GPU): packed+blocked SGEMM.
   cl_kernel mm_pack_kernel() const { return mm_pack_kernel_; }
   cl_kernel mm_packed_kernel() const { return mm_packed_kernel_; }
+  cl_kernel mm_packed_epi_kernel() const { return mm_packed_epi_kernel_; }
   // Execution trace (PJRT_OCL_VM_TRACE=<path>): host-dispatch is forced and
   // every schedule entry runs as its own single-workgroup launch on a per-lane
   // profiling queue; per-entry device timestamps are appended to <path> as one
@@ -245,6 +246,7 @@ class OclRuntime {
   cl_kernel gemv_kernel_ = nullptr;    // width-1 matmul (both device classes)
   cl_kernel mm_pack_kernel_ = nullptr;    // CPU only: B panel packing
   cl_kernel mm_packed_kernel_ = nullptr;  // CPU only: packed 6x16 KC-swept
+  cl_kernel mm_packed_epi_kernel_ = nullptr;  // CPU only: packed 6x16 + epilogue
   std::string trace_path_;             // empty = tracing off
   bool trace_suppressed_ = false;      // true during cost calibration
   std::string cost_table_path_;        // measured cost JSON ("" = unit costs)
@@ -296,6 +298,12 @@ class LoadedProgram {
   // Pure-matmul fast path: launch the standalone mm2 SGEMM (one workgroup per
   // 128x128 output tile) instead of the megakernel. Only taken when mm_ok_.
   bool LaunchMatmul(cl_command_queue q, std::string* err);
+  // Enqueue the packed CPU SGEMM (mm2_pack + mm2p KC-sweeps) for one matmul,
+  // writing into scratch `bp`. Shared by the pure-matmul fast path and the CPU
+  // in-program hybrid routing (both need the identical pack+sweep sequence).
+  bool EnqueuePackedMM(cl_command_queue q, uint32_t M, uint32_t N, uint32_t K,
+                       uint32_t dst, uint32_t a, uint32_t bh, cl_mem bp,
+                       uint32_t p6, uint32_t p7, std::string* err);
   // Trace mode: lazily creates the per-lane profiling queues (one per lane so
   // lanes run concurrently, like workgroups of one launch do).
   bool EnsureTraceQueues(std::string* err);
@@ -315,6 +323,11 @@ class LoadedProgram {
   cl_mem seg_tab_buf_ = nullptr;   // host-dispatch: per-lane {off,count} u2
   cl_mem mm_bp_ = nullptr;         // CPU packed matmul: B-panel scratch (pool)
   size_t mm_bp_bytes_ = 0;
+  // CPU in-program matmul hybrid: B-panel scratch reused across every routed
+  // matmul in the program (in-order queue serializes pack/sweep so one buffer
+  // is safe). Sized at load time to the largest routable matmul's K*N.
+  cl_mem hy_bp_ = nullptr;
+  size_t hy_bp_bytes_ = 0;
   std::vector<cl_command_queue> trace_queues_;  // trace mode, one per lane
 
   // Zero-copy I/O ports (docs/decisions.md): up to kNIoPorts input/output

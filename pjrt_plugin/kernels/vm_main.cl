@@ -368,6 +368,31 @@ __kernel void mm2_pack(__global uchar *arena, VMO_IO_PARAMS,
             Bp + (ulong)p * K * 16u + k * 16u + 8u);
 }
 
+/* mm2p geometry (poc/10 + poc/18): 2D grid. dim0 = 6-row block, dim1 = a group
+ * of VMO_MM_PC 16-col panels. Splitting N across workgroups (vs one WG per
+ * 6-row stripe streaming all of N) multiplies the workgroup count by N/(16*PC)
+ * — on PoCL, one WI/WG maps to one host thread, so more, smaller workgroups
+ * fill all 24 threads and keep each WG's B working set (PC panels x KC) L1/L2
+ * resident. Measured @2048: 297 -> 555 GFLOP/s; @1024: 230 -> 500 (poc/18).
+ * The 6x16 accumulator block is FULLY UNROLLED into named registers: PoCL's
+ * LLVM leaves the a0[6]/a1[6] arrays in memory (SROA fails across the k-loop),
+ * costing ~25% — named c00..c15 stay in ymm. */
+#ifndef VMO_MM_PC
+#define VMO_MM_PC 2u
+#endif
+#define VMO_MM_ACC6(A0, A1, A2, A3, A4, A5)                                    \
+    do {                                                                       \
+        const float8 av0 = (float8)(A0), av1 = (float8)(A1),                   \
+                     av2 = (float8)(A2), av3 = (float8)(A3),                   \
+                     av4 = (float8)(A4), av5 = (float8)(A5);                   \
+        c00 = mad(av0, b0, c00); c10 = mad(av0, b1, c10);                      \
+        c01 = mad(av1, b0, c01); c11 = mad(av1, b1, c11);                      \
+        c02 = mad(av2, b0, c02); c12 = mad(av2, b1, c12);                      \
+        c03 = mad(av3, b0, c03); c13 = mad(av3, b1, c13);                      \
+        c04 = mad(av4, b0, c04); c14 = mad(av4, b1, c14);                      \
+        c05 = mad(av5, b0, c05); c15 = mad(av5, b1, c15);                      \
+    } while (0)
+
 __kernel void mm2p(__global uchar *arena, VMO_IO_PARAMS,
                    const uint M, const uint N, const uint K,
                    const uint dsth, const uint ah,
@@ -378,45 +403,143 @@ __kernel void mm2p(__global uchar *arena, VMO_IO_PARAMS,
     __global const float *ga = AP(const float, ah);
     __global float *gd = AP(float, dsth);
     const uint r0 = get_group_id(0) * 6u;
-    if (r0 >= M) return;
-    const uint nr = min(6u, M - r0);
-    if (nr == 6u) {
-        for (uint p = 0; p < N / 16u; ++p) {
-            __global const float *panel = gbp + (ulong)p * K * 16u;
-            float8 a0[6], a1[6];
-            if (kc0 == 0u) {
-                for (int i = 0; i < 6; ++i) {
-                    a0[i] = (float8)(0.0f); a1[i] = (float8)(0.0f);
-                }
-            } else {
-                for (int i = 0; i < 6; ++i) {
-                    a0[i] = vload8(0, gd + (r0 + i) * N + p * 16u);
-                    a1[i] = vload8(0, gd + (r0 + i) * N + p * 16u + 8u);
-                }
-            }
-            for (uint k = kc0; k < kc1; ++k) {
-                const float8 b0 = vload8(0, panel + k * 16u);
-                const float8 b1 = vload8(0, panel + k * 16u + 8u);
-                for (int i = 0; i < 6; ++i) {
-                    const float8 av = (float8)(ga[(r0 + i) * K + k]);
-                    a0[i] = mad(av, b0, a0[i]);
-                    a1[i] = mad(av, b1, a1[i]);
-                }
-            }
-            for (int i = 0; i < 6; ++i) {
-                vstore8(a0[i], 0, gd + (r0 + i) * N + p * 16u);
-                vstore8(a1[i], 0, gd + (r0 + i) * N + p * 16u + 8u);
-            }
+    const uint np = N / 16u;
+    const uint pg = get_group_id(1) * VMO_MM_PC;
+    if (r0 >= M || pg >= np) return;
+    const uint pe = min(pg + VMO_MM_PC, np);
+    if (r0 + 6u > M) {   /* edge rows: one full-K scalar pass, on first sweep */
+        if (kc0 == 0u)
+            for (uint p = pg; p < pe; ++p)
+                for (uint c0 = p * 16u; c0 < p * 16u + 16u; ++c0)
+                    for (uint i = 0; i < M - r0; ++i) {
+                        float s = 0.0f;
+                        for (uint k = 0; k < K; ++k)
+                            s = mad(ga[(r0 + i) * K + k],
+                                    gbp[(ulong)p * K * 16u + k * 16u +
+                                        (c0 % 16u)], s);
+                        gd[(r0 + i) * N + c0] = s;
+                    }
+        return;
+    }
+    __global const float *a0p = ga + (r0 + 0) * K, *a1p = ga + (r0 + 1) * K,
+                         *a2p = ga + (r0 + 2) * K, *a3p = ga + (r0 + 3) * K,
+                         *a4p = ga + (r0 + 4) * K, *a5p = ga + (r0 + 5) * K;
+    for (uint p = pg; p < pe; ++p) {
+        __global const float *panel = gbp + (ulong)p * K * 16u;
+        float8 c00, c01, c02, c03, c04, c05, c10, c11, c12, c13, c14, c15;
+        if (kc0 == 0u) {
+            c00 = c01 = c02 = c03 = c04 = c05 =
+            c10 = c11 = c12 = c13 = c14 = c15 = (float8)(0.0f);
+        } else {
+            __global float *cp = gd + p * 16u;
+            c00 = vload8(0, cp + (r0 + 0) * N); c10 = vload8(0, cp + (r0 + 0) * N + 8u);
+            c01 = vload8(0, cp + (r0 + 1) * N); c11 = vload8(0, cp + (r0 + 1) * N + 8u);
+            c02 = vload8(0, cp + (r0 + 2) * N); c12 = vload8(0, cp + (r0 + 2) * N + 8u);
+            c03 = vload8(0, cp + (r0 + 3) * N); c13 = vload8(0, cp + (r0 + 3) * N + 8u);
+            c04 = vload8(0, cp + (r0 + 4) * N); c14 = vload8(0, cp + (r0 + 4) * N + 8u);
+            c05 = vload8(0, cp + (r0 + 5) * N); c15 = vload8(0, cp + (r0 + 5) * N + 8u);
         }
-    } else if (kc0 == 0u) {   /* edge rows: one full-K scalar pass */
-        for (uint c0 = 0; c0 < N; ++c0)
-            for (uint i = 0; i < nr; ++i) {
-                float s = 0.0f;
-                for (uint k = 0; k < K; ++k)
-                    s = mad(ga[(r0 + i) * K + k],
-                            gbp[(ulong)(c0 / 16u) * K * 16u + k * 16u +
-                                (c0 % 16u)], s);
-                gd[(r0 + i) * N + c0] = s;
+        for (uint k = kc0; k < kc1; ++k) {
+            const float8 b0 = vload8(0, panel + k * 16u);
+            const float8 b1 = vload8(0, panel + k * 16u + 8u);
+            VMO_MM_ACC6(a0p[k], a1p[k], a2p[k], a3p[k], a4p[k], a5p[k]);
+        }
+        __global float *cp = gd + p * 16u;
+        vstore8(c00, 0, cp + (r0 + 0) * N); vstore8(c10, 0, cp + (r0 + 0) * N + 8u);
+        vstore8(c01, 0, cp + (r0 + 1) * N); vstore8(c11, 0, cp + (r0 + 1) * N + 8u);
+        vstore8(c02, 0, cp + (r0 + 2) * N); vstore8(c12, 0, cp + (r0 + 2) * N + 8u);
+        vstore8(c03, 0, cp + (r0 + 3) * N); vstore8(c13, 0, cp + (r0 + 3) * N + 8u);
+        vstore8(c04, 0, cp + (r0 + 4) * N); vstore8(c14, 0, cp + (r0 + 4) * N + 8u);
+        vstore8(c05, 0, cp + (r0 + 5) * N); vstore8(c15, 0, cp + (r0 + 5) * N + 8u);
+    }
+}
+
+/* Store-epilogue variant of the ALU micro-program (mirror of ops/mma.cl's
+ * vmo_mma_epi, batch g fixed to 0 since routing only takes p3<=1). Applies the
+ * fused scale/bias/gelu/residual chain in aux at (ep6-1) to one accumulator at
+ * output (gr,gc) before store — lets the CPU hybrid route bias+relu FFN /
+ * residual-add projection matmuls (p6!=0) that would otherwise crawl on the
+ * in-megakernel scalar-4x4 mma. */
+static float vmo_mm2p_epi(float v, __global uchar *arena, __global uchar **iop,
+                          __global const int *aux, uint ep6, uint ep7,
+                          uint gr, uint gc, uint N)
+{
+    if (!ep6) return v;
+    const int eoff = (int)ep6 - 1;
+    const uint nm = (uint)aux[eoff];
+    for (uint m = 0; m < nm; ++m) {
+        const int o = eoff + 1 + (int)m * 4;
+        const uint kind = (uint)aux[o];
+        const uint src  = (uint)aux[o + 1];
+        const float s  = as_float(aux[o + 2]);
+        const float tt = as_float(aux[o + 3]);
+        float y = v;
+        if (src == 1u)
+            y = ((__global const float *)VMO_BASE(ep7))[(size_t)gr * N + gc];
+        else if (src == 2u)
+            y = ((__global const float *)VMO_BASE(ep7))[gc];
+        v = vmo_region_micro(kind, (float4)(v), (float4)(y), s, tt).x;
+    }
+    return v;
+}
+
+/* Packed CPU SGEMM with a fused store-epilogue (single K-sweep — routing only
+ * uses this for K where one sweep is fine, KC blocking is unnecessary). Same
+ * 2D grid / 6x16 unrolled block as mm2p; every output goes through
+ * vmo_mm2p_epi before store (scalar store, O(M*N) — negligible vs O(M*N*K)). */
+__kernel void mm2p_epi(__global uchar *arena, VMO_IO_PARAMS,
+                       __global const int *aux,
+                       const uint M, const uint N, const uint K,
+                       const uint dsth, const uint ah,
+                       __global const float *gbp,
+                       const uint ep6, const uint ep7)
+{
+    VMO_IO_ARRAY;
+    __global const float *ga = AP(const float, ah);
+    __global float *gd = AP(float, dsth);
+    const uint r0 = get_group_id(0) * 6u;
+    const uint np = N / 16u;
+    const uint pg = get_group_id(1) * VMO_MM_PC;
+    if (r0 >= M || pg >= np) return;
+    const uint pe = min(pg + VMO_MM_PC, np);
+    if (r0 + 6u > M) {   /* edge rows: scalar, epilogued */
+        for (uint p = pg; p < pe; ++p)
+            for (uint c0 = p * 16u; c0 < p * 16u + 16u; ++c0)
+                for (uint i = 0; i < M - r0; ++i) {
+                    float s = 0.0f;
+                    for (uint k = 0; k < K; ++k)
+                        s = mad(ga[(r0 + i) * K + k],
+                                gbp[(ulong)p * K * 16u + k * 16u + (c0 % 16u)], s);
+                    gd[(r0 + i) * N + c0] =
+                        vmo_mm2p_epi(s, arena, iop, aux, ep6, ep7, r0 + i, c0, N);
+                }
+        return;
+    }
+    __global const float *a0p = ga + (r0 + 0) * K, *a1p = ga + (r0 + 1) * K,
+                         *a2p = ga + (r0 + 2) * K, *a3p = ga + (r0 + 3) * K,
+                         *a4p = ga + (r0 + 4) * K, *a5p = ga + (r0 + 5) * K;
+    for (uint p = pg; p < pe; ++p) {
+        __global const float *panel = gbp + (ulong)p * K * 16u;
+        float8 c00, c01, c02, c03, c04, c05, c10, c11, c12, c13, c14, c15;
+        c00 = c01 = c02 = c03 = c04 = c05 =
+        c10 = c11 = c12 = c13 = c14 = c15 = (float8)(0.0f);
+        for (uint k = 0; k < K; ++k) {
+            const float8 b0 = vload8(0, panel + k * 16u);
+            const float8 b1 = vload8(0, panel + k * 16u + 8u);
+            VMO_MM_ACC6(a0p[k], a1p[k], a2p[k], a3p[k], a4p[k], a5p[k]);
+        }
+        float cb[6][16];
+        vstore8(c00, 0, cb[0]); vstore8(c10, 0, cb[0] + 8);
+        vstore8(c01, 0, cb[1]); vstore8(c11, 0, cb[1] + 8);
+        vstore8(c02, 0, cb[2]); vstore8(c12, 0, cb[2] + 8);
+        vstore8(c03, 0, cb[3]); vstore8(c13, 0, cb[3] + 8);
+        vstore8(c04, 0, cb[4]); vstore8(c14, 0, cb[4] + 8);
+        vstore8(c05, 0, cb[5]); vstore8(c15, 0, cb[5] + 8);
+        for (uint i = 0; i < 6u; ++i)
+            for (uint j = 0; j < 16u; ++j) {
+                const uint gc = p * 16u + j;
+                gd[(r0 + i) * N + gc] = vmo_mm2p_epi(cb[i][j], arena, iop, aux,
+                                                     ep6, ep7, r0 + i, gc, N);
             }
     }
 }

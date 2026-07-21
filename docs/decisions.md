@@ -752,6 +752,48 @@ NVIDIA megakernel 1.06–1.19× (cheap in-kernel barriers); **PoCL host-dispatch
     Stop point recorded: packed A / prefetch / per-core-type tiles not worth it for a debug
     backend.
 
+## 12a. CPU matmul, round 2: 2D grid + unrolled accs + in-program hybrid (2026-07-21, poc/18)
+
+Re-attacked the CPU matmul front (the poc/10 "stop point" was premature). Two independent wins
+in the packed SGEMM kernel, then the far bigger structural fix — routing *in-program* matmul off
+the megakernel. All f32-exact on PoCL (no fast-math; `mad()` already fuses), 343/1 pytest green.
+
+- ✅ **`mm2p` kernel rework (poc/18, standalone verified then shipped):**
+  1. **Fully-unrolled named accumulators.** The `float8 a0[6]/a1[6]` array left the accumulators
+     in memory (PoCL/LLVM SROA fails across the k-loop); naming them `c00..c15` keeps them in ymm.
+     +25% @2048 standalone.
+  2. **2D grid `{ceil(M/6), ceil(npanels/PC)}`, PC=2.** One WI/WG = one PoCL host thread, so the
+     old 1D `ceil(M/6)`-group grid starved the 24 threads at M≤1024 (171 groups). Splitting N into
+     32-col panel-groups multiplies workgroups by N/32 → all cores fed, each WG's B slice L1/L2-hot.
+     @1024 230→503 GFLOP/s (2.2x). PC=1–2 best; PC≥8 collapses.
+  - In-VM single-matmul sweep (bench_ops, GFLOP/s @256/512/1024/2048): **62/219/230/301 →
+    112/447/600/370**. XLA-CPU (Eigen) reference on the same box: 202/539/993/510 — we're now
+    0.55–0.83x XLA on square sweeps (was 0.2–0.3x), and standalone the kernel hits 555 @2048.
+  - **Power-of-2 residual**: @2048 in-VM dips to 370 (standalone 555) — leading-dim cache aliasing
+    (A stride K·4, C stride N·4 both 8 KiB → same L1 set), worsened by arena A/C offsets. 1536/1792
+    run 557–602. Needs packed-A/dim-pad; deferred again (isolated to power-of-2 N).
+- ✅ **The real workload win — CPU in-program matmul hybrid (`hy_bp_`, `mm2p_epi`).** Root cause
+  found by benching chained matmuls (bigmlp 1024³×6): a single matmul takes the pure-matmul fast
+  path (mm2p, ~600 GF/s) but a matmul *embedded in a larger program* ran the megakernel's scalar
+  4x4 `vmo_mma_tile` — pessimal on PoCL (§12 rc2: `__local` staging + WG barriers force loop-splits)
+  — at **~10 GFLOP/s**. Mirror of the NVIDIA `mm_tc` hybrid (§36) for CPU: at host-dispatch time,
+  peel any phase whose every task is a plain f32 matmul out to the packed kernel (flush pending VM
+  phases enqueue-only, then enqueue pack+mm2p; in-order queue serializes — no clFinish). One shared
+  B-panel scratch reused across the program's matmuls (in-order pack_{i+1} is ordered after sweeps_i).
+  - **Epilogue-fused matmuls too (`mm2p_epi`).** The FFN/projection matmuls carry a §33-R2c store
+    epilogue (bias/relu/residual, `p6`/`p7`), which the plain packed kernel can't apply — so they'd
+    stay on the slow VM path. Added a single-sweep `mm2p_epi` that runs the same per-element ALU
+    micro-program (`vmo_mm2p_epi`, byte-mirror of `vmo_mma_epi`) at store. This unlocked the FFN,
+    the dominant cost in real transformers. (Batched+viewed matmuls — attention QKᵀ/AV — still stay
+    on the VM: `p3>1`/`p4|p5` unsupported by the packed path.)
+  - **Measured (ms/iter, ours-PoCL vs XLA-CPU):** bigmlp 1024³×6 **1230→37** (10.5→347 GF/s; XLA
+    20/647). transformer `small` **280→85** (gap 36×→11×). transformer `base` (FFN-dominated):
+    hybrid-off 2172 → QKV-only 1660 → **full 392** (9.6→53 GF/s; XLA 117 → gap 18.5×→3.35×),
+    vs-JAX-CPU allclose PASS. Overhead-bound workloads (`mlp` 23 ms, `attention` 12 ms — tiny/viewed
+    matmuls, host-dispatch phase floor dominates) are unchanged: not a matmul-front problem (§12 rc3).
+  - Default ON for CPU; `PJRT_OCL_MM_HYBRID_CPU=0` disables. `PJRT_OCL_MM_HYBRID_DBG=1` prints
+    routed phases. Refactored the pure-matmul packed enqueue into `EnqueuePackedMM` (shared).
+
 ## 13. General principle: access-map–driven fusion (2026-07-16, transformer workload)
 
 Driving a realistic transformer forward pass (`tools/bench_transformer.py`: layernorm, MHA,
