@@ -73,6 +73,13 @@ CONFIGS = {
     # single large layer: fits the arena today; the full 6-layer `large` needs
     # arena liveness-reuse (bump allocator overflows the u32 offset cap — §15).
     "large_l1": (8, 256, 1024, 16, 4096, 1),
+    # LONG-SEQUENCE prefill (§34 flash-attention target): base model dims, a
+    # growing sequence length. The decomposed path materializes the (H,T,T)
+    # score matrix (T² per head) twice; flash never does — its payoff scales
+    # with T. batch 1 to keep the arena bounded at long T.
+    "base_s512":  (1, 512, 512, 8, 2048, 2),
+    "base_s1k":   (1, 1024, 512, 8, 2048, 2),
+    "base_s2k":   (1, 2048, 512, 8, 2048, 2),
 }
 
 

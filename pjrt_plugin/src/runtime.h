@@ -51,7 +51,8 @@ enum TileOp : uint32_t {
   kTopRedWindow = 9, kTopRedSeg = 10,
   kTopSoftmaxSeg = 11, kTopLayernormSeg = 12,  // fused segmented norms (§19)
   kTopMapRegion = 13,  // §27 register-resident map-region (PoC; -DVMO_REGION_POC)
-  kMaxTileOp = kTopMapRegion,
+  kTopFlashAttn = 14,  // §34 fused flash-attention (online softmax; p0 = V buffer)
+  kMaxTileOp = kTopFlashAttn,
 };
 // dtype packed in tile_op bits 8-15 (matches python DT_* / vm_common.cl).
 enum VmDtype : uint32_t {

@@ -145,6 +145,9 @@ OP_LAYERNORM = 55        # fused layernorm core over innermost `seg`; imm = seg,
 OP_GELU = 56             # fused GELU tanh-approx unary EW op (§19b/§24); a = input, no imm
 OP_MAP_REGION = 57       # §27/§28 register-resident fused map-region: a=in0, b=in1,
                          # n=elems, aux=descriptor word-offset (slots + micro-program)
+OP_FLASH_ATTN = 58       # §34 fused flash-attention (online softmax): a=Q b=K src,
+                         # imm2=V src, n=H, imm=T, aux=descriptor word-offset
+                         # ([H,T,C,hd,scale,causal,qv,kv,vv]); dst=out
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -175,6 +178,7 @@ OP_NAMES = {
     OP_LAYERNORM: "layernorm",
     OP_GELU: "gelu",
     OP_MAP_REGION: "map_region",
+    OP_FLASH_ATTN: "flash_attn",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
@@ -2151,6 +2155,215 @@ def _fuse_mma_epilogue(ctx: _Ctx, main_len: int) -> None:
             reads_hint=new_hint)
 
 
+def _gather_is_identity(ctx: _Ctx, aux_off: int, n: int) -> bool:
+    """True iff the OP_GATHER_STRIDED descriptor at `aux_off` is a pure
+    contiguous reshape (element i ↦ i): src_off == 0 and in_strides equal the
+    row-major strides of out_dims, over exactly `n` elements. Such a gather can
+    be skipped in the flash-attention walk (it only re-labels axes)."""
+    aux = ctx.aux
+    if aux_off + 1 > len(aux):
+        return False
+    rank = aux[aux_off]
+    if rank <= 0 or aux_off + 1 + 2 * rank + 1 > len(aux):
+        return False
+    out_dims = [aux[aux_off + 1 + i] for i in range(rank)]
+    in_strides = [_as_i32(aux[aux_off + 1 + rank + i]) for i in range(rank)]
+    src_off = _as_i32(aux[aux_off + 1 + 2 * rank])
+    total = 1
+    for d in out_dims:
+        total *= d
+    if src_off != 0 or total != n:
+        return False
+    # element i ↦ i iff every axis with dim>1 carries its row-major stride
+    # (size-1 axes never contribute — their index is always 0 — so their stride
+    # is irrelevant; a leading size-1 axis is exactly why we can't require exact
+    # equality). src_off already checked to be 0.
+    acc, want = 1, [0] * rank
+    for i in range(rank - 1, -1, -1):
+        want[i] = acc
+        acc *= out_dims[i]
+    return all(out_dims[i] == 1 or in_strides[i] == want[i]
+               for i in range(rank))
+
+
+def _as_i32(u: int) -> int:
+    return u - (1 << 32) if u >= (1 << 31) else u
+
+
+def _epi_scale(ctx: _Ctx, epi: int):
+    """If a DOT epilogue (aux at epi-1) is EXACTLY one AFFINE(x·s + 0) with a
+    unary self source, return its scale s (float bits); else None (bail). Used to
+    recover the QKᵀ ×(hd**-0.5) that _fuse_mma_epilogue folded into the DOT."""
+    if not epi:
+        return 0  # no epilogue → scale contribution is identity (handled = 1.0)
+    aux = ctx.aux
+    off = epi - 1
+    if off < 0 or off + 1 > len(aux):
+        return None
+    nm = aux[off]
+    if nm != 1 or off + 1 + 4 > len(aux):
+        return None
+    kind, src, s_bits, t_bits = (aux[off + 1], aux[off + 2],
+                                 aux[off + 3], aux[off + 4])
+    if kind != _EPI_AFFINE or src != _EPI_SELF or _bits_to_f32(t_bits) != 0.0:
+        return None
+    return s_bits
+
+
+def _bits_to_f32(bits: int) -> float:
+    import numpy as np
+    return float(np.frombuffer(np.uint32(bits & 0xFFFFFFFF).tobytes(), "<f4")[0])
+
+
+def _fuse_attention(ctx: _Ctx, main_len: int) -> None:
+    """Recognize the batched per-head attention idiom  DOT(QKᵀ)[·scale] →
+    softmax(-1) → DOT(AV)  and collapse it into ONE OP_FLASH_ATTN (online
+    softmax), so the (T×C) score matrix never materializes and the two attention
+    matmuls + the softmax reduce fold from 3 barriered phases into 1 (§34).
+
+    Anchored on OP_SOFTMAX. Walks BACKWARD through an optional identity-reshape
+    gather and an optional scale-affine to reach DOT1 (the QKᵀ matmul, whose
+    ×scale may instead sit in its §33 epilogue), and FORWARD to the single
+    consumer DOT2 (the AV matmul). Q/K/V and their FOLDED views (aview/bview) are
+    carried verbatim into the fused op, which reads them through the SAME strided
+    descriptors the matmuls used — so the result is byte-addressed identically to
+    the decomposed path (decode: kv only; prefill: qv,kv,vv all fold).
+
+    Gated HARD on every shape relation + single-consumer linkage + hd ≤ 256
+    (local staging). Any mismatch leaves the decomposed DOT→softmax→DOT chain
+    untouched (never wrong, only sometimes-unfused).
+
+    DEFAULT OFF (`PJRT_OCL_FLASH=1` enables it): the scalar online-softmax kernel
+    is a MEASURED regression on this workload (§34) — it replaces two TF32
+    tensor-core matmuls with a scalar streaming kernel (prefill: up to 11× slower)
+    and, at decode T=1, runs only H workgroups (severe underutilization). Kept,
+    gated off, as the correct substrate for a future split-KV + tensor-core
+    version. Runs after _fuse_mma_epilogue/_dce_nops (so the scale is a single
+    epilogue or a single affine and softmax is one op) and before
+    _finalize_matmul_views / _reuse_arena (so liveness sees the fused Q/K/V reads)."""
+    if os.environ.get("PJRT_OCL_FLASH", "0") != "1":
+        return
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+    _HD_MAX = 256
+
+    def _elems(buf: int) -> int:
+        return ctx.buffers[buf].size_bytes // 4
+
+    # unique-writer + live-reader maps (over non-NOP instrs).
+    writer: dict[int, int] = {}
+    multi: set[int] = set()
+    readers: dict[int, list[int]] = {}
+    for idx, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        d = ins.dst
+        if d in writer or d in multi:
+            writer.pop(d, None)
+            multi.add(d)
+        else:
+            writer[d] = idx
+        for b in _reads_of(ins):
+            readers.setdefault(b, []).append(idx)
+
+    def live_readers(buf: int) -> list[int]:
+        return [j for j in readers.get(buf, []) if instrs[j].op != OP_NOP]
+
+    import numpy as np
+
+    for si, SM in enumerate(instrs):
+        if SM.op != OP_SOFTMAX:
+            continue
+        C = SM.imm            # softmax segment length (= attention key count)
+        n_out = SM.n          # G*M
+        if C <= 0 or C > 0xFFFF:
+            continue
+
+        # --- backward: softmax.a → [reshape] → [affine·scale] → DOT1 -----------
+        walked_scale = np.float32(1.0)
+        consumed_mid: list[int] = []
+        cur = SM.a
+        DOT1i = None
+        for _ in range(4):
+            if cur in outs or cur in multi:
+                break
+            w = writer.get(cur)
+            if w is None:
+                break
+            P = instrs[w]
+            # the producer must be single-consumer (only the chain reads it) so
+            # NOP'ing it later is safe.
+            if len(live_readers(cur)) != 1:
+                break
+            if P.op == OP_DOT:
+                DOT1i = w
+                break
+            if (P.op == OP_AFFINE_F32 and P.a == P.b and not P.imm2 and
+                    _elems(P.dst) == _elems(P.a)):
+                walked_scale = walked_scale * np.float32(_bits_to_f32(P.imm))
+                consumed_mid.append(w)
+                cur = P.a
+                continue
+            if (P.op == OP_GATHER_STRIDED and _elems(P.dst) == _elems(P.a) and
+                    _gather_is_identity(ctx, P.aux, _elems(P.dst))):
+                consumed_mid.append(w)
+                cur = P.a
+                continue
+            break
+        if DOT1i is None:
+            continue
+        DOT1 = instrs[DOT1i]
+        if len(live_readers(DOT1.dst)) != 1:      # its only reader is the chain
+            continue
+
+        G = max(1, DOT1.imm2)
+        M = DOT1.n
+        N1 = DOT1.imm >> 16
+        hd = DOT1.imm & 0xFFFF
+        if N1 != C or n_out != G * M or hd <= 0 or hd > _HD_MAX:
+            continue
+        epi_s = _epi_scale(ctx, DOT1.epi)
+        if epi_s is None:                          # epilogue present but not a pure scale
+            continue
+        scale = walked_scale
+        if DOT1.epi:
+            scale = scale * np.float32(_bits_to_f32(epi_s))
+
+        # --- forward: softmax.dst → DOT2 (AV) ---------------------------------
+        fwd = live_readers(SM.dst)
+        if SM.dst in outs or len(fwd) != 1:
+            continue
+        DOT2i = fwd[0]
+        DOT2 = instrs[DOT2i]
+        if (DOT2.op != OP_DOT or DOT2.a != SM.dst or DOT2.aview != 0
+                or DOT2.epi != 0):
+            continue
+        G2 = max(1, DOT2.imm2)
+        M2 = DOT2.n
+        N2 = DOT2.imm >> 16
+        K2 = DOT2.imm & 0xFFFF
+        if G2 != G or M2 != M or K2 != C or N2 != hd:
+            continue
+
+        Q, qv = DOT1.a, DOT1.aview
+        K, kv = DOT1.b, DOT1.bview
+        V, vv = DOT2.b, DOT2.bview
+        out = DOT2.dst
+        # sanity: the fused op reads Q/K/V/out with the sizes the matmuls used.
+        if (_elems(out) != G * M * hd or _elems(Q) < G * M * hd):
+            continue
+
+        hdr = ctx.add_aux([G, M, C, hd, int(np.float32(scale).view(np.uint32)),
+                           0, qv, kv, vv])   # causal = 0 (idiom has no mask)
+        for j in consumed_mid + [DOT1i, si]:
+            instrs[j] = Instr(OP_NOP)
+        # emit the fused op in DOT2's slot (after Q/K/V are produced; its output
+        # buffer + downstream consumers are unchanged).
+        instrs[DOT2i] = Instr(OP_FLASH_ATTN, dst=out, a=Q, b=K,
+                              n=G, imm=M, imm2=V, aux=hdr,
+                              reads_hint=(V,))
+
+
 def _reuse_arena(ctx: _Ctx, main_len: int) -> None:
     """Reassign arena byte offsets by live interval (offline linear-scan /
     register-allocation) so the arena is bounded by PEAK concurrent liveness,
@@ -2381,6 +2594,13 @@ def lower_module(module) -> VMProgram:
     # EW/norm/gelu fusions so those are single ops = epilogue candidates, and
     # before _reuse_arena so liveness sees the retargeted DOT + residual read.
     _fuse_mma_epilogue(ctx, main_len)
+    _dce_nops(ctx)
+    # §34 flash-attention: collapse DOT(QKᵀ)·scale → softmax → DOT(AV) into ONE
+    # online-softmax op (no materialized score matrix). Runs after the epilogue
+    # fold (so QKᵀ's ×scale is a single epilogue/affine and softmax is one op)
+    # and before _finalize_matmul_views/_reuse_arena. Reads Q/K/V through the
+    # DOTs' own folded views, so it must see aview/bview BEFORE they are consumed.
+    _fuse_attention(ctx, main_len)
     _dce_nops(ctx)
     # Mirror DOT views + epilogue into the serialized aux header now that both
     # are settled, so the reparsed tensor validator can recover them.

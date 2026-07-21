@@ -2361,3 +2361,97 @@ serial-block transformer it is a small win, not the frontier's payoff. Prologue
 (stage 4) deliberately NOT built this session: it targets the remaining 24 *even
 cheaper* LN-affine EW phases, so its e2e ceiling is below the epilogue's — not worth
 the strided-load risk until a flash-attention-class lever lands (§14a).
+
+## 34. Flash-attention (QKᵀ→softmax→AV as ONE online-softmax op) — BUILT, MEASURED, REVERTED (default OFF) — 2026-07-21
+
+**Goal (the §33 "what WOULD close it" lever a).** Fuse the batched per-head
+attention block `DOT(QKᵀ)·scale → softmax(-1) → DOT(AV)` into ONE instruction
+via **online softmax** (flash recurrence: running max `m`, denom `l`, output
+accumulator `acc[hd]`, rescale each K/V tile by `exp(m_old−m_new)`), so the
+(T×C) score matrix and the (1×C) decode score row NEVER materialize. This
+attacks the two MATMUL phases the §33 store-epilogue leaves alone.
+
+### What was built (all correct, all portable)
+- **`OP_FLASH_ATTN`(58)/`TILE_FLASH_ATTN`(14)** + a NEW self-contained kernel
+  `kernels/ops/attention.cl` (`vmo_flash_attn`): one workgroup per (head, query
+  row), streams the C keys in tiles of `lsz`, local tree-reduces for the per-tile
+  max/sum, `acc[hd]` in `__local` rescaled per tile. Reuses the shared As/Bs MMA
+  panels (no new occupancy) and obeys §18/§19a PoCL rules (uniform-trip key loop;
+  cleanup barrier at the loop TOP, never before the backedge; no return before a
+  barrier). SCALAR only — did NOT touch `mma.cl`'s tensor-core tile (a parallel
+  agent owns it); per the brief, WMMA-inside-attention was out of scope.
+- **Read-through-view (correct-by-construction).** Q/K/V are read through the
+  SAME strided view descriptors (qv/kv/vv) the decomposed DOT1/DOT2 used, with
+  the matmul's own flat-index formula — so the fused op reads byte-identical
+  inputs for ANY folded transpose/reshape (decode: kv only; prefill: qv,kv,vv all
+  fold). No shape assumption; a wrong layout is impossible because the addressing
+  is shared. Task: a=Q, b=K, p0=V (loader-patched), p1=H, p2=T, p3=descriptor
+  aux-offset `[H,T,C,hd,scale,causal,qv,kv,vv]`. Loader change: the §33 epilogue
+  p7-patch was gated on `kTopMma` so flash may use p6/p7 freely (byte-identical:
+  only MMA ever set p6).
+- **Recognizer `_fuse_attention`** (lowering, post-`_fuse_mma_epilogue`): anchors
+  on `OP_SOFTMAX`, walks BACKWARD through an optional identity-reshape gather +
+  scale-affine to DOT1 (scale recovered from its §33 epilogue OR the affine), and
+  FORWARD to the single-consumer DOT2. Hard-gated on every shape relation +
+  single-consumer linkage + hd≤256; any mismatch → decomposed path untouched.
+- Dual validators (tensor interp + schedule sim), `tests/test_ops_flash.py`
+  (12 tests: fires on decode/prefill/full-MHA idioms, both validators vs jax,
+  disabled/oversized/default-off gates).
+
+### Correctness — PROVEN exact on both engines (the online rescale is right)
+289→**301 pytest** (+12) + 1 skip. runtime_test PASS NVIDIA+PoCL. **NVIDIA
+MEGA_TC=0 scalar-f32 base FLASH ON = 2.15e-6** (vs decomposed 2.38e-6 — the
+online-softmax kernel is f32-EXACT, the reassociation is numerically clean).
+PoCL flash-on stable across repeats (finite, matches decode stats — no §19a
+heap-corruption; the barrier discipline holds). Isolated decode C=2048 dev-vs-ref
+2.7e-5. Occupancy UNCHANGED: lanes=376 (the scalar case reuses As/Bs + a few
+scalar registers; no cliff).
+
+### Phase count DROPS as designed — but wall-clock REGRESSES (the §33 wall, again)
+Base (6 layers), FLASH ON vs OFF: **prefill/decode 84 → 72 compute phases**
+(−12 = 3→1 per attention × 6 layers). The mechanism does exactly what it claims.
+
+But it is a **measured wall-clock REGRESSION everywhere it fires**, worsening
+with sequence length (RTX PRO 6000, TF32 megakernel, A/B via `PJRT_OCL_FLASH`):
+
+| workload (where flash fires)         | flash ON | flash OFF | ON/OFF |
+|--------------------------------------|----------|-----------|--------|
+| prefill base   (T=128)  ms/iter      | 12.20    | 5.41      | **2.3× slower** |
+| prefill base_s512 (T=512) ms/iter    | 9.56     | 1.85      | **5.2× slower** |
+| prefill base_s1k  (T=1024) ms/iter   | 33.84    | 2.94      | **11.5× slower** |
+| decode base    (C=256)  µs/token     | 4318     | 3807      | **1.13× slower** |
+
+**Why (two independent killers):**
+1. **Prefill replaces two TF32 tensor-core matmuls with a scalar kernel.** QKᵀ
+   and AV run on WMMA in the decomposed path; the scalar online-softmax kernel
+   cannot compete, and the gap grows with T (2.3×→11×). The 12 phases saved are
+   dwarfed by losing the tensor cores — §29 already pinned base at *matmul 84%*,
+   and this makes the matmul SLOWER, not faster.
+2. **Decode (T=1) runs only H workgroups** (=8 for base). One WG per (head,query)
+   → 8 of 376 lanes busy; the decomposed gemv path parallelizes over the C
+   dimension (more tiles). And §32 already showed decode is **weight-HBM-bandwidth
+   bound**, not attention-bound — even a perfect attention op barely moves decode
+   e2e.
+
+### Extra finding: it can't even fire at long context yet
+`_fuse_attention` anchors on `OP_SOFTMAX`, which `_fuse_norm` only emits for
+**seg ≤ 1024** (its local-staging cap, §19a). So for C>1024 (base_c2k/c4k,
+base_s2k) softmax stays decomposed and flash never fires — the "wash" numbers
+first seen there were both-decomposed (dev-vs-dev diff 0.00). The target
+long-context regime is exactly where it's blocked. Firing it there needs a
+second recognizer anchored on the decomposed `REDUCE_SEG` softmax; not built,
+because the increasing-regression trend (2.3×→11× as T grows 128→1024) makes the
+outcome certain — a longer C only does MORE serial scalar work.
+
+### Verdict (§14a): REVERT — default OFF, kept behind `PJRT_OCL_FLASH=1`
+Correct, portable, occupancy-free, collapses 14% of phases — but a wall-clock
+regression wherever it fires and blocked at the long context it targets. Per the
+§14a rule (keep only if it moves the needle) and the brief's PoC gate ("if it
+doesn't win even at long context, STOP and report"): **default OFF**, byte-
+identical revert. The op/kernel/recognizer are KEPT as the correct substrate for
+the version that *could* win — needs (a) **tensor-core** QKᵀ/AV inside the
+attention body (WMMA, the §33 substrate doesn't cover this), and (b) **split-KV /
+partial+reduction** (survey §1.1) so decode's low (H·T) occupancy fills the GPU.
+Both are large, hardware-specific builds; on this serial-block f32 transformer a
+scalar single-pass flash is the wrong tool. `PJRT_OCL_FLASH=1` re-enables it for
+that future work. NOT merged — reported for review.
