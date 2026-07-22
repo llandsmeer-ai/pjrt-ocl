@@ -283,6 +283,14 @@ def _depends(instrs, j: int, i: int) -> bool:
     a, b = instrs[i], instrs[j]
     aw = _writes(a)
     bw = _writes(b)
+    # §52: two members of the same DISJOINT group (concatenate/pad's scatters)
+    # write non-overlapping element ranges of the shared dst by construction, so
+    # their WAW edge is not a real dependency and needs no barrier. They still
+    # take RAW/WAR edges against everything else (including each other's reads,
+    # which never touch the shared dst).
+    if a.disjoint and a.disjoint == b.disjoint:
+        aw = aw - bw
+        bw = bw - _writes(a)
     return bool((_reads(b) & aw) or (bw & aw) or (_reads(a) & bw))
 
 
@@ -317,12 +325,37 @@ def _phases(instrs, indices: list[int], is_map, fuse: bool = True
                 else _cross_lane_dep(instrs, j, i, is_map))
     phases: list[list[int]] = []
     cur: list[int] = []
+    # Buffer -> members of the CURRENT phase that read / write it. `_depends`
+    # can only fire between instructions sharing a buffer, so testing j against
+    # just those members is equivalent to testing it against all of `cur` — and
+    # keeps this linear instead of quadratic in the phase size (a fully-fused
+    # unrolled scan puts thousands of instrs in one phase).
+    ph_readers: dict[int, list[int]] = {}
+    ph_writers: dict[int, list[int]] = {}
+
+    def track(i):
+        ins = instrs[i]
+        for b in _reads(ins):
+            ph_readers.setdefault(b, []).append(i)
+        for b in _writes(ins):
+            ph_writers.setdefault(b, []).append(i)
+
     for j in indices:
-        if cur and any(boundary(j, i) for i in cur):
+        cand: set[int] = set()
+        ins_j = instrs[j]
+        for b in _reads(ins_j):
+            cand.update(ph_writers.get(b, ()))
+        for b in _writes(ins_j):
+            cand.update(ph_writers.get(b, ()))
+            cand.update(ph_readers.get(b, ()))
+        if cur and any(boundary(j, i) for i in cand):
             phases.append(cur)
             cur = [j]
+            ph_readers.clear()
+            ph_writers.clear()
         else:
             cur.append(j)
+        track(j)
     if cur:
         phases.append(cur)
     return phases

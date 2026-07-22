@@ -33,12 +33,45 @@ def _row_major_strides(shape: tuple[int, ...]) -> list[int]:
     return strides
 
 
-def _emit_gather(ctx, out_shape, in_buf, out_strides, src_off=0, dtype=None):
+def _is_identity_map(out_shape, out_strides, src_off, in_n) -> bool:
+    """True iff this access map is `dst[i] = a[i]` over the whole input — i.e.
+    the gather is a pure relabel (§52). Size-1 axes carry no information and
+    their stride is irrelevant (broadcast_in_dim writes 0 there), so they are
+    dropped before the row-major contiguity test."""
+    if src_off != 0:
+        return False
+    dims, strides = [], []
+    for d, sz in enumerate(out_shape):
+        if sz == 1:
+            continue
+        dims.append(sz)
+        strides.append(out_strides[d])
+    acc = 1
+    for d in range(len(dims) - 1, -1, -1):
+        if strides[d] != acc:
+            return False
+        acc *= dims[d]
+    return acc == in_n
+
+
+def _emit_gather(ctx, out_shape, in_buf, out_strides, src_off=0, dtype=None,
+                 in_n=None):
     """Emit a GATHER_STRIDED producing out_shape from in_buf, walking in_buf with
     `out_strides` (one per output axis) starting at element `src_off`. Gather
     copies whole elements, so the output dtype = input dtype (must be passed for
-    non-f32 — the element size drives the VM's copy width)."""
+    non-f32 — the element size drives the VM's copy width).
+
+    §52: when the access map is the identity over the entire input (a reshape
+    written as broadcast_in_dim/transpose/slice-of-everything — the `jnp.stack`
+    and axis-juggling idioms emit these constantly inside scan bodies), no data
+    moves: ALIAS the input buffer, like stablehlo.reshape does. That removes a
+    whole barrier phase per occurrence instead of a full memory round trip.
+    `in_n` is the input's element count (defaults to the output's, which is
+    correct for every caller whose map is a permutation of the same count)."""
     n = math.prod(out_shape) if out_shape else 1
+    if _is_identity_map(out_shape, out_strides, src_off,
+                        n if in_n is None else in_n):
+        return in_buf
     rank = len(out_shape)
     aux_words = [rank] + list(out_shape) + list(out_strides) + [src_off]
     aux_off = ctx.add_aux(aux_words)
@@ -68,7 +101,7 @@ def _broadcast_in_dim(ctx, op):
                 raise L.LoweringError("broadcast_in_dim: non-1 axis size change")
             out_strides[out_axis] = in_strides[in_axis]
     dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]), out_strides,
-                       dtype=in_dt)
+                       dtype=in_dt, in_n=math.prod(in_shape) if in_shape else 1)
     ctx.value_to_buf[op.results[0]] = dst
     # scalar-const broadcast (rank-0 f32 -> full shape): record the constant so
     # an elementwise consumer can fold `x*s`/`x+t` into OP_AFFINE_F32 and let the
@@ -115,7 +148,8 @@ def _slice(ctx, op):
     out_strides = [in_strides[d] * sstrides[d] for d in range(len(out_shape))]
     src_off = sum(starts[d] * in_strides[d] for d in range(len(in_shape)))
     dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]),
-                       out_strides, src_off, dtype=in_dt)
+                       out_strides, src_off, dtype=in_dt,
+                       in_n=math.prod(in_shape) if in_shape else 1)
     ctx.value_to_buf[op.results[0]] = dst
 
 
@@ -132,7 +166,8 @@ def _reverse(ctx, op):
         out_strides[d] = -in_strides[d]
         src_off += (in_shape[d] - 1) * in_strides[d]
     dst = _emit_gather(ctx, in_shape, ctx.buf_for(op.operands[0]),
-                       out_strides, src_off, dtype=in_dt)
+                       out_strides, src_off, dtype=in_dt,
+                       in_n=math.prod(in_shape) if in_shape else 1)
     ctx.value_to_buf[op.results[0]] = dst
 
 
@@ -148,7 +183,7 @@ def _transpose(ctx, op):
     # output axis k corresponds to input axis perm[k]; walk that input stride.
     out_strides = [in_strides[perm[k]] for k in range(len(out_shape))]
     dst = _emit_gather(ctx, out_shape, ctx.buf_for(op.operands[0]), out_strides,
-                       dtype=in_dt)
+                       dtype=in_dt, in_n=math.prod(in_shape) if in_shape else 1)
     ctx.value_to_buf[op.results[0]] = dst
 
 
