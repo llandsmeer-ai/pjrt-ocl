@@ -3999,9 +3999,32 @@ input write and output read ASYNCHRONOUSLY (`CL_FALSE`) and pays exactly ONE
 `clFinish` at the end. The 1.6x measured above is per-transfer *synchronisation*
 cost, which we never pay. The transfer path was already efficient.
 
-**Where the ~29 us actually is: not yet localized.** It is host-side and
-device-independent, so the candidates are the PJRT C-API boundary, per-Execute
-program/entry/segment setup, and the host-dispatch phase walk — not OpenCL. A
-profiler run (perf on the plugin .so during a small-op loop) is the right next
-step; guessing has now cost two wrong hypotheses. Recorded so the next attempt
-starts from measurement, and so nobody re-tries zero-copy I/O expecting a win.
+**Where the ~29 us is — LOCALIZED by scaling, not guessing.** Varying the number
+of I/O buffers on Xe2 (256-element arrays, so transfer time is irrelevant):
+
+| program | us/call |
+|---|---|
+| 1 in, 1 out | 33.0 |
+| 4 in, 1 out | 47.8 |
+| 8 in, 1 out | 76.0 |
+| 1 in, 4 out | 54.2 |
+| 1 in, 8 out | 62.7 |
+
+Both axes scale **linearly at ~5–6 us per additional buffer**, on top of a fixed
+base of roughly 22 us. That is enormous for what should be one asynchronous
+enqueue per buffer (sub-microsecond). So the cost is **per-buffer host work in
+the Execute path**, not per-call setup and not the phase walk.
+
+Prime suspect for the next session: `LoadedProgram::ExecuteDevice` materializes
+every output into its own `std::vector<uint8_t>` (`(*outputs)[o].resize(...)`,
+which allocates AND zero-fills) and then that buffer is copied again as it
+crosses the PJRT boundary — i.e. per output we may pay allocate + zero + device
+read + copy. Inputs have the mirror-image shape. The fix direction is to reuse
+per-program scratch across Executes and read straight into the destination
+rather than through a fresh vector.
+
+**perf is NOT available in this container** (kernel 6.17.0-1028-oem; only
+`linux-tools-6.8` packages exist, and `perf record` produces nothing). Do not
+burn time re-trying it — the scaling experiment above is the substitute, and it
+is enough to aim the next attempt. Recorded also so nobody re-tries zero-copy
+I/O expecting a win.
