@@ -141,6 +141,9 @@ class OclRuntime {
   cl_kernel vm_seg_kernel() const { return vm_seg_kernel_; }
   cl_kernel vm_one_kernel() const { return vm_one_kernel_; }
   cl_kernel mm_kernel() const { return mm_kernel_; }
+  // §47 epilogue-fused SGEMM (mm2_epi); null on non-GPU builds. Lets the GPU
+  // host-dispatch hybrid route matmuls carrying a store-epilogue (p6!=0).
+  cl_kernel mm_epi_kernel() const { return mm_epi_kernel_; }
   // §36 standalone TF32 tensor-core SGEMM (poc/17); null unless the NVIDIA
   // VMO_NV_PTX program built. Preferred over mm_kernel_ (SGEMM) on GPU/TF32.
   cl_kernel mm_tc_kernel() const { return mm_tc_kernel_; }
@@ -273,6 +276,7 @@ class OclRuntime {
   cl_kernel vm_seg_kernel_ = nullptr;  // host-dispatch segment kernel
   cl_kernel vm_one_kernel_ = nullptr;  // trace mode: one entry per launch
   cl_kernel mm_kernel_ = nullptr;      // standalone SGEMM (pure-matmul fast path)
+  cl_kernel mm_epi_kernel_ = nullptr;  // §47 epilogue-fused SGEMM (GPU build)
   cl_kernel mm_tc_kernel_ = nullptr;   // §36 standalone TF32 WMMA (NV_PTX only)
   cl_kernel mm_tc_fp16_kernel_ = nullptr;  // §38 standalone fp16 WMMA (NV_PTX only)
   cl_kernel mm_tc_fp16p_kernel_ = nullptr; // §39 fp16-INPUT WMMA (packed scratch)

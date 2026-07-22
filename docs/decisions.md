@@ -3711,3 +3711,395 @@ strictly-linear bytecode, still f32 split-pair) — recorded, not built. complex
 is rejected (arena is f32). The top-level func may not RETURN a complex value
 (PJRT output buffers are single f32 arrays) — only real projections (abs/real/
 imag) cross the host boundary, which is all a magnitude-spectrum program needs.
+
+## 44. Xe2 (low-residency iGPU) defaults to host-dispatch, not the megakernel — 5–8x matmul win + fixes a chained-matmul -5 (2026-07-22)
+
+**Context.** Post-container-recreate bring-up on the Lunar Lake host (Intel Arc
+140V Xe2, `intel-opencl-icd` 26.22). Re-running `tools/plot_bench.py --device
+Intel` under the default engine produced `nan`s: `matrix x matrix` at N≥1536
+failed with `clFinish -5` (CL_OUT_OF_RESOURCES), and — because the bench worker
+benchmarks every op in ONE persistent process — that kernel-execution error
+POISONED the OpenCL context, so every *subsequent* op family (gather, while)
+then failed with `WriteToDevice failed`. In isolation gather/while are fine
+(verified); the cascade was purely downstream of the matmul -5.
+
+**Root cause.** The bench applies each op as a CHAIN=16 data-dependent chain in
+one dispatch. On the megakernel that is 16 sequential matmul instructions in a
+single long-running persistent-kernel launch. On Xe2 this is pathological:
+- Residency is only **32 co-resident workgroups** (measured, poc/08). The
+  megakernel caps parallelism at residency, so a 2048³ matmul (1024 output
+  tiles) is processed 32-at-a-time by persistent threads, while the
+  cross-workgroup spin-barrier between the 16 instructions is pure overhead.
+- A single 2048³ matmul is correct and takes ~16 ms; ×16 chained in one
+  dispatch runs long enough / hard enough that the Intel GPU returns -5.
+
+**Measurement (divergence experiment).** Same matmul chain, mega vs host
+engine (`PJRT_OCL_ENGINE`), N=512:
+
+| K (chain depth) | mega ms/matmul | host ms/matmul |
+|---|---|---|
+| 1  | 3.48 | 0.54 |
+| 8  | 2.19 | 0.39 |
+| 16 | 2.16 | 0.28 |
+
+Host-dispatch is **5–8x faster** and never trips -5. A host-launched matmul
+gets a full oversubscribed grid the driver latency-hides across the XVEs; the
+megakernel's whole premise (amortize launch overhead with persistent threads)
+does not pay on a 32-workgroup iGPU where launch is cheap relative to the
+barrier + the parallelism cap.
+
+**Decision (converge).** The "auto" engine default now flips GPUs whose
+**measured** residency is below `kMegaMinResidency = 64` to host-dispatch
+(`runtime.cc`, after `ProbeResidency`). Xe2 probes 32 → host; NVIDIA probes
+into the hundreds → keeps the megakernel, so **no NVIDIA re-validation needed**
+(the change is inert there). Guards: only fires on a genuine nonzero
+measurement, and never overrides an explicit `PJRT_OCL_ENGINE=host|mega`
+(tracked via `engine_forced`). `PJRT_OCL_ENGINE=mega` still forces the
+megakernel on Xe2 (runtime_test PASS confirms it still works when asked).
+
+**Validation.** Full `pytest tests/` on Xe2 with the new default: **406 passed,
+1 skipped** (the known Phase-1 WHILE/IF seam). `runtime_test` PASS on both
+Intel and PoCL. Regenerated `docs/bench_plot_xe2.csv` (no nans): matmul now
+completes at every N and beats JAX CPU through 1536³ (1.8x @768, 1.4x @1536),
+~par at 2048³. PoCL unaffected (CPU was always host-dispatch; the heuristic
+requires a nonzero residency measurement, and CPU probes 0).
+
+**Honest scope / next.** This is the project's "plan B keeps winning on small
+GPUs" case, exactly as CLAUDE.md anticipated — the megakernel thesis still
+holds on big discrete GPUs (NVIDIA benchmarks unchanged). The residency
+threshold (64) is a proxy; a per-device mega-vs-host matmul calibration at init
+would be more principled but adds init cost — deferred. Remaining Xe2 perf gap:
+the large matmul (2048³) is only ~par with an 8-core CPU at ~1.15 TFLOP/s,
+far below Xe2's f32 peak — the host-dispatch SGEMM microkernel is the next
+optimization target (§45+).
+
+## 45. Xe2 SGEMM tile: MM2_BK 16 → 8 (occupancy, not registers) — 1.3x (2026-07-22)
+
+**Context.** After §44 put Xe2 on host-dispatch, the standalone `mm2` SGEMM ran
+at ~1.17 TFLOP/s at 2048³ — about a quarter of the part's f32 peak, and only
+par with an 8-core CPU. Hypothesis going in: the 128×64 tile's 8×4 = 32
+accumulators over-pressure Intel's GRF and spill.
+
+**PoC (poc/19-xe2-mma).** The shipped kernel with `TM/TN/TD/BK` lifted to build
+`-D` options, swept at N=512/1024/2048 (full table in the poc README).
+
+**The hypothesis was WRONG — it is occupancy, not registers.** The 8×8
+(64-accumulator) 128×128 tile is the *fastest* config at 2048 (1866 GFLOP/s),
+so register pressure was not the limit. What mattered was `BK`: double-buffered
+staging allocates `2*BK*(TM+TN)` floats, so bk16 = 24 KB/workgroup vs bk8 =
+12 KB. Halving it doubles co-resident workgroups on the 128 KB SLM and lets the
+driver latency-hide global loads. `bk32` (48 KB) is catastrophic (−60%),
+confirming the occupancy story.
+
+| config | 512 | 1024 | 2048 |
+|---|---|---|---|
+| 128×64 bk16 (shipped) | 675 | 1079 | 1171 |
+| **128×64 bk8 (chosen)** | **795** | **1564** | 1522 |
+| 128×128 bk8 | 428 | 1608 | **1866** |
+
+**Chosen: 128×64 bk8** — a one-constant change. 128×128 bk8 is 1.23x better at
+2048 but *collapses* at 512 (428 vs 795: only 16 output tiles, far too few to
+fill 64 CUs), and ONE fixed geometry serves every host-dispatch matmul. Size-
+adaptive geometry (compile both, pick on M/N) is recorded as future work.
+
+**Result.** End-to-end single-call `a@b` on Xe2: 2048³ 16.05→11.75 ms (1.37x),
+1536³ 7.91→4.71 ms (1.68x), 1024³ 3.32→2.37 ms (1.40x). `MM2_BK` is NOT touched
+for `VMO_NV_PTX` (TF32 `TC_LDS = MMA_BK+4` and the k16 wmma fragments depend on
+it) or `VMO_CPU_TILES` — the constant changed is the GPU `mm2`'s own, so NVIDIA
+and CPU are unaffected and need no re-validation.
+
+## 46. The real Xe2 matmul win: route EMBEDDED matmuls to mm2 (+ an epilogue-fused mm2_epi) — 2.5x (2026-07-22)
+
+**The trap.** §45 sped up the single-matmul fast path but the chained benchmark
+barely moved. Cause: the fast path requires `tasks.size() == 1`, so it only ever
+fires for a program that is *exactly one matmul*. Every matmul EMBEDDED in a
+real program (transformer projections, MLP layers) fell back to the in-VM
+`vmo_mma_tile` — a 64×64 / 4×4 / single-buffered tile constrained by the
+megakernel's shared `__local` and register budget. Measured directly
+(`PJRT_OCL_MM_KERNEL=0` reproduces it): **574 vs 1443 GFLOP/s at 2048, a 2.5x
+gap** that no amount of tile tuning on the fast path could reach.
+
+**Fix (§46a): a GPU host-dispatch matmul hybrid.** The codebase already had this
+mechanism twice — `mm_tc` for NVIDIA TF32 (§36) and `mm2p` for CPU (§12/§13) —
+both gated so Xe2 got neither. Added a third: peel pure-matmul phases out of the
+program and enqueue `mm2`, same flush-without-drain structure (in-order queue
+serializes it after the flushed phases, no `clFinish`). Chained 2048³ matmul:
+**30.25 → 11.72 ms/op (2.58x, 568 → 1467 GFLOP/s)**; embedded matmul now matches
+the standalone path.
+
+**Fix (§46b): mm2_epi, because the FFN matmuls were still excluded.** With the
+hybrid on, the transformer gained only 9%. The `PJRT_OCL_MM_HYBRID_DBG`
+diagnostic (added here — it reports *why* a phase was kept on the VM) showed
+only the QKV projection routing; the two **largest** matmuls, FFN up
+(2048×4096×1024) and FFN down (2048×1024×4096), were rejected *solely* for
+carrying a store-epilogue (`p6!=0` — fused bias+gelu / residual add), since
+`mm2` had no epilogue path. Mirroring the CPU's `mm2p_epi`, `vmo_mm2p_epi` moved
+above the `VMO_CPU_TILES` split and `mm2`/`mm2_epi` now share ONE tuned body
+(`vmo_mm2_body`; `ep6==0` makes the epilogue the identity, costing one branch
+per *output* element — O(M*N) against an O(M*N*K) loop). The `__local` panels are
+declared by the kernels and passed in: OpenCL C forbids `__local` declarations
+in non-kernel functions.
+
+**Size gate — routing everything REGRESSES small programs.** Peeling costs an
+extra enqueue and breaks the phase's batching. Measured on the transformer:
+routing every matmul regressed `small` (vol ~3e7) by **39%** and was neutral on
+`base` (vol ≤5.4e8), while `large_l1` (vol ≥2.1e9) gained 27%. The gate is
+therefore on compute VOLUME `M*N*K >= 1<<30` (same form as the NVIDIA fp16
+hybrid's), which sits in that gap with margin.
+`PJRT_OCL_MM_HYBRID_GPU_MINVOL` re-tunes it; `PJRT_OCL_MM_HYBRID_GPU=0` disables.
+Noise floor on this host is ±6% — measured by running `base` OFF vs a
+route-nothing gate, which is how the earlier "6% base regression" was identified
+as noise rather than signal.
+
+**Result.** Transformer `large_l1` **101.2 → 74.2 ms/iter (1.36x, 552 → 753
+GFLOP/s)**; `small`/`base` unchanged. Chained per-op matmul vs JAX CPU is now
+**2.4–2.7x FASTER at every size** (was ~par at 2048, and crashing before §44).
+Validated: `pytest tests/` **406 passed / 1 skipped on BOTH Xe2 and PoCL**,
+`runtime_test` PASS on both, transformer `--check` allclose PASS on base and
+large_l1. NVIDIA is untouched (`mm_tc` still takes precedence; the new path
+requires `!mm_tc_kernel()`), CPU untouched (`is_gpu()` guard).
+
+**Honest scope.** Still NOT routed, by design: batched matmuls (`p3>1` — the
+per-head attention QK^T/AV) and matmuls with folded view operands (`p4/p5!=0`),
+neither of which `mm2` can read. Those keep the in-VM tile and are the next
+lever, along with size-adaptive tile geometry (§45) and Xe2's XMX/DPAS matrix
+engine (bf16-only, so it needs the same operand rounding the NVIDIA TF32 path
+uses — a vendor extension, belongs behind the kernel-table override).
+
+**Tooling gap found.** `tools/bench_suite/run_suite.py` is hardcoded to compare
+against native CUDA and forces `PJRT_OCL_DEVICE=NVIDIA` in its workers, so on a
+non-NVIDIA host every workload fails on BOTH sides. It has a `--cpu` mode
+(PoCL vs XLA CPU) but no GPU-vs-CPU mode, so the 18-workload testbench cannot
+currently be run on Xe2. Not fixed here — recorded as a gap.
+
+## 47. Xe2 streaming bandwidth: we are at 86% of achievable — NO change shipped (2026-07-22)
+
+**Context.** After the matmul work (§45/§46), the only op Xe2 still loses to XLA
+CPU on is `gather`/`dynamic_slice` (~2x at 16M). Before optimizing it, measure:
+is it a bad kernel, or the memory wall?
+
+**First, a correction to an earlier reading of the bench.** The chained
+benchmark's per-op elementwise number implied ~1100 GB/s, which is impossible on
+LPDDR5X. The explanation is that **our VM fuses the chain too** — 16 chained
+adds cost 1.25x a single add, not 16x. An earlier draft of the README claimed
+"XLA:CPU fuses elementwise chains and our bytecode VM does not"; that is WRONG
+and has been fixed. Both backends fuse, so the 2.2x elementwise ratio is an
+honest bandwidth-vs-bandwidth comparison.
+
+**PoC (poc/20-xe2-bw): the achievable ceiling is ~109 GB/s, not 136.** A bare
+triad / copy / read-only reduction all converge on ~108–110 GB/s (80% of
+theoretical — the normal ratio). Measured through the plugin, our elementwise
+`a+b` at 16M reaches **~94 GB/s = 86% of achievable**, and `dynamic_slice` sits
+at the same ceiling. So `gather` is **bandwidth-bound, not algorithmically
+bad**, and the "2x behind XLA CPU" is the same fused-chain comparison artifact,
+not a kernel defect. The residual ~14% is bytecode-VM interpretation (per-tile
+task descriptor read, handle resolution, sub-opcode branch) — intrinsic to the
+"one generic kernel, never recompile per dispatch" design.
+
+**`float8`/`float16` are a 27% PENALTY on Xe2** (80 vs 108 GB/s); `float1/2/4`
+are equivalent. This is the OPPOSITE of the CPU result (§11 / poc/09, where
+explicit `float8` took PoCL from 5 to 46 GB/s). Our `float8` bodies are gated to
+`VMO_CPU_TILES` and GPUs take the `float4` path, so the shipped code is already
+correct — but this is a trap for anyone tempted to widen the GPU vectors.
+
+**`EW_TS` re-checked and deliberately left at 4096.** Raising it buys nothing at
+16M (94 GB/s either way — an apparent 85→89 gain was run variance) and costs
+**44%** at n=64K (0.065 → 0.093 ms: too few tiles, idle XVEs). The
+NVIDIA-derived default is right for Xe2 too.
+
+**Outcome: no code change.** Recorded because the negative result is the useful
+part — it closes "optimize gather/elementwise on Xe2" as a dead end at the
+kernel level and prices the remaining VM-interpretation overhead at ~14%.
+
+## 48. Three Xe2 matmul follow-ups measured and REJECTED — the §45/§46 config is a local optimum (2026-07-22)
+
+All three obvious next steps after §46 were measured and none is worth shipping.
+Recorded so they are not re-opened.
+
+**(a) Size-adaptive tile geometry — rejected.** poc/19 showed 128×128 bk8 beats
+the shipped 128×64 bk8 by 1.23x on a SQUARE 2048 matmul, suggesting a
+launch-time tile choice on M/N. But on the three shapes a real transformer
+actually issues, the win evaporates: 2048×1024×1024 1.09x, 2048×4096×1024
+1.13x, and 2048×1024×4096 **0.94x — a regression**. ~1.05x average with one
+shape worse, against needing either a second full program build at init or a
+refactor of the kernel body to be macro-instantiable (its nested
+`#define MM2_STAGE` blocks simple macro-ization). Not worth it. Square-matrix
+microbenchmarks over-predicted the win — the real shapes are rectangular.
+
+**(b) Lowering the §46 volume gate — rejected, gate VALIDATED.** The `1<<30`
+gate was tuned before `mm2_epi` existed, so it might have been too conservative.
+Swept on the transformer (best-of-3 to beat the ±6% noise):
+
+| minvol | `base` ms | vs OFF (34.28) |
+|---|---|---|
+| OFF (no routing) | 34.28 | — |
+| 1<<27 (1.34e8) — routes proj+FFN | 36.45 | +6% worse |
+| 1<<28 (2.7e8) — routes FFN | 37.39 | +9% worse |
+| 1<<29 (5.4e8) — routes FFN | 37.46 | +9% worse |
+| **1<<30 (shipped)** — routes nothing here | 34.76 | parity (correct) |
+
+Three independent thresholds all regress `base` by 6–9% — a consistent signal,
+not noise. The gate is where it belongs. (Method note: `small`'s numbers spread
+12% across thresholds, but NONE of its matmuls (vol 3.4e7) route at any tested
+threshold, so those rows are identical by construction — that spread is a
+direct measurement of this host's noise floor, not an effect.)
+
+**(c) Batched/attention matmul routing — rejected on the evidence from (b).**
+The remaining unrouted matmuls are attention's QK^T (256×64×256, batch=128) and
+AV (256×256×64, batch=128). Two independent reasons not to pursue it: (1) both
+carry FOLDED VIEW operands (`p4/p5!=0` — the multi-head transpose), and mm2 reads
+contiguous memory; supporting views means a `vmo_view_idx` per element, which
+destroys the coalesced float4 fast path that makes mm2 fast in the first place.
+(2) Per-slice volume is 4.2e6 and even the whole batch is 5.4e8 — the SAME
+volume class as `base`'s FFN, which (b) just measured as a 9% REGRESSION when
+routed. So the work is squarely in the range where peeling costs more than the
+better kernel returns. Attention stays on the in-VM tile, by evidence.
+
+**Conclusion.** Xe2 f32 matmul is done for now at ~1.47 TFLOP/s in-program
+(2.4–2.7x JAX CPU at every size). The next real lever is not tiling or routing —
+it is the XMX matrix engine (bf16, vendor extension, needs the kernel-table
+override), evaluated separately in poc/21.
+
+## 49. The small-op floor is ~33 us of HOST overhead, not OpenCL — zero-copy I/O measured and REVERTED (2026-07-22)
+
+**Context.** Below ~1M elements Xe2 is 2–6x slower than XLA CPU. §47 showed the
+large-array side is at the bandwidth wall, so the small side is all dispatch.
+Quantified on Xe2, per `jax.jit` call:
+
+| program | us/call |
+|---|---|
+| `lambda x: x` (identity, zero instructions) | **32** |
+| `x + 1.0` on 1024 elems | 43 |
+| chain of 8 adds on 1024 elems | 43 (fused — see §47) |
+| identity, JAX **native CPU/XLA** backend | **3.7** |
+
+So compute is ~7 us and **our plugin adds ~29 us per Execute over what JAX's own
+dispatch costs**. It is NOT device-specific: PoCL floors at 35 us, essentially
+the same, so it is host-side C++/PJRT work, not GPU launch. (Raw OpenCL floor on
+Xe2 for reference: bare `clFinish` 0.6 us, null kernel launch + `clFinish`
+10 us.)
+
+**Hypothesis 1 — per-Execute `clCreateBuffer`/`clReleaseMemObject` for ported
+I/O buffers. WRONG.** Measured create+release at 0.24 us on Xe2 (0.14 on PoCL),
+size-independent — the driver allocates lazily. Not the cost.
+
+**Hypothesis 2 — H2D/D2H transfer cost; fix with zero-copy. WRONG end-to-end,
+and REVERTED.** On an integrated GPU host and device share DRAM, so I/O buffers
+can be `CL_MEM_ALLOC_HOST_PTR`. Microbenchmark supported it: a 4 KB
+`clEnqueueWriteBuffer`+`clFinish` drops **11.4 -> 7.1 us** (1.6x), and the
+obvious risk was disproved — large-buffer triad is **107.5 vs 107.8 GB/s**, no
+penalty (same DRAM either way; `clEnqueueMapBuffer` was *worse*, 14.4 us). It was
+implemented, gated strictly on `CL_DEVICE_HOST_UNIFIED_MEMORY` (Xe2/PoCL 1,
+NVIDIA 0 — inert there), and then **A/B measured as a WASH**: identity 33.8 (on)
+vs 33.1 (off) us on Xe2, 34.0 vs 33.9 on PoCL. Reverted rather than ship dead
+complexity.
+
+**Why the microbenchmark did not transfer:** our Execute already enqueues every
+input write and output read ASYNCHRONOUSLY (`CL_FALSE`) and pays exactly ONE
+`clFinish` at the end. The 1.6x measured above is per-transfer *synchronisation*
+cost, which we never pay. The transfer path was already efficient.
+
+**Where the ~29 us is — LOCALIZED by scaling, not guessing.** Varying the number
+of I/O buffers on Xe2 (256-element arrays, so transfer time is irrelevant):
+
+| program | us/call |
+|---|---|
+| 1 in, 1 out | 33.0 |
+| 4 in, 1 out | 47.8 |
+| 8 in, 1 out | 76.0 |
+| 1 in, 4 out | 54.2 |
+| 1 in, 8 out | 62.7 |
+
+Both axes scale **linearly at ~5–6 us per additional buffer**, on top of a fixed
+base of roughly 22 us. That is enormous for what should be one asynchronous
+enqueue per buffer (sub-microsecond). So the cost is **per-buffer host work in
+the Execute path**, not per-call setup and not the phase walk.
+
+**CONTROL EXPERIMENT (do this first next time).** The same sweep on JAX's native
+CPU backend: 1in/1out 4.9 us, 4in 4.4 (flat), 8in 10.5 (~0.8 us/input), 8out
+22.6 (~2.5 us/output). So JAX's own per-argument cost is ~0.8 us/input — ours is
+~5–6. **Inputs are the anomaly**; our per-output excess over JAX is much smaller
+(~1.7 us). Aim at the input path.
+
+*(A first guess that the cost was `Execute`'s per-output `std::vector<uint8_t>`
+resize was WRONG — that overload is for runtime_test/non-PJRT callers. The PJRT
+hot path is `ExecuteDevice`, which traffics in `cl_mem` and never touches host
+vectors. Checked, corrected.)*
+
+**What `ExecuteDevice` actually does per buffer.** An input bound to one of the
+`kNIoPorts = 8` zero-copy ports costs nothing (`io_bufs_[port] = inputs[i]`);
+anything else pays a device->device `clEnqueueCopyBuffer` into the arena, and
+every output pays a `PoolAlloc`. Measured on Xe2, `clEnqueueCopyBuffer` of 1 KB
+costs **2.50 us just to ENQUEUE** — expensive enough to be a real contributor,
+and it explains why programs exceeding 8 I/O buffers degrade sharply (8in/1out =
+9 buffers > 8 ports). It does NOT by itself explain the 4-input case (5 buffers,
+all portable, still +4.9 us each), so there is a second per-input cost above the
+port binding — that is the thing to find. Fix directions to evaluate: raise
+`kNIoPorts`, and find the non-port per-input work.
+
+**perf is NOT available in this container** (kernel 6.17.0-1028-oem; only
+`linux-tools-6.8` packages exist, and `perf record` produces nothing). Do not
+burn time re-trying it — the scaling experiment above is the substitute, and it
+is enough to aim the next attempt. Recorded also so nobody re-tries zero-copy
+I/O expecting a win.
+
+## 50. OPEN BUG: fused softmax_seg returns WRONG results on Xe2, non-deterministically across processes (2026-07-22)
+
+**This is a silent-wrong-answer bug, not a perf issue. It is NOT fixed.** Found
+by the reworked workload suite (§51) via an accuracy marker, not by the test
+suite — the error is small enough (~5e-3 on ~0.1 values) to pass the 2e-2
+GPU tolerance, so `pytest` is green and the suite reports "close" while the
+numbers are wrong.
+
+**Minimal reproducer.** `jax.nn.softmax(x, axis=-1)` on a plain f32 array:
+
+```bash
+. ./env.sh
+# 64 rows x 10 cols: wrong in ~14 of 16 PROCESSES on Xe2
+JAX_PLATFORMS=opencl PJRT_OCL_DEVICE=Intel .venv/bin/python -c "
+import numpy as np, jax, jax.numpy as jnp
+x=(np.random.default_rng(1).standard_normal((64,10))*0.05).astype(np.float32)
+z=x-x.max(-1,keepdims=True); e=np.exp(z); ref=e/e.sum(-1,keepdims=True)
+got=np.asarray(jax.jit(lambda a: jax.nn.softmax(a,axis=-1))(jnp.asarray(x)))
+d=np.abs(got-ref); print(d.max(), sorted(set(np.argwhere(d>1e-6)[:,0].tolist())))"
+```
+
+**Signature.**
+- **Deterministic WITHIN a process** (12 consecutive calls bitwise identical),
+  **varies ACROSS processes** — the classic signature of reading memory whose
+  contents differ per process, not of a plain data race.
+- Corrupts a contiguous run of TAIL rows (25–30 of 32; 3-row groups).
+- Corrupted rows are *plausible*: they still sum to 1. Some come back as exactly
+  `0.1` in every class — i.e. that row's logits were all-equal/zero, so the
+  staged row was lost or replaced.
+- **Xe2 only.** PoCL is clean (0/6 wrong, bitwise identical). So it is a device
+  path, not the lowering.
+
+**Bisected to the fused op.** With the same data: standalone `max(-1)` clean
+(6/6), standalone `sum(-1)` clean (6/6), `gather` clean (8/8), `gather @ dot`
+clean (6/6) — only the FUSED softmax (`TOP_SOFTMAX_SEG` / `vmo_softmax_seg` in
+`kernels/ops/reduce.cl`) is wrong. Shape sweep: `64x10` fails ~85% of processes,
+`32x10` intermittently, and `32x16`, `32x64`, `16x10`, `128x10` were clean in
+8 processes each. 64 rows over the 32 discovered lanes = exactly **2 tiles per
+workgroup**, i.e. the case where a workgroup REUSES its `__local As/Bs` for a
+second segment.
+
+**Hypothesis tested and REJECTED — do not redo it.** The tile body's final store
+loop READS `As[j]` with no barrier before the next tile's staging WRITES it (the
+comment at the store loop argues the next tile "re-barriers before any shared
+read", which only orders read-after-write, not this write-after-read). That WAR
+hazard is real on paper, but adding the trailing `barrier(CLK_LOCAL_MEM_FENCE)`
+**does not fix the bug**: clean A/B on the 64x10 reproducer measured **14/16
+wrong without it vs 13/16 with it**. The barrier was therefore NOT landed
+(unproven mechanism + a per-tile barrier cost). Something else is wrong.
+
+**Still to check:** whether `lsz` passed to the tile equals the actual
+`get_local_size(0)` for this launch (the max/sum trees assume a power-of-two
+`lsz` and that every one of `lsz` lanes wrote `Bs[lid]`); whether `As`/`Bs`
+sizing (`MMA_ASZ`/`MMA_BSZ`) is right for the seg path; and what makes `128x10`
+pass while `64x10` fails, which any correct theory must explain.
+
+**Impact.** Any program using softmax on Xe2 — the workload suite's
+`embedding_softmax` is where it surfaced, and attention has its own fused kernel
+(`attention.cl`, not this path) so flash-attention is not implicated. Treat Xe2
+softmax results as suspect until fixed.

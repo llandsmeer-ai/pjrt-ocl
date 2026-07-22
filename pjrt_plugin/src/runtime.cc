@@ -411,6 +411,11 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->gemv_kernel_ = clCreateKernel(rt->program_, "gemv", &cerr);
   if (cerr != CL_SUCCESS)
     return fail("clCreateKernel gemv: " + std::to_string(cerr));
+  if (rt->info_.is_gpu) {  // epilogue-fused SGEMM only exists on the GPU build
+    rt->mm_epi_kernel_ = clCreateKernel(rt->program_, "mm2_epi", &cerr);
+    if (cerr != CL_SUCCESS)
+      return fail("clCreateKernel mm2_epi: " + std::to_string(cerr));
+  }
   if (!rt->info_.is_gpu) {  // packed CPU SGEMM only exists under VMO_CPU_TILES
     rt->mm_pack_kernel_ = clCreateKernel(rt->program_, "mm2_pack", &cerr);
     if (cerr != CL_SUCCESS)
@@ -531,11 +536,15 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   // barrier); GPUs keep the persistent megakernel. A device whose vm.cl build
   // lacks device-scope fences (strict OpenCL C 1.2, see dialect probe above)
   // must ALSO use host-dispatch: its spin-barrier is a data race (poc/07).
-  // PJRT_OCL_ENGINE overrides.
+  // PJRT_OCL_ENGINE overrides.  engine_forced tracks an EXPLICIT host/mega
+  // choice so the residency heuristic below (which runs after ProbeResidency)
+  // only reshapes the "auto" default and never silently overrides the user.
+  bool engine_forced = false;
   rt->host_dispatch_ = !rt->info_.is_gpu || !rt->info_.has_device_fence;
   if (const char* e = std::getenv("PJRT_OCL_ENGINE"); e && e[0]) {
     if (!std::strcmp(e, "host")) {
       rt->host_dispatch_ = true;
+      engine_forced = true;
     } else if (!std::strcmp(e, "mega")) {
       if (!rt->info_.has_device_fence)
         return fail(
@@ -543,6 +552,7 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
             "device-scope acquire/release fences; the megakernel "
             "spin-barrier would be a data race (poc/07)");
       rt->host_dispatch_ = false;
+      engine_forced = true;
     }
     // "auto" (or anything else) keeps the default.
   }
@@ -585,6 +595,23 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   if (rt->info_.is_gpu)
     if ((measured_res = rt->ProbeResidency()))
       rt->ngroups_ = std::min(rt->ngroups_, measured_res);
+  // Low-residency GPUs (small iGPUs like Intel Arc 140V Xe2, measured 32
+  // co-resident workgroups) are a NET LOSS on the persistent megakernel:
+  // parallelism is capped at residency while a host-launched kernel gets a
+  // full oversubscribed grid the driver latency-hides across the XVEs, and
+  // the cross-workgroup spin-barrier is pure overhead here. Measured on Xe2,
+  // host-dispatch matmul is 5-8x faster than the megakernel AND avoids the
+  // -5 (CL_OUT_OF_RESOURCES) that a long chained-matmul megakernel dispatch
+  // trips (decisions.md §44). The megakernel only pays off when residency is
+  // large enough to cover the work (NVIDIA: hundreds of lanes). So the "auto"
+  // default flips GPUs whose MEASURED residency is below kMegaMinResidency to
+  // host-dispatch; NVIDIA (well above it) is untouched, so this needs no
+  // NVIDIA re-validation. Only applies to a genuine measurement (nonzero) and
+  // never overrides an explicit PJRT_OCL_ENGINE.
+  constexpr cl_uint kMegaMinResidency = 64;
+  if (!engine_forced && !rt->host_dispatch_ && measured_res &&
+      measured_res < kMegaMinResidency)
+    rt->host_dispatch_ = true;
   if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
   // Host-dispatch tile work-group size. On CPU, lsz=1 removes the collaborative
@@ -659,6 +686,7 @@ OclRuntime::~OclRuntime() {
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
   if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
   if (mm_kernel_) clReleaseKernel(mm_kernel_);
+  if (mm_epi_kernel_) clReleaseKernel(mm_epi_kernel_);
   if (mm_tc_kernel_) clReleaseKernel(mm_tc_kernel_);
   if (mm_tc_fp16_kernel_) clReleaseKernel(mm_tc_fp16_kernel_);
   if (mm_tc_fp16p_kernel_) clReleaseKernel(mm_tc_fp16p_kernel_);
@@ -1745,6 +1773,110 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
                            tk.p6, tk.p7, err);
   };
 
+  // GPU-on-host-dispatch analog (§46): route pure-matmul phases to the
+  // standalone mm2 SGEMM. The in-VM vmo_mma_tile is a 64x64 / 4x4 / single-
+  // buffered tile constrained by the megakernel's shared __local and register
+  // budget; mm2 is a 128x64 / 8x4 / double-buffered kernel with its own budget.
+  // Measured on Xe2: 1443 vs 574 GFLOP/s at 2048 (2.5x) — the single-matmul
+  // fast path already gets this, but ONLY for a program that is exactly one
+  // matmul task, so every matmul EMBEDDED in a real program (transformer
+  // projections, MLP layers) was stuck on the slow tile. Same peel-and-flush
+  // structure as the mm_tc / mm2p hybrids above. Applies to GPUs without the
+  // NVIDIA TF32 kernel (which has its own opt-in mm_tc hybrid). Default ON;
+  // PJRT_OCL_MM_HYBRID_GPU=0 disables.
+  static const bool hybrid_gpu_off = [] {
+    const char* e = std::getenv("PJRT_OCL_MM_HYBRID_GPU");
+    return e && e[0] == '0';
+  }();
+  const bool hybrid_gpu = rt_->is_gpu() && rt_->mm_kernel() &&
+                          !rt_->mm_tc_kernel() && !hybrid_gpu_off;
+  // Size gate, on compute VOLUME (M*N*K) rather than dims — peeling costs an
+  // extra enqueue and breaks the phase's batching, so it only pays once the
+  // matmul is big enough for mm2's better kernel to dominate. Measured on Xe2
+  // (§46) with the transformer bench: routing EVERYTHING regresses `small`
+  // (vol~3e7) by 39% and is neutral on `base` (vol<=5.4e8), while `large_l1`
+  // (vol>=2.1e9) gains 27%. 1<<30 sits in that gap with margin; same form as
+  // the NVIDIA fp16 hybrid's volume gate. PJRT_OCL_MM_HYBRID_GPU_MINVOL
+  // overrides for re-tuning on other hardware.
+  static const uint64_t hybrid_gpu_minvol = [] {
+    const char* e = std::getenv("PJRT_OCL_MM_HYBRID_GPU_MINVOL");
+    return (e && e[0]) ? (uint64_t)std::strtoull(e, nullptr, 10)
+                       : (uint64_t)1 << 30;
+  }();
+  auto routable_phase_gpu = [&]() -> bool {
+    mm_tasks.clear();
+    for (uint32_t L = 0; L < n; ++L)
+      for (uint32_t e = seg[2 * L]; e < seg[2 * L] + seg[2 * L + 1]; ++e) {
+        if (p.entries[e].task == kEntNop) continue;
+        const uint32_t t = p.entries[e].task;
+        const VmTask& tk = p.tasks[t];
+        // Contiguous f32 matmul: no batch (p3>1) and no folded view operands
+        // (p4/p5), which mm2 cannot read. A store-epilogue (p6) IS routable —
+        // it goes to mm2_epi (§47), which is what unlocks the transformer FFN
+        // matmuls (bias+gelu / residual add).
+        const uint64_t vol =
+            (uint64_t)tk.p0 * (uint64_t)tk.p1 * (uint64_t)tk.p2;
+        const bool ok = (tk.tile_op & 0xFFu) == kTopMma &&
+                        ((tk.tile_op >> 8) & 0xFFu) == kDtF32 && tk.p3 <= 1 &&
+                        tk.p4 == 0 && tk.p5 == 0 &&
+                        (tk.p6 == 0 || rt_->mm_epi_kernel()) &&
+                        vol >= hybrid_gpu_minvol;
+        if (!ok) {
+          // Diagnostic: say WHY a phase carrying a matmul was kept on the VM.
+          // (A phase mixing a matmul with any other op cannot be peeled, so the
+          // reason is often simply the co-scheduled non-matmul task.)
+          if ((tk.tile_op & 0xFFu) == kTopMma &&
+              std::getenv("PJRT_OCL_MM_HYBRID_DBG"))
+            std::fprintf(stderr,
+                         "[hybrid] ph%u REJECT mma %ux%ux%u batch=%u av=%u "
+                         "bv=%u epi=%u dt=%u\n",
+                         phase_i, tk.p0, tk.p1, tk.p2, tk.p3, tk.p4, tk.p5,
+                         tk.p6, (tk.tile_op >> 8) & 0xFFu);
+          else if (std::getenv("PJRT_OCL_MM_HYBRID_DBG"))
+            std::fprintf(stderr, "[hybrid] ph%u REJECT non-mma top=%u\n",
+                         phase_i, tk.tile_op & 0xFFu);
+          mm_tasks.clear();
+          return false;
+        }
+        if (std::find(mm_tasks.begin(), mm_tasks.end(), t) == mm_tasks.end())
+          mm_tasks.push_back(t);
+      }
+    return !mm_tasks.empty();
+  };
+  auto enqueue_mm_gpu = [&](const VmTask& tk) -> bool {
+    // p6!=0 -> the epilogue-fused variant, which takes aux + (ep6,ep7) around
+    // the same (M,N,K,dst,a,b) core arguments.
+    const bool epi = tk.p6 != 0;
+    cl_kernel km = epi ? rt_->mm_epi_kernel() : rt_->mm_kernel();
+    clSetKernelArg(km, 0, sizeof(arena_), &arena_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(km, 1 + pt, sizeof(cl_mem), &b);
+    }
+    int arg = 9;
+    if (epi) clSetKernelArg(km, arg++, sizeof(cl_mem), &aux_buf_);
+    const uint32_t M = tk.p0, N = tk.p1, Kd = tk.p2;
+    clSetKernelArg(km, arg++, sizeof(uint32_t), &M);
+    clSetKernelArg(km, arg++, sizeof(uint32_t), &N);
+    clSetKernelArg(km, arg++, sizeof(uint32_t), &Kd);
+    clSetKernelArg(km, arg++, sizeof(uint32_t), &tk.dst);
+    clSetKernelArg(km, arg++, sizeof(uint32_t), &tk.a);
+    clSetKernelArg(km, arg++, sizeof(uint32_t), &tk.b);
+    if (epi) {
+      clSetKernelArg(km, arg++, sizeof(uint32_t), &tk.p6);
+      clSetKernelArg(km, arg++, sizeof(uint32_t), &tk.p7);
+    }
+    constexpr uint32_t kTM = 128, kTN = 64;  // must match MM2_TM / MM2_TN
+    const size_t tiles_m = (M + kTM - 1) / kTM, tiles_n = (N + kTN - 1) / kTN;
+    size_t lsz = 256, gsz = tiles_m * tiles_n * lsz;  // MM2_NT threads/wg
+    if (clEnqueueNDRangeKernel(q, km, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                               nullptr) != CL_SUCCESS) {
+      *err = "host-dispatch: mm2 (hybrid) launch failed";
+      return false;
+    }
+    return true;
+  };
+
   for (long guard = 0;; ++guard) {
     if (guard > 100000000L) {
       *err = "host-dispatch: runaway control loop";
@@ -1764,19 +1896,23 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     const bool route = any && hybrid_ok && !tracing && routable_phase();
     const bool route_cpu =
         !route && any && hybrid_cpu && !tracing && routable_phase_cpu();
-    if ((route || route_cpu) && std::getenv("PJRT_OCL_MM_HYBRID_DBG"))
+    const bool route_gpu = !route && !route_cpu && any && hybrid_gpu &&
+                           !tracing && routable_phase_gpu();
+    if ((route || route_cpu || route_gpu) &&
+        std::getenv("PJRT_OCL_MM_HYBRID_DBG"))
       for (uint32_t t : mm_tasks)
         std::fprintf(stderr, "[hybrid] ph%u -> %s %ux%ux%u\n", phase_i,
-                     route ? "mm_tc" : "mm2p", p.tasks[t].p0, p.tasks[t].p1,
-                     p.tasks[t].p2);
-    if (route || route_cpu) {
+                     route ? "mm_tc" : (route_cpu ? "mm2p" : "mm2"),
+                     p.tasks[t].p0, p.tasks[t].p1, p.tasks[t].p2);
+    if (route || route_cpu || route_gpu) {
       // Flush pending VM phases (enqueue only, no drain), then run each of this
       // phase's matmuls on the dedicated kernel — the in-order queue keeps them
       // after the flushed phases and before the next phase; no clFinish.
       if (!flush_group(false)) { release_tevs(); return false; }
       for (uint32_t t : mm_tasks)
         if (!(route ? enqueue_mm_tc(tasks_patched_[t])
-                    : enqueue_mm_cpu(tasks_patched_[t]))) {
+                    : (route_cpu ? enqueue_mm_cpu(tasks_patched_[t])
+                                 : enqueue_mm_gpu(tasks_patched_[t])))) {
           release_tevs();
           return false;
         }
