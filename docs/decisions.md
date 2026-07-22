@@ -4103,3 +4103,59 @@ pass while `64x10` fails, which any correct theory must explain.
 `embedding_softmax` is where it surfaced, and attention has its own fused kernel
 (`attention.cl`, not this path) so flash-attention is not implicated. Treat Xe2
 softmax results as suspect until fixed.
+
+## 51. Why 13/18 application workloads lose to XLA-CPU on Xe2: per-phase cost, and a hard floor (2026-07-22)
+
+**Setting.** The 18-workload suite on Xe2 (`docs/workload-coverage-xe2.md`) has
+only 2/18 beating XLA-CPU. Every catastrophic gap is a scan/loop workload:
+spring_mass 449x, rk4_ode 409x, logistic_map 233x, hh_neuron 134x, brax_step
+120x, heat2d 31x.
+
+**Measured decomposition** (`PJRT_OCL_PHASE_STATS=1`, which already existed):
+
+| workload | phases | phases/iter | total ms | us/phase |
+|---|---|---|---|---|
+| rk4_ode | 2502 | ~25 | 11.4 | 4.6 |
+| spring_mass | 842 | ~7 | 3.56 | 4.2 |
+| hh_neuron | 802 | ~4 | 6.14 | 7.7 |
+| heat2d | 390 | ~13 | 3.53 | 9.0 |
+| logistic_map | 202 | ~1 | 1.67 | 8.3 |
+
+Each iteration is a handful of tiny elementwise ops — sub-microsecond of real
+arithmetic. Cost = (phases/iter) x (trip count) x (per-phase cost). So there are
+exactly two levers: **phase count** and **per-phase cost**.
+
+**Ruled out — do not redo:**
+- **The engine.** The megakernel is WORSE on all five (spring_mass 4.21 vs 3.56,
+  logistic_map 3.07 vs 1.67, rk4_ode 14.4 vs 11.4, hh_neuron 8.24 vs 6.14,
+  heat2d 3.91 vs 3.53). On Xe2 the per-instruction spin-barrier costs more than
+  a per-phase launch, so §44's host-dispatch default is right here too.
+- **Per-iteration blocking condition reads.** Suspected, but `drains` is only
+  1-10 per Execute (vs 200-2500 phases) — these fixed-trip loops already take
+  the cheap `kEntFor` path, no per-iteration device->host round-trip.
+- **Lane count.** Sweeping `PJRT_OCL_VM_LANES` 32->2 gives at best ~17%
+  (rk4_ode 11.5->9.5 at 4 lanes) and REGRESSES heat2d (4.2->5.0), which has
+  genuine parallel work. Workload-dependent, not a clean lever.
+
+**Per-phase cost has ~2-4x of headroom.** Measured on this device with a
+standalone probe: a tiny back-to-back kernel costs **2.13 us**, and making the
+chain strictly DEPENDENT (each launch reads the previous one's output, as VM
+phases do) changes nothing — **2.15 us** at 256 elements, **2.37 us** at 9216.
+Grid size is irrelevant (1 workgroup vs 32 both ~2.15 us): it is pure launch
+latency. We pay 4.2-9.0 us. The gap is inside `vm2_seg`, whose prologue chases
+three DEPENDENT global loads before any arithmetic (`seg_tab[..]` -> `entries[..]`
+-> `tasks[en.task]`) and which unconditionally declares 8 KB of `__local`
+(`MMA_ASZ`+`MMA_BSZ`), capping occupancy. Fast-path idea (not yet built): for
+the common single-entry phase, pass the task descriptor in as kernel ARGS and
+skip the pointer chase.
+
+**THE HARD FLOOR — state this before promising anyone "faster than CPU".**
+Our per-Execute dispatch floor is ~33 us with ~5-6 us per I/O buffer (§49).
+Eight of the eighteen workloads finish on XLA-CPU in **under 50 us** total:
+logistic_map 7, spring_mass 8, fft 10, embedding_softmax 12, batchnorm 17,
+rk4_ode 31, nbody 42, hh_neuron 46. For those, no amount of kernel or phase
+tuning can win — the dispatch alone outlasts the entire CPU run. "All 18
+workloads significantly faster than CPU" is **not achievable on this hardware**;
+the achievable goal is collapsing the 100-450x gaps to small multiples and
+winning decisively on the workloads whose absolute work is large enough to
+amortize a GPU dispatch (transformer and attention already win).
