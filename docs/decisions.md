@@ -4015,13 +4015,27 @@ base of roughly 22 us. That is enormous for what should be one asynchronous
 enqueue per buffer (sub-microsecond). So the cost is **per-buffer host work in
 the Execute path**, not per-call setup and not the phase walk.
 
-Prime suspect for the next session: `LoadedProgram::ExecuteDevice` materializes
-every output into its own `std::vector<uint8_t>` (`(*outputs)[o].resize(...)`,
-which allocates AND zero-fills) and then that buffer is copied again as it
-crosses the PJRT boundary — i.e. per output we may pay allocate + zero + device
-read + copy. Inputs have the mirror-image shape. The fix direction is to reuse
-per-program scratch across Executes and read straight into the destination
-rather than through a fresh vector.
+**CONTROL EXPERIMENT (do this first next time).** The same sweep on JAX's native
+CPU backend: 1in/1out 4.9 us, 4in 4.4 (flat), 8in 10.5 (~0.8 us/input), 8out
+22.6 (~2.5 us/output). So JAX's own per-argument cost is ~0.8 us/input — ours is
+~5–6. **Inputs are the anomaly**; our per-output excess over JAX is much smaller
+(~1.7 us). Aim at the input path.
+
+*(A first guess that the cost was `Execute`'s per-output `std::vector<uint8_t>`
+resize was WRONG — that overload is for runtime_test/non-PJRT callers. The PJRT
+hot path is `ExecuteDevice`, which traffics in `cl_mem` and never touches host
+vectors. Checked, corrected.)*
+
+**What `ExecuteDevice` actually does per buffer.** An input bound to one of the
+`kNIoPorts = 8` zero-copy ports costs nothing (`io_bufs_[port] = inputs[i]`);
+anything else pays a device->device `clEnqueueCopyBuffer` into the arena, and
+every output pays a `PoolAlloc`. Measured on Xe2, `clEnqueueCopyBuffer` of 1 KB
+costs **2.50 us just to ENQUEUE** — expensive enough to be a real contributor,
+and it explains why programs exceeding 8 I/O buffers degrade sharply (8in/1out =
+9 buffers > 8 ports). It does NOT by itself explain the 4-input case (5 buffers,
+all portable, still +4.9 us each), so there is a second per-input cost above the
+port binding — that is the thing to find. Fix directions to evaluate: raise
+`kNIoPorts`, and find the non-port per-input work.
 
 **perf is NOT available in this container** (kernel 6.17.0-1028-oem; only
 `linux-tools-6.8` packages exist, and `perf record` produces nothing). Do not
