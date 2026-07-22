@@ -4556,3 +4556,135 @@ output/alias binding in the host-dispatch output path, NOT at arithmetic.
 it; it needs a real root-cause on the runtime side, and ideally a `tests/` case
 covering gru/lstm on both devices so the next occurrence is caught by pytest
 rather than by a scoreboard someone happens to read.
+## 56. §50/§54 ROOT-CAUSED and FIXED: an intra-work-group data race between fused tile entries (2026-07-22)
+
+**The Xe2 "wrong softmax" bug of §50/§54 is not a softmax bug and not an Intel
+driver bug.** It is a real, portable data race in the VM's engine: two tile
+entries that the scheduler deliberately chains on ONE lane without a global
+barrier are executed by the whole work-group, and different tile bodies map
+elements to work-items DIFFERENTLY, so the consumer's work-items read elements
+the producer's OTHER work-items wrote — with nothing ordering them.
+
+### Two §50/§54 premises were wrong, and cost that investigation its bearings
+
+- **`vmo_softmax_seg` / `TOP_SOFTMAX_SEG` never runs for this program.** A printf
+  in the kernel is never reached, and a `-DVMO_DBG_SM_SYNTH` build that replaces
+  the staged row with a constant changes nothing. JAX 0.10.2's `jax.nn.softmax`
+  emits `reduce(max)` → `maximum(-inf_bcast, ·)` → broadcast → `subtract` →
+  `exponential` → `reduce(add)` → broadcast → `divide`; the §19 recognizer does
+  not match it (the extra `maximum` breaks the idiom). The lowered program is 8
+  tasks: `RED_SEG(max) · EW(max) · GATHER · EW(sub) · EW(exp) · RED_SEG(add) ·
+  GATHER · EW(div)`. So every §50/§54 conclusion "specific to `vmo_softmax_seg`"
+  was about an op that was not executing.
+- **On `main` the reproducer is CLEAN (0/16)** — `main` runs Xe2 on the
+  megakernel. §50/§54 were measured on `xe2-perf`, where commit 4ef60ba defaults
+  low-residency GPUs to HOST-DISPATCH. `PJRT_OCL_ENGINE=host` reproduces on
+  `main` at **15/16 processes**. The race exists in `vm2` too (same entry loop,
+  no barrier) — it just did not fire in 16 megakernel processes.
+
+### How it was localised (each step a build-flag probe, no guessing)
+
+1. `-DVMO_DBG_EW_RAWA` (the viewed-EW path becomes `d[i] = a[i]`): the program
+   output becomes `exp(x_as_read)`. **6/6 clean** ⇒ the I/O-port read is fine,
+   killing §54's "ported input is read wrong" theory.
+2. `-DVMO_DBG_EW_RAWDIV` (only the final divide becomes a pass-through): the
+   output IS the `exp()` arena buffer. **5/6 WRONG** ⇒ the corruption is already
+   in memory before the sum reduce, which is why the row still sums to 1 (the
+   sum is taken over the corrupted values and renormalises the good ones — the
+   observed uniform 0.9719 factor is exactly `1/(1 - e8 - e9 + 2*e2)`).
+3. Recovering `x - max` per element from that dump gives the decisive picture:
+   the `subtract` op's **output buffer contains ZERO in contiguous runs**, and
+   the runs are **64-byte aligned and 64 bytes long** — flat elements
+   `[576,592)` and `[608,624)` of 640. `exp(0)=1` is exactly the "row comes back
+   as 0.1 in every class" signature of §50.
+4. `640` elements, `EW_TS=4096` ⇒ ONE tile, one work-group, `lsz=256`. The
+   producer (`subtract`, viewed operand ⇒ scalar `for (i = lo+lid; i < hi;
+   i += lsz)`) writes elements `{lid, lid+256, lid+512}`. Missing elements
+   576–591 and 608–623 are `lid = 64..79` and `96..111` in the **third (last)**
+   trip — two whole **SIMD16 hardware threads**.
+5. The consumer (`exponential`, no views ⇒ the **float4 fast path**) gives
+   work-item `lid` elements `4*lid..4*lid+3`. Its work-items 144–159 read
+   elements 576–639 as their FIRST and only instruction, while the producer's
+   work-items 64–111 are still on their LAST trip. Race, tail-biased by
+   construction — which is why corruption is always a contiguous run at the
+   TAIL of the buffer (§50's "rows 57–62 of 64", "rows 185–199 of 200").
+6. **Control experiment**: `-DVMO_DBG_NOVEC4` forces the scalar stride-`lsz`
+   mapping for every EW op, making producer and consumer mappings identical.
+   **0/16 wrong** (vs 15/16). Mechanism confirmed.
+
+### Why the §54 brackets looked the way they did
+
+`lsz=256` matters because the producer then needs 3 trips over 640 elements
+(a tail written last) and the work-group spans 16 SIMD16 threads that drift
+apart; at `lsz<=128` the trip/thread structure changes and the race window
+closes in practice. "Source must be a ported INPUT" matters because inserting
+`x*1.0+0.0` changes which ops the scheduler fuses into one phase-chain — not
+because ports read wrong (probe 1 proves they do not). Non-monotonic shape
+dependence (seg 5,10 fail; 11,20 pass) is just whether the flat element count
+puts a float4-path consumer's reads on top of the scalar producer's last trip.
+
+### The invariant that was violated
+
+`scheduler.py::_emit_phase` states it explicitly: dependent elementwise ops
+"chain on one lane per tile (**no barrier, no fence: thread `lid` writes then
+re-reads the same elements across ops**)". That is true across WORK-GROUPS and
+false within one. It holds only while every tile body uses the same
+element→work-item mapping — and `vmo_ew_tile_f32` alone has three (scalar
+stride-`lsz` for viewed operands, `float4` for the GPU fast path, contiguous
+per-WI chunks under `VMO_CPU_TILES`), before counting gather/iota/region.
+
+### The fix (kernel only — `pjrt_plugin/kernels/vm_main.cl`)
+
+`VMO_PUBLISH_TILE(pub)`: a work-group `barrier(CLK_GLOBAL_MEM_FENCE)` before a
+tile entry **iff another tile entry already ran since the last global barrier**,
+in BOTH engines (`vm2` and `vm2_seg`). `vmo_barrier` already opens and closes
+with `barrier(CLK_GLOBAL_MEM_FENCE)`, so the first tile entry of a phase needs
+nothing; `pub` is reset at each `vmo_barrier`. `pub` is work-group-uniform (the
+interpreter state comes from lane-uniform data), so the conditional barrier is
+legal. This is deliberately GENERAL: it fixes every op-family pair, not just the
+EW pair that happened to fire. Not fixed by making mappings agree — that would
+cost the float4 path (its reason for existing) and would have to be re-proved
+for every future tile body.
+
+The §54 fallback (per-program `seg_lsz_=128` for softmax programs) was NOT
+implemented: it would have papered over a race that also exists on the
+megakernel and on PoCL at `lsz=256`, and it is unsafe for programs that also
+contain `vmo_mma_tile` (which needs a 16x16=256-thread grid).
+
+### Verified
+
+| check | before | after |
+|---|---|---|
+| `softmax(x)` 64x10, Xe2, `PJRT_OCL_ENGINE=host` | **15/16 processes WRONG** | **0/24** |
+| same, 200x10 / 63x10 / 96x10 | wrong (§50/§54) | 0/6 each |
+| same, Xe2 megakernel (`main` default) | 0/16 (latent) | 0/8 |
+| `embedding_softmax` (bench-suite workload) vs float64 ref | **3/8 processes NOT-CLOSE** (5.6e-3 abs, 5.3e-2 rel) | **0/8**, 1.8e-8 abs, bit-identical |
+| `pytest tests/ -q`, `PJRT_OCL_DEVICE=Intel` | 406 passed / 1 skipped | 406 passed / 1 skipped |
+| `pytest tests/ -q`, `PJRT_OCL_DEVICE=Portable` | 406 passed / 1 skipped | 406 passed / 1 skipped |
+
+Note the test suite was GREEN throughout — the 2e-2 GPU tolerance never saw
+this. The oracle here is a per-process reproducer, not `pytest`.
+
+### Perf cost (measured, `tools/bench_transformer.py`)
+
+| config | before | after |
+|---|---|---|
+| Xe2 megakernel, `--config base` | 196.4 ms | 180.6 ms |
+| Xe2 host-dispatch, `--config base` | 35.96 ms | 34.70 ms |
+| Xe2 host-dispatch, `--config small` | 4.05 ms | 4.08–4.11 ms |
+| PoCL CPU, `--config small` | 27.9 / 28.4 / 28.7 ms | 29.1 / 29.3 / 29.9 ms |
+
+Xe2 is a wash (both directions within noise). **PoCL pays ~3–4%**: at `lsz=1` the
+barrier is a semantic no-op, but PoCL's work-item-loop former still splits the
+parallel region around it. Guarding the barrier with `get_local_size(0) > 1u`
+was tried and recovered nothing (29.1 ms) — the cost is the barrier's PRESENCE,
+not its execution — so the simpler unguarded form was kept. A compile-time
+`VMO_CPU_TILES` guard would be WRONG: `runtime.cc` raises a CPU program's
+`seg_lsz_` back to 256 whenever it contains an op outside `safe_at_lsz1()`.
+
+### Left open
+
+`scheduler.py`'s "no barrier, no fence" comment now describes a guarantee the
+kernel provides rather than one the mapping provides — worth rewording when that
+file is next touched (it was owned by another agent during this work). Nothing
+else in the schedule needs to change.

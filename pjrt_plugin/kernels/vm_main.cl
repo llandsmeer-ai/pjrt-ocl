@@ -79,6 +79,26 @@ static void vmo_exec_tiles(__global uchar *arena, __global uchar **iop,
     }
 }
 
+/* INTRA-PHASE PUBLISH (docs/decisions.md §55). Consecutive tile entries on one
+ * lane are a scheduler-fused chain: the scheduler deliberately omits the global
+ * barrier between them because "tile T of every op stays on the same lane".
+ * That argument is sound ACROSS work-groups but NOT within one: a tile is run
+ * by the whole work-group, and different tile bodies map elements to
+ * work-items DIFFERENTLY — the EW float4 fast path gives work-item `lid`
+ * elements 4*lid..4*lid+3, while the scalar/viewed path gives it
+ * lid, lid+lsz, lid+2*lsz, ... So the consumer's work-item reads elements that
+ * ANOTHER work-item of the same group wrote, with nothing ordering the two.
+ * On Xe2 that raced for real: whole SIMD16 threads of the consumer read the
+ * producer's tail (its LAST loop trip) before it landed — silently wrong
+ * softmax, 15/16 processes (§55). A work-group barrier with a global-memory
+ * fence between tile entries is the general fix (it covers every op family, not
+ * just EW). Only needed after ANOTHER tile entry: vmo_barrier already opens and
+ * closes with barrier(CLK_GLOBAL_MEM_FENCE), so the first tile entry of a phase
+ * is already published. `pub` is work-group-uniform (the interpreter state is
+ * derived from lane-uniform data), so the conditional barrier is legal. */
+#define VMO_PUBLISH_TILE(pub) do { if (pub) barrier(CLK_GLOBAL_MEM_FENCE); \
+                                   (pub) = 1; } while (0)
+
 /* Per-lane interpreter with a frame stack over the lane's OWN stream. */
 #define MAX_DEPTH 8
 #define WIDX_ROOT 0xFFFFFFFFu
@@ -118,6 +138,7 @@ __kernel void vm2(__global uchar *arena,
 
     const uint4 span = lane_tab[lane];   /* .x off, .y count, .z root_len */
     uint barrier_i = 0;
+    uint pub = 0;   /* a tile entry has run since the last barrier (see above) */
 
     frame_t st[MAX_DEPTH];
     int sp = 0;
@@ -138,6 +159,7 @@ __kernel void vm2(__global uchar *arena,
                  * across lanes. phase counts REMAINING iterations. */
                 VMO_TS_REC(stats, barrier_i, lane, nlanes);
                 vmo_barrier(bar, nlanes);
+                pub = 0;   /* barrier published this group's stores */
                 barrier_i++;
                 if (--st[sp].phase != 0u) {
                     st[sp].pc = w.tile_lo;
@@ -151,6 +173,7 @@ __kernel void vm2(__global uchar *arena,
             if (st[sp].phase == 0) {           /* while-cond range done */
                 VMO_TS_REC(stats, barrier_i, lane, nlanes);
                 vmo_barrier(bar, nlanes);
+                pub = 0;   /* barrier published this group's stores */
                 barrier_i++;
                 const uint cbits = atomic_add(
                     (volatile __global uint *)(arena + w.signal_flag), 0u);
@@ -165,6 +188,7 @@ __kernel void vm2(__global uchar *arena,
             } else {                           /* while-body done: recheck */
                 VMO_TS_REC(stats, barrier_i, lane, nlanes);
                 vmo_barrier(bar, nlanes);
+                pub = 0;   /* barrier published this group's stores */
                 barrier_i++;
                 st[sp].pc = w.tile_lo;
                 st[sp].end = w.tile_lo + w.tile_hi;
@@ -184,6 +208,7 @@ __kernel void vm2(__global uchar *arena,
                 stats[barrier_i * nlanes + lane] = atomic_inc(&bar[2]) % nlanes;
 #endif
             vmo_barrier(bar, nlanes);
+            pub = 0;   /* barrier published this group's stores */
             barrier_i++;
             st[sp].pc++;
             continue;
@@ -224,6 +249,7 @@ __kernel void vm2(__global uchar *arena,
         if (en.task != ENT_NOP) {
             /* wait_flag/signal_flag per-op counters are reserved (v0 emits
              * FLAG_NONE); wire a flags buffer through before enabling. */
+            VMO_PUBLISH_TILE(pub);
             vmo_exec_tiles(arena, iop, aux, tasks[en.task], en.tile_lo, en.tile_hi,
                        As, Bs);
         }
@@ -254,11 +280,17 @@ __kernel void vm2_seg(__global uchar *arena,
     __local float As[MMA_ASZ];
     __local float Bs[MMA_BSZ];
     const uint2 seg = seg_tab[seg_base + lane];
+    uint pub = 0;   /* see VMO_PUBLISH_TILE (§55): the host's clFinish is the
+                     * phase barrier, so within a segment nothing but this
+                     * work-group barrier orders one tile entry's global stores
+                     * against the next entry's reads. */
     for (uint i = 0; i < seg.y; ++i) {
         const entry_t en = entries[seg.x + i];
-        if (en.task != ENT_NOP)
+        if (en.task != ENT_NOP) {
+            VMO_PUBLISH_TILE(pub);
             vmo_exec_tiles(arena, iop, aux, tasks[en.task], en.tile_lo, en.tile_hi,
                            As, Bs);
+        }
     }
 }
 
