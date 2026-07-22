@@ -4157,7 +4157,19 @@ So neither `vm2_seg`'s unconditional 8 KB of `__local` nor its three-deep
 pointer chase costs anything measurable. The "pass the task descriptor as kernel
 args to skip the chase" idea is therefore dead — it would buy ~0.
 
-**Remaining suspect: the size of the monolithic `vm2_seg` kernel itself.** It
+**CONFIRMED CAUSE: `vm2_seg` SPILLS.** Added a permanent diagnostic
+(`PJRT_OCL_INFO=1` now prints kernel resources). On Xe2:
+
+```
+[pjrt-ocl] vm2_seg: max_wg=1024 sg_multiple=16 private_mem=4352 B (spill if >0) local_mem=8192 B
+```
+
+**4352 bytes of private memory PER WORK-ITEM** — i.e. 1.1 MB per 256-thread
+workgroup of spill traffic, paid on EVERY phase no matter which op runs, because
+the compiler must size private memory for the WORST-CASE arm of the opcode
+switch. That is the 4.2-9.0 us against a 2.2 us floor.
+
+**Mitigation (evidence-backed now, not speculative): the size of the monolithic `vm2_seg` kernel itself.** It
 carries the ENTIRE op library behind one opcode switch, and a large kernel pays
 in register pressure and instruction fetch regardless of which arm runs. This is
 exactly the risk CLAUDE.md flags ("watch compile time / register pressure as the

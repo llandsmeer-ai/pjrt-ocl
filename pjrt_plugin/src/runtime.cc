@@ -620,13 +620,39 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   rt->seg_lsz_ = rt->info_.is_gpu ? 256 : 1;
   if (const char* s = std::getenv("PJRT_OCL_CPU_LSZ"); s && s[0])
     rt->seg_lsz_ = std::max(1, std::atoi(s));
-  if (const char* v = std::getenv("PJRT_OCL_INFO"); v && v[0])
+  if (const char* v = std::getenv("PJRT_OCL_INFO"); v && v[0]) {
+    // Kernel resource footprint of the monolithic VM kernel. The whole op
+    // library sits behind one opcode switch, so register pressure / spilling
+    // here is a plausible cause of per-phase launch cost (§51) — print it so
+    // that is measurable instead of guessed. PRIVATE_MEM_SIZE > 0 means spill.
+    size_t kwg = 0, pref = 0;
+    cl_ulong priv = 0, lmem = 0;
+    if (rt->vm_seg_kernel_) {
+      clGetKernelWorkGroupInfo(rt->vm_seg_kernel_, rt->dev_,
+                               CL_KERNEL_WORK_GROUP_SIZE, sizeof(kwg), &kwg,
+                               nullptr);
+      clGetKernelWorkGroupInfo(rt->vm_seg_kernel_, rt->dev_,
+                               CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                               sizeof(pref), &pref, nullptr);
+      clGetKernelWorkGroupInfo(rt->vm_seg_kernel_, rt->dev_,
+                               CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(priv), &priv,
+                               nullptr);
+      clGetKernelWorkGroupInfo(rt->vm_seg_kernel_, rt->dev_,
+                               CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lmem), &lmem,
+                               nullptr);
+      std::fprintf(stderr,
+                   "[pjrt-ocl] vm2_seg: max_wg=%zu sg_multiple=%zu "
+                   "private_mem=%llu B (spill if >0) local_mem=%llu B\n",
+                   kwg, pref, (unsigned long long)priv,
+                   (unsigned long long)lmem);
+    }
     std::fprintf(stderr,
                  "[pjrt-ocl] engine=%s in-program-matmul=%s lanes=%u "
                  "measured-residency=%u\n",
                  rt->host_dispatch_ ? "host" : "mega",
                  rt->vm_tc_kernel_ ? "TF32-tensor-core" : "portable-fp32",
                  rt->ngroups_, measured_res);
+  }
   // Calibration executes µbenchmark programs through the normal engine, so
   // lane sizing must be final first. (Today's calibration programs are all
   // n_lanes=1 and immune to oversubscription; the ordering keeps that from
