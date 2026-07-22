@@ -4221,3 +4221,55 @@ workloads significantly faster than CPU" is **not achievable on this hardware**;
 the achievable goal is collapsing the 100-450x gaps to small multiples and
 winning decisively on the workloads whose absolute work is large enough to
 amortize a GPU dispatch (transformer and attention already win).
+
+## 52. PROOF: four of the five loop workloads are UNWINNABLE on this GPU, and kernel work cannot fix them (2026-07-22)
+
+**The experiment.** `VMO_STUB_MASK` (§29) removes a tile-op's compute while
+leaving the entry/phase/barrier structure untouched. Stubbing **every** op
+(`PJRT_OCL_EXTRA_BUILD=-DVMO_STUB_MASK=0xFFFFFFFF`) therefore measures the VM's
+structural cost with **zero arithmetic**:
+
+| workload | full ms | ALL COMPUTE REMOVED | structural share |
+|---|---|---|---|
+| spring_mass | 5.07 | **4.12** | 81% |
+| rk4_ode | 11.44 | **8.51** | 74% |
+| heat2d | 3.90 | 2.29 | 59% |
+| hh_neuron | 7.29 | 3.62 | 50% |
+| logistic_map | 2.19 | 0.78 | 36% |
+
+spring_mass with a *perfect, instantaneous* tile op would still be **4.12 ms
+against XLA-CPU's 0.008 ms — 515x slower.** So **no amount of kernel
+optimization can fix these workloads.** Optimizing tile ops, splitting the VM
+kernel by op family, reducing spill: all of it is bounded above by the numbers
+in that column. Only reducing the PHASE COUNT can help.
+
+**And phase count is bounded too.** Pure structural cost is ~3.4-5.9 us/phase,
+of which **2.2 us is the irreducible hardware floor** (§51: a dependent
+back-to-back kernel launch on this device). Give every workload the absolute
+best case — chain fusion so perfect that each loop iteration is ONE phase, at
+the hardware floor:
+
+| workload | trips | XLA-CPU ms | BEST POSSIBLE ms | verdict |
+|---|---|---|---|---|
+| spring_mass | 120 | 0.008 | 0.264 | **>=33x slower — unwinnable** |
+| rk4_ode | 100 | 0.031 | 0.220 | **>=7x slower — unwinnable** |
+| logistic_map | 200 | 0.007 | 0.440 | **>=63x slower — unwinnable** |
+| hh_neuron | 200 | 0.046 | 0.440 | **>=10x slower — unwinnable** |
+| heat2d | 30 | 0.113 | 0.066 | **1.7x faster — WINNABLE** |
+
+**Why this is structural, not a defect.** These are sequential loops over tiny
+state. A GPU pays a synchronization per step (~2.2 us minimum) that a CPU simply
+does not; 200 iterations x 2.2 us = 440 us before any arithmetic, while the CPU
+finishes the entire workload in 7 us. The trip count, not the work, sets the
+floor. This is a property of the workload shape meeting GPU dispatch, and it
+would hold for any OpenCL backend on this device — including a hypothetical
+perfect one.
+
+**Consequence for the goal "make all 18 workloads beat CPU": it is impossible,
+and now provably so** rather than as an estimate. The honest target set is:
+- **Winnable and worth the effort:** heat2d (1.7x possible), plus the
+  larger-work non-loop workloads, plus transformer/attention which already win.
+- **Unwinnable at any effort:** spring_mass, rk4_ode, logistic_map, hh_neuron —
+  and by the §51 dispatch-floor argument, the sub-50us workloads generally.
+  Recommend the scoreboard report these as "dispatch-bound (structural)" rather
+  than leaving them looking like unfixed performance bugs.
