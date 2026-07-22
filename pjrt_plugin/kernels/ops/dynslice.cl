@@ -78,6 +78,25 @@ static void vmo_dyn_gather_tile(__global uchar *arena, __global uchar **iop, __g
         for (; i < chi; ++i) d[i] = a[i];
         return;
     }
+#else
+    /* GPU twin of the CPU fast path: 4-wide copy, 2x unrolled for ILP (the
+     * generic body's per-element div/mod chain measured ~30 us per 16K tile).
+     * vloadn needs only element alignment, so a runtime-odd `base` is fine. */
+    if (esz == 4 && rank == 1 && strides[0] == 1) {
+        __global uint *d = AP(uint, t.dst);
+        __global const uint *a = AP(const uint, t.a) + base;
+        const uint lo4 = lo >> 2, hi4 = lo4 + ((hi - lo) >> 2);
+        uint v = lo4 + lid;
+        for (; v + lsz < hi4; v += 2u * lsz) {
+            const uint4 x0 = vload4(v, a), x1 = vload4(v + lsz, a);
+            vstore4(x0, v, d);
+            vstore4(x1, v + lsz, d);
+        }
+        if (v < hi4) vstore4(vload4(v, a), v, d);
+        for (uint j = lo + ((hi - lo) & ~3u) + lid; j < hi; j += lsz)
+            d[j] = a[j];
+        return;
+    }
 #endif
     if (esz == 8)      DYN_GATHER_BODY(ulong);
     else if (esz == 2) DYN_GATHER_BODY(ushort);
@@ -119,6 +138,24 @@ static void vmo_dyn_scatter_tile(__global uchar *arena, __global uchar **iop, __
         uint i = clo;
         for (; i + 8u <= chi; i += 8u) vstore8(vload8(0, a + i), 0, d + i);
         for (; i < chi; ++i) d[i] = a[i];
+        return;
+    }
+#else
+    /* GPU twin (in-place DUS carries / scan): 4-wide, 2x unrolled. d+base is
+     * runtime-odd in general; vstoren needs only element alignment. */
+    if (esz == 4 && rank == 1 && strides[0] == 1) {
+        __global uint *d = AP(uint, t.dst) + base;
+        __global const uint *a = AP(const uint, t.a);
+        const uint lo4 = lo >> 2, hi4 = lo4 + ((hi - lo) >> 2);
+        uint v = lo4 + lid;
+        for (; v + lsz < hi4; v += 2u * lsz) {
+            const uint4 x0 = vload4(v, a), x1 = vload4(v + lsz, a);
+            vstore4(x0, v, d);
+            vstore4(x1, v + lsz, d);
+        }
+        if (v < hi4) vstore4(vload4(v, a), v, d);
+        for (uint j = lo + ((hi - lo) & ~3u) + lid; j < hi; j += lsz)
+            d[j] = a[j];
         return;
     }
 #endif

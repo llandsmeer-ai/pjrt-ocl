@@ -49,12 +49,46 @@ import math
 
 from .. import lowering as L
 from .. import opsem
-from ..scheduler import Task, TILE_MMA, MMA_T
+from ..scheduler import Task, TILE_MMA, TILE_RED_SEG, MMA_T
 
 
 def _decode(ins):
     """(M, N, K, G) from the packed Instr fields. G = batch count (imm2)."""
     return ins.n, ins.imm >> 16, ins.imm & 0xFFFF, max(1, ins.imm2)
+
+
+def _row_major_strides(shape):
+    strides = [0] * len(shape)
+    acc = 1
+    for i in range(len(shape) - 1, -1, -1):
+        strides[i] = acc
+        acc *= shape[i]
+    return strides
+
+
+def _canonicalize(ctx, buf, shape, batch, contract, contract_first):
+    """Transpose an operand so its axes are batch(in given order) + contract +
+    free (contract_first) or batch + free + contract (otherwise) — the layout
+    the plain-matmul path wants. Returns (buf, canonical_shape). No-op (no
+    transpose emitted) when the operand is already in that order. A
+    non-canonical dot_general (e.g. `A @ Bᵀ`, contracting_dims=[1]x[2]) then
+    lowers to a materializing transpose GATHER + the canonical matmul."""
+    rank = len(shape)
+    free = [d for d in range(rank) if d not in batch and d != contract]
+    perm = (list(batch) + [contract] + free if contract_first
+            else list(batch) + free + [contract])
+    if perm == list(range(rank)):
+        return buf, shape
+    in_strides = _row_major_strides(shape)
+    out_shape = tuple(shape[perm[j]] for j in range(rank))
+    out_strides = [in_strides[perm[j]] for j in range(rank)]
+    n = 1
+    for d in out_shape:
+        n *= d
+    aux_off = ctx.add_aux([rank] + list(out_shape) + list(out_strides) + [0])
+    dst = ctx.new_buffer(n)
+    ctx.emit(L.Instr(L.OP_GATHER_STRIDED, dst=dst, a=buf, n=n, aux=aux_off))
+    return dst, out_shape
 
 
 @L.handles("stablehlo.dot_general")
@@ -86,23 +120,27 @@ def _dot_general(ctx, op):
         raise L.LoweringError(
             f"dot_general: only a single contracting dim (got lhs {lc}, rhs {rc})")
     nb = len(lb)
-    if lb != list(range(nb)) or rb != list(range(nb)):
-        raise L.LoweringError(
-            f"dot_general: batch dims must be the leading axes on both sides "
-            f"(got lhs_batching={lb}, rhs_batching={rb})")
+    if len(rb) != nb:
+        raise L.LoweringError("dot_general: batch-dim count mismatch lhs/rhs")
+
+    # Canonicalize to lhs=[batch…, free…, K], rhs=[batch…, K, free…] via a
+    # transpose GATHER on any operand not already in that order (batch dims may
+    # be interior, lhs contract not last, rhs contract not first-after-batch —
+    # all the layouts jax emits for `A @ Bᵀ`, permuted einsums, etc.).
+    lhs_buf, lhs_shape = _canonicalize(
+        ctx, ctx.buf_for(op.operands[0]), lhs_shape, lb, lc[0],
+        contract_first=False)
+    rhs_buf, rhs_shape = _canonicalize(
+        ctx, ctx.buf_for(op.operands[1]), rhs_shape, rb, rc[0],
+        contract_first=True)
+    lr, rr = len(lhs_shape), len(rhs_shape)
+    lc, rc = [lr - 1], [nb]     # contract axes after canonicalization
+
     G = 1
     for d in range(nb):
         if lhs_shape[d] != rhs_shape[d]:
             raise L.LoweringError("dot_general: batch dim size mismatch")
         G *= lhs_shape[d]
-    if lc[0] != lr - 1:
-        raise L.LoweringError(
-            f"dot_general: lhs contract dim must be last (got {lc[0]} of rank "
-            f"{lr}); a non-canonical layout needs a transpose first")
-    if rc[0] != nb:
-        raise L.LoweringError(
-            f"dot_general: rhs contract dim must be first after the batch dims "
-            f"(got {rc[0]}); a non-canonical layout needs a transpose first")
 
     K = lhs_shape[lc[0]]
     if rhs_shape[rc[0]] != K:
@@ -118,9 +156,7 @@ def _dot_general(ctx, op):
             f"dot_general: N={N}, K={K} exceed the 16-bit packing limit")
 
     dst = ctx.new_buffer(G * M * N)
-    ctx.emit(L.Instr(L.OP_DOT, dst=dst,
-                     a=ctx.buf_for(op.operands[0]),
-                     b=ctx.buf_for(op.operands[1]),
+    ctx.emit(L.Instr(L.OP_DOT, dst=dst, a=lhs_buf, b=rhs_buf,
                      n=M, imm=(N << 16) | K, imm2=G))
     ctx.value_to_buf[op.results[0]] = dst
 
@@ -129,20 +165,82 @@ def _dot_general(ctx, op):
 
 def _dot_to_task(ins) -> Task:
     M, N, K, G = _decode(ins)
+    # GEMV routing: A[M,K] @ x[K,1] through the 64x64 MMA tile wastes 63/64 of
+    # every tile (N=1) and runs the K-loop serially per tile — measured 27-46x
+    # off cuBLAS on the chained bench. Route it to the segmented-reduce tile in
+    # dot mode instead (p3=1: out[o] = sum_j A[o*K+j] * x[j]): one row per
+    # tile, whole-workgroup coalesced dot + local tree — M-way parallel.
+    # Folded views (p4/p5) stay on the MMA path (the row read must be
+    # contiguous).
+    if N == 1 and G == 1 and not ins.aview and not ins.bview:
+        return Task(TILE_RED_SEG, dst=ins.dst, a=ins.a, b=ins.b,
+                    p0=M, p1=K, p2=0, p3=1)
     # aview/bview (+1; 0 = contiguous): a folded transpose/reshape/broadcast on
     # this operand (see lowering._fuse_matmul_views). The device reads the
     # pre-transpose SOURCE via the gather descriptor at p4/p5-1.
     return Task(TILE_MMA, dst=ins.dst, a=ins.a, b=ins.b,
-                p0=M, p1=N, p2=K, p3=G, p4=ins.aview, p5=ins.bview)
+                p0=M, p1=N, p2=K, p3=G, p4=ins.aview, p5=ins.bview,
+                p6=ins.epi, p7=ins.epi_res)
 
 
 def _dot_views(ins, rt):
-    """Recover (aview, bview) for a folded dot from the 2-word aux header at
-    ins.aux (0 = no fold). Written by lowering._finalize_matmul_views so the
-    tensor validator, which runs on re-parsed bytecode, can see the fold."""
+    """Recover (aview, bview) for a folded dot from the DOT aux header at ins.aux
+    (0 = no header). Written by lowering._finalize_matmul_views so the tensor
+    validator, which runs on re-parsed bytecode, can see the fold. The header is
+    [aview, bview, epi, epi_res]; views are words 0-1."""
     if not ins.aux:
         return 0, 0
     return rt.aux[ins.aux], rt.aux[ins.aux + 1]
+
+
+def _dot_epi(ins, rt):
+    """Recover (epi_off+1, epi_res) for a §33 R2c epilogue from the DOT aux header
+    words 2-3 (0 = no epilogue)."""
+    if not ins.aux:
+        return 0, 0
+    return rt.aux[ins.aux + 2], rt.aux[ins.aux + 3]
+
+
+# Numpy mirror of vm_common.cl vmo_region_micro (the epilogue micro-op ALU);
+# kinds MUST match the SUB_* opcodes the recognizer emits.
+def _epi_micro(kind, x, y, s, t):
+    import numpy as np
+    if kind == 0:  return x + y
+    if kind == 1:  return x * y
+    if kind == 2:  return x - y
+    if kind == 3:  return x / y
+    if kind == 4:  return np.maximum(x, y)
+    if kind == 5:  return np.minimum(x, y)
+    if kind == 8:  return -x
+    if kind == 9:  return np.exp(x)
+    if kind == 10: return np.log(x)
+    if kind == 11: return np.sqrt(x)
+    if kind == 12: return np.float32(1.0) / np.sqrt(x)
+    if kind == 13: return np.tanh(x)
+    if kind == 14: return np.abs(x)
+    if kind == 40: return x * s + t
+    if kind == 41: return (np.float32(0.5) * x * (np.float32(1.0) + np.tanh(
+        np.float32(0.7978845608) * (x + np.float32(0.044715) * x * x * x))))
+    return x
+
+
+def _apply_epi(block, rt, epi1, res_block):
+    """Run the epilogue micro-program (aux at epi1-1) on numpy `block` in place-
+    of-value; src=1 binary reads the aligned `res_block` (residual), src=2 reads
+    res_block as a per-column vector. Mirrors ops/mma.cl vmo_mma_epi."""
+    import numpy as np
+    off = epi1 - 1
+    nm = rt.aux_i32(off)
+    v = np.asarray(block, np.float32)
+    for m in range(nm):
+        o = off + 1 + m * 4
+        kind = rt.aux_i32(o)
+        src = rt.aux_i32(o + 1)
+        s = np.float32(rt.f32_from_bits(rt.aux[o + 2]))
+        t = np.float32(rt.f32_from_bits(rt.aux[o + 3]))
+        y = v if src == 0 else np.asarray(res_block, np.float32)
+        v = np.asarray(_epi_micro(kind, v, y, s, t), np.float32)
+    return v
 
 
 def _dot_interp(ins, rt):
@@ -153,7 +251,12 @@ def _dot_interp(ins, rt):
     av, bv = _dot_views(ins, rt)
     a = rt.viewed(ins.a, G * M * K, av).reshape(G, M, K)
     b = rt.viewed(ins.b, G * K * N, bv).reshape(G, K, N)
-    rt.view(ins.dst, G * M * N)[:] = (a @ b).reshape(-1)
+    c = (a @ b).reshape(G, M, N)
+    epi1, res_buf = _dot_epi(ins, rt)
+    if epi1:
+        res = rt.view(res_buf, G * M * N).reshape(G, M, N) if res_buf else None
+        c = _apply_epi(c, rt, epi1, res)
+    rt.view(ins.dst, G * M * N)[:] = c.reshape(-1)
 
 
 def _dot_tile_sim(task, entry, rt):
@@ -170,6 +273,11 @@ def _dot_tile_sim(task, entry, rt):
     b = (rt.viewed(task.b, G * K * N, task.p5) if task.p5
          else rt.view(task.b)).reshape(G, K, N)
     c = rt.view(task.dst).reshape(G, M, N)
+    # §33 R2c epilogue: task.p6 = descriptor aux-offset (+1), task.p7 = residual
+    # buffer id (per-element src=1). Applied per output tile block (each element
+    # written once), mirroring ops/mma.cl's store-epilogue.
+    epi1 = task.p6
+    res = rt.view(task.p7).reshape(G, M, N) if (epi1 and task.p7) else None
     tiles_n = math.ceil(N / MMA_T) if N else 1
     tiles_m = math.ceil(M / MMA_T) if M else 1
     per = tiles_m * tiles_n
@@ -180,8 +288,20 @@ def _dot_tile_sim(task, entry, rt):
         c0, c1 = tc * MMA_T, min(tc * MMA_T + MMA_T, N)
         if r0 >= r1 or c0 >= c1:
             continue
-        c[g, r0:r1, c0:c1] = a[g, r0:r1, :] @ b[g, :, c0:c1]
+        blk = a[g, r0:r1, :] @ b[g, :, c0:c1]
+        if epi1:
+            rb = res[g, r0:r1, c0:c1] if res is not None else None
+            blk = _apply_epi(blk, rt, epi1, rb)
+        c[g, r0:r1, c0:c1] = blk
 
 
-opsem.register(L.OP_DOT, to_task=_dot_to_task, interp=_dot_interp)
+def _dot_reads(ins):
+    """Buffer ids the dot reads: its two operands + any §33 R2c epilogue
+    second-input (residual/bias) carried in reads_hint, so the scheduler and
+    arena-liveness order the matmul after that input is produced."""
+    return {ins.a, ins.b} | set(ins.reads_hint)
+
+
+opsem.register(L.OP_DOT, to_task=_dot_to_task, interp=_dot_interp,
+               reads=_dot_reads)
 opsem.register_tile_sim(TILE_MMA, _dot_tile_sim)

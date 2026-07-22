@@ -4,6 +4,18 @@
  * (compare: operands adt -> bool result; select: bool pred -> operands dt).
  * bool is 1-byte (uchar 0/1), matching jax PRED. */
 
+/* GELU tanh-approx (§19b/§24): 0.5*x*(1+tanh(0.7978845608*(x+0.044715*x^3))).
+ * One scalar + float8/float4 twin so it rides all three EW paths (scalar tail,
+ * CPU float8 chunk, GPU float4 fast path). Matches python _gelu_np exactly. */
+#define VMO_GELU_BODY(x) \
+    ((float)0.5f * (x) * ((float)1.0f + \
+        tanh((float)0.7978845608f * ((x) + (float)0.044715f * (x) * (x) * (x)))))
+static float  vmo_gelu1(const float  x) { return VMO_GELU_BODY(x); }
+static float8 vmo_gelu8(const float8 x)
+{ return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x))); }
+static float4 vmo_gelu4(const float4 x)
+{ return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x))); }
+
 static float vmo_ew_bin(const uint sub, const float x, const float y)
 {
     switch (sub) {
@@ -33,6 +45,7 @@ static float vmo_ew_un(const uint sub, const float x)
     case SUB_TAN: return tan(x);
     case SUB_RINT: return rint(x);    /* round to nearest, ties to even */
     case SUB_ROUND: return round(x);  /* round to nearest, ties away from 0 */
+    case SUB_GELU: return vmo_gelu1(x);
     default: return 0.0f;
     }
 }
@@ -46,7 +59,8 @@ static int vmo_ew_is_bin(const uint sub)
 static int vmo_ew_is_un(const uint sub)
 {
     return (sub >= SUB_COPY && sub <= SUB_SIGN) ||
-           (sub >= SUB_LOG1P && sub <= SUB_ROUND);
+           (sub >= SUB_LOG1P && sub <= SUB_ROUND) ||
+           sub == SUB_GELU;
 }
 #define CMP(p, x, y) ((p)==0?(x)==(y):(p)==1?(x)!=(y):(p)==2?(x)<(y): \
                       (p)==3?(x)<=(y):(p)==4?(x)>(y):(x)>=(y))
@@ -146,6 +160,7 @@ static float8 vmo_ew_un8(const uint sub, const float8 x)
     case SUB_TAN: return tan(x);
     case SUB_RINT: return rint(x);
     case SUB_ROUND: return round(x);
+    case SUB_GELU: return vmo_gelu8(x);
     default: return (float8)(0.0f);
     }
 }
@@ -167,6 +182,45 @@ static uint vmo_view_idx(__global const int *aux, uint off, uint i)
         rem /= dims[e];
     }
     return (uint)o;
+}
+
+/* float4 twins of vmo_ew_bin/un for the GPU vector fast path — every builtin
+ * used has a vector overload; SUB_SIGN spelled with select() as in the float8
+ * CPU twins. */
+static float4 vmo_ew_bin4(const uint sub, const float4 x, const float4 y)
+{
+    switch (sub) {
+    case SUB_ADD: return x + y;   case SUB_MUL: return x * y;
+    case SUB_SUB: return x - y;   case SUB_DIV: return x / y;
+    case SUB_MAX: return fmax(x, y); case SUB_MIN: return fmin(x, y);
+    case SUB_POW: return pow(x, y);
+    case SUB_ATAN2: return atan2(x, y);
+    case SUB_REMAINDER: return fmod(x, y);
+    default: return (float4)(0.0f);
+    }
+}
+static float4 vmo_ew_un4(const uint sub, const float4 x)
+{
+    switch (sub) {
+    case SUB_COPY: return x;      case SUB_NEG: return -x;
+    case SUB_EXP: return exp(x);  case SUB_LOG: return log(x);
+    case SUB_SQRT: return sqrt(x); case SUB_RSQRT: return rsqrt(x);
+    case SUB_TANH: return tanh(x); case SUB_ABS: return fabs(x);
+    case SUB_FLOOR: return floor(x); case SUB_CEIL: return ceil(x);
+    case SUB_SIGN: return select(select((float4)(1.0f), (float4)(-1.0f),
+                                        x < (float4)(0.0f)),
+                                 x, x == (float4)(0.0f) | isnan(x));
+    case SUB_LOG1P: return log1p(x);
+    case SUB_EXPM1: return expm1(x);
+    case SUB_CBRT: return cbrt(x);
+    case SUB_SIN: return sin(x);
+    case SUB_COS: return cos(x);
+    case SUB_TAN: return tan(x);
+    case SUB_RINT: return rint(x);
+    case SUB_ROUND: return round(x);
+    case SUB_GELU: return vmo_gelu4(x);
+    default: return (float4)(0.0f);
+    }
 }
 
 static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop,
@@ -223,6 +277,63 @@ static void vmo_ew_tile_f32(__global uchar *arena, __global uchar **iop,
     }
     else if (sub == SUB_LTS) { if (lid == 0 && lo == 0) d[0] = (a[0] < b[0]) ? 1.0f : 0.0f; }
 #else
+    /* GPU shape: the plain stride-lsz scalar loop is LATENCY-bound — a 16K
+     * tile = 64 dependent iterations/thread ~= 15 us on Blackwell (13 GB/s
+     * per lane). float4 lanes + 2x manual unroll cut that to 8 wider, more
+     * independent memory round trips per thread. Applies when all resolved
+     * operand pointers are 16B-aligned (arena allocs and IO ports are; tile
+     * origin lo is a multiple of EW_TS); the last tile's non-multiple-of-4
+     * remainder runs the scalar tail below. Aliasing (SUB_AFFINE in-place
+     * carry) stays safe: each work item reads then writes only its own
+     * elements. */
+    const int isb = vmo_ew_is_bin(sub), isu = vmo_ew_is_un(sub);
+    const uintptr_t amask = (uintptr_t)d |
+        (sub == SUB_FILL ? (uintptr_t)0 : (uintptr_t)a) |
+        (isb ? (uintptr_t)b : (uintptr_t)0);
+    const int vec4 = (isb | isu | (sub == SUB_AFFINE) | (sub == SUB_FILL)) &&
+        !(amask & (uintptr_t)15);
+    if (vec4) {
+        __global float4 *d4 = (__global float4 *)d;
+        __global const float4 *a4 = (__global const float4 *)a;
+        __global const float4 *b4 = (__global const float4 *)b;
+        const uint lo4 = lo >> 2, hi4 = lo4 + ((hi - lo) >> 2);
+        uint i = lo4 + lid;
+        if (isb) {
+            for (; i + lsz < hi4; i += 2u * lsz) {
+                const float4 x0 = a4[i], y0 = b4[i];
+                const float4 x1 = a4[i + lsz], y1 = b4[i + lsz];
+                d4[i] = vmo_ew_bin4(sub, x0, y0);
+                d4[i + lsz] = vmo_ew_bin4(sub, x1, y1);
+            }
+            if (i < hi4) d4[i] = vmo_ew_bin4(sub, a4[i], b4[i]);
+        } else if (isu) {
+            for (; i + lsz < hi4; i += 2u * lsz) {
+                const float4 x0 = a4[i], x1 = a4[i + lsz];
+                d4[i] = vmo_ew_un4(sub, x0);
+                d4[i + lsz] = vmo_ew_un4(sub, x1);
+            }
+            if (i < hi4) d4[i] = vmo_ew_un4(sub, a4[i]);
+        } else if (sub == SUB_AFFINE) {
+            const float4 s4 = (float4)(as_float(t.p2));
+            const float4 t4 = (float4)(as_float(t.p3));
+            for (; i + lsz < hi4; i += 2u * lsz) {
+                const float4 x0 = a4[i], x1 = a4[i + lsz];
+                d4[i] = mad(x0, s4, t4);
+                d4[i + lsz] = mad(x1, s4, t4);
+            }
+            if (i < hi4) d4[i] = mad(a4[i], s4, t4);
+        } else { /* SUB_FILL */
+            const float4 v4 = (float4)(as_float(t.p2));
+            for (; i < hi4; i += lsz) d4[i] = v4;
+        }
+        /* scalar tail: elements past the last full float4 of this tile */
+        for (uint j = lo + ((hi - lo) & ~3u) + lid; j < hi; j += lsz)
+            d[j] = isb ? vmo_ew_bin(sub, a[j], b[j])
+                 : isu ? vmo_ew_un(sub, a[j])
+                 : sub == SUB_AFFINE ? mad(a[j], as_float(t.p2), as_float(t.p3))
+                 : as_float(t.p2);
+        return;
+    }
     if (vmo_ew_is_bin(sub))
         for (uint i = lo + lid; i < hi; i += lsz) d[i] = vmo_ew_bin(sub, a[i], b[i]);
     else if (vmo_ew_is_un(sub))
@@ -289,7 +400,8 @@ static void vmo_ew_tile_i32(__global uchar *arena, __global uchar **iop, const t
     __global const int *a = AP(const int, t.a), *b = AP(const int, t.b);
     if (sub == SUB_FILL) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (int)t.p2; return; }
     if (sub == SUB_IOTA_FLAT) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (int)i; return; }
-    const int needs_y = (sub <= SUB_POW) || sub == SUB_AND || sub == SUB_OR || sub == SUB_XOR;
+    const int needs_y = (sub <= SUB_POW) || sub == SUB_AND || sub == SUB_OR || sub == SUB_XOR
+                        || sub == SUB_SHL || sub == SUB_SHR_L || sub == SUB_SHR_A;
     for (uint i = lo + lid; i < hi; i += lsz) {
         const int x = a[i], y = needs_y ? b[i] : 0;
         int r;
@@ -302,6 +414,48 @@ static void vmo_ew_tile_i32(__global uchar *arena, __global uchar **iop, const t
         case SUB_SIGN: r = x > 0 ? 1 : (x < 0 ? -1 : 0); break;
         case SUB_AND: r = x & y; break;   case SUB_OR: r = x | y; break;
         case SUB_XOR: r = x ^ y; break;   case SUB_NOT: r = ~x; break;
+        /* Shifts: mask count to 31 (C/OpenCL leave count>=width undefined; jax
+         * threefry only shifts by <32 anyway, but the mask keeps it defined).
+         * SHR_L is logical via the unsigned view; SHR_A is arithmetic. */
+        case SUB_SHL:   r = (int)((uint)x << ((uint)y & 31u)); break;
+        case SUB_SHR_L: r = (int)((uint)x >> ((uint)y & 31u)); break;
+        case SUB_SHR_A: r = x >> (y & 31); break;
+        default: r = x; break;
+        }
+        d[i] = r;
+    }
+}
+
+/* int64/uint64 (8-byte) elementwise. Mirrors vmo_ew_tile_i32 on `long`. The
+ * threefry RNG counter is ui64 (iota -> multiply -> shift_right_logical by 32 ->
+ * convert to ui32), so this path must exist for jax.random. Shifts mask the
+ * count to 63; SHR_L is logical (unsigned view), SHR_A arithmetic. */
+static void vmo_ew_tile_i64(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
+                        uint lid, uint lsz)
+{
+    const uint sub = t.p0, n = t.p1;
+    const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
+    __global long *d = AP(long, t.dst);
+    __global const long *a = AP(const long, t.a), *b = AP(const long, t.b);
+    if (sub == SUB_FILL) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (long)(int)t.p2; return; }
+    if (sub == SUB_IOTA_FLAT) { for (uint i = lo + lid; i < hi; i += lsz) d[i] = (long)i; return; }
+    const int needs_y = (sub <= SUB_POW) || sub == SUB_AND || sub == SUB_OR || sub == SUB_XOR
+                        || sub == SUB_SHL || sub == SUB_SHR_L || sub == SUB_SHR_A;
+    for (uint i = lo + lid; i < hi; i += lsz) {
+        const long x = a[i], y = needs_y ? b[i] : 0;
+        long r;
+        switch (sub) {
+        case SUB_ADD: r = x + y; break;   case SUB_MUL: r = x * y; break;
+        case SUB_SUB: r = x - y; break;   case SUB_DIV: r = y ? x / y : 0; break;
+        case SUB_MAX: r = max(x, y); break; case SUB_MIN: r = min(x, y); break;
+        case SUB_COPY: r = x; break;      case SUB_NEG: r = -x; break;
+        case SUB_ABS: r = abs(x); break;
+        case SUB_SIGN: r = x > 0 ? 1 : (x < 0 ? -1 : 0); break;
+        case SUB_AND: r = x & y; break;   case SUB_OR: r = x | y; break;
+        case SUB_XOR: r = x ^ y; break;   case SUB_NOT: r = ~x; break;
+        case SUB_SHL:   r = (long)((ulong)x << ((ulong)y & 63u)); break;
+        case SUB_SHR_L: r = (long)((ulong)x >> ((ulong)y & 63u)); break;
+        case SUB_SHR_A: r = x >> (y & 63); break;
         default: r = x; break;
         }
         d[i] = r;
@@ -380,6 +534,25 @@ static void vmo_convert_tile(__global uchar *arena, __global uchar **iop, const 
 {
     const uint n = t.p1;
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n);
+    /* Integer-only conversions between i64 and i32/u32 go through `long` (not the
+     * double intermediate below), so truncation keeps the exact low 32 bits even
+     * when the value exceeds 2^53 — required by threefry's ui64->ui32 word split.
+     * Widening i32/u32->i64 sign/zero-extends per the signless-int convention. */
+    const int a_is_i64 = (adt == DT_I64);
+    const int d_is_i64 = (dt == DT_I64);
+    const int a_is_i32 = (adt == DT_I32 || adt == DT_U32 || adt == DT_BOOL);
+    const int d_is_i32 = (dt == DT_I32 || dt == DT_U32);
+    if ((a_is_i64 || a_is_i32) && (d_is_i64 || d_is_i32)) {
+        for (uint i = lo + lid; i < hi; i += lsz) {
+            long v = a_is_i64 ? AP(const long, t.a)[i]
+                   : (adt == DT_U32) ? (long)(uint)AP(const int, t.a)[i]
+                   : (adt == DT_BOOL) ? (long)AP(const uchar, t.a)[i]
+                   : (long)AP(const int, t.a)[i];
+            if (d_is_i64) AP(long, t.dst)[i] = v;
+            else          AP(int, t.dst)[i] = (int)v;   /* low 32 bits */
+        }
+        return;
+    }
     for (uint i = lo + lid; i < hi; i += lsz) {
 #ifdef cl_khr_fp64
         double v;
@@ -473,6 +646,7 @@ static void vmo_ew_tile(__global uchar *arena, __global uchar **iop,
     if (t.p0 == SUB_ISFINITE) { vmo_isfinite_tile(arena, iop, t, tile, adt, lid, lsz); return; }
     switch (dt) {
     case DT_I32: case DT_U32: vmo_ew_tile_i32(arena, iop, t, tile, lid, lsz); break;
+    case DT_I64:              vmo_ew_tile_i64(arena, iop, t, tile, lid, lsz); break;
     case DT_BOOL:             vmo_ew_tile_bool(arena, iop, t, tile, lid, lsz); break;
     case DT_F16:              vmo_ew_tile_f16(arena, iop, t, tile, lid, lsz); break;
     case DT_BF16:             vmo_ew_tile_bf16(arena, iop, t, tile, lid, lsz); break;

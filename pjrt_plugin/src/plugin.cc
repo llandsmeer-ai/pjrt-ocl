@@ -768,7 +768,9 @@ static PJRT_Error* Impl_PJRT_Client_Compile(PJRT_Client_Compile_Args* args) {
   std::string err;
   bool unsupported = false;
   std::vector<std::pair<std::string, std::string>> sub_env = {
-      {"PJRT_OCL_NLANES", std::to_string(client->runtime->ngroups())}};
+      {"PJRT_OCL_NLANES", std::to_string(client->runtime->ngroups())},
+      {"PJRT_OCL_EW_TS", std::to_string(client->runtime->ew_ts())},
+      {"PJRT_OCL_MMA_T", std::to_string(client->runtime->mma_t())}};
   if (const char* ct = std::getenv("PJRT_OCL_COST_TABLE"); ct && ct[0])
     sub_env.push_back({"PJRT_OCL_COST_TABLE", ct});
   else if (!client->runtime->cost_table_path().empty())

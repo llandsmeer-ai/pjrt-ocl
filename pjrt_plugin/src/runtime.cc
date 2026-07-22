@@ -196,15 +196,26 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
     if (dt > kDtMax) return fail("unknown dtype " + std::to_string(dt));
     for (uint32_t id : {t.dst, t.a, t.b})
       if (id >= n_buffers) return fail("task buffer id out of range");
+    // §28 multi-input region: p2..p7 are extra input buffer handles.
+    if (base_op == kTopMapRegion)
+      for (uint32_t id : {t.p2, t.p3, t.p4, t.p5, t.p6, t.p7})
+        if (id >= n_buffers) return fail("region input buffer id out of range");
     if (base_op == kTopEw && t.p0 == kEwSubSelect && t.p3 >= n_buffers)
       return fail("select pred id out of range");
     if ((base_op == kTopGather || base_op == kTopIotaDim ||
          base_op == kTopDynGather || base_op == kTopDynScatter ||
-         base_op == kTopRedWindow) && t.p0 >= n_aux)
+         base_op == kTopRedWindow || base_op == kTopGatherIndex ||
+         base_op == kTopScatterIndex) &&
+        t.p0 >= n_aux)
       return fail("task aux offset out of range");
     // MMA operand VIEW aux-offsets (+1; 0 = contiguous) index the aux pool.
     if (base_op == kTopMma && (t.p4 > n_aux || t.p5 > n_aux))
       return fail("mma view aux offset out of range");
+    // §34 flash-attention: p0 = V buffer id, p3 = descriptor aux word-offset
+    // (9 words: H,T,C,hd,scale,causal,qv,kv,vv).
+    if (base_op == kTopFlashAttn &&
+        (t.p0 >= n_buffers || uint64_t(t.p3) + 9 > n_aux))
+      return fail("flash-attn V id / aux offset out of range");
   }
   uint32_t barrier_count_ref = 0;
   bool first_lane = true;
@@ -348,6 +359,26 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   if (!rt->info_.is_gpu)
     for (auto& v : variants)
       v.opts += v.opts.empty() ? "-DVMO_CPU_TILES" : " -DVMO_CPU_TILES";
+  // Device-tuned EW tile size, baked into the kernels here and advertised to
+  // the python scheduler via PJRT_OCL_EW_TS (plugin.cc) — the two must agree.
+  // GPUs: 4096. One tile is one workgroup's serial grid-stride chain, so at
+  // 16384 any op smaller than ~lanes*16K elems ran latency-bound on a handful
+  // of lanes (flat ~15 us/op for N in 16K..2M, chained bench). 4096 quadruples
+  // lane parallelism at equal total work; per-tile dispatch is sub-us. CPUs
+  // keep 16384: PoCL pays ~300 us/tile host overhead, more tiles = pure loss.
+  rt->ew_ts_ = rt->info_.is_gpu ? 4096 : 16384;
+  if (const char* e = std::getenv("PJRT_OCL_EW_TS"); e && e[0])
+    rt->ew_ts_ = std::max(256, std::atoi(e));
+  rt->ew_ts_ = (rt->ew_ts_ + 7u) & ~7u;  // float8 CPU path needs 8-alignment
+  for (auto& v : variants)
+    v.opts += (v.opts.empty() ? "-DEW_TS=" : " -DEW_TS=") +
+              std::to_string(rt->ew_ts_) + "u";
+  // Investigation hook (§27 register-budget PoC): append arbitrary build defines
+  // to every variant, e.g. PJRT_OCL_EXTRA_BUILD="-DVMO_PROBE_REGS=64" or
+  // "-DVMO_REGION_POC". Off unless set; never used by the shipped path.
+  if (const char* e = std::getenv("PJRT_OCL_EXTRA_BUILD"); e && e[0])
+    for (auto& v : variants)
+      v.opts += std::string(v.opts.empty() ? "" : " ") + e;
   std::string build_log;
   bool built = false;
   for (const auto& v : variants) {
@@ -387,6 +418,9 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
     rt->mm_packed_kernel_ = clCreateKernel(rt->program_, "mm2p", &cerr);
     if (cerr != CL_SUCCESS)
       return fail("clCreateKernel mm2p: " + std::to_string(cerr));
+    rt->mm_packed_epi_kernel_ = clCreateKernel(rt->program_, "mm2p_epi", &cerr);
+    if (cerr != CL_SUCCESS)
+      return fail("clCreateKernel mm2p_epi: " + std::to_string(cerr));
   }
 
   // NVIDIA-only TF32 tensor-core megakernel (docs/decisions.md §10b, poc/08):
@@ -405,8 +439,27 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
                  rt->info_.has_device_fence;
   if (const char* e = std::getenv("PJRT_OCL_MEGA_TC"); e && e[0] == '0')
     mega_tc = false;
+  // §31 go-to-188: PJRT_OCL_MEGA_BIGTILE=1 builds the TF32 megakernel with a
+  // 128x128 MMA tile (-DVMO_MEGA_BIGTILE). The larger accumulator crosses the
+  // 128-register cliff so occupancy discovery relaunches at 1 WG/SM = 188
+  // lanes (all co-resident; barrier/scoreboard safe, §27). Only meaningful
+  // with the TF32 (WMMA) path; the scheduler is told MMA_T=128 (below) only if
+  // the big-tile TF32 program actually builds, so the portable 64x64 fallback
+  // is never driven by a 128-tile schedule.
+  bool big_tile = mega_tc;
+  if (const char* e = std::getenv("PJRT_OCL_MEGA_BIGTILE");
+      !(e && e[0] && e[0] != '0'))
+    big_tile = false;
+  // P3 (§31): -DVMO_MMA_PIPE double-buffers the WMMA K-loop staging. Opt-in via
+  // PJRT_OCL_MEGA_PIPE; independent of tile size (A/B either). Off by default.
+  bool mma_pipe = mega_tc;
+  if (const char* e = std::getenv("PJRT_OCL_MEGA_PIPE");
+      !(e && e[0] && e[0] != '0'))
+    mma_pipe = false;
   if (mega_tc) {
     std::string tc_opts = rt->info_.build_opts + " -DVMO_NV_PTX";
+    if (big_tile) tc_opts += " -DVMO_MEGA_BIGTILE";
+    if (mma_pipe) tc_opts += " -DVMO_MMA_PIPE";
     const char* tsrc = kVmClSource;
     size_t tlen = std::strlen(tsrc);
     cl_int tce;
@@ -417,7 +470,41 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
                        nullptr, nullptr) == CL_SUCCESS) {
       rt->vm_tc_kernel_ = clCreateKernel(rt->tc_mega_program_, "vm2", &tce);
       if (tce != CL_SUCCESS) rt->vm_tc_kernel_ = nullptr;
+      // §36: the standalone TF32 WMMA SGEMM (poc/17) lives in the SAME NV_PTX
+      // program (inline PTX). Non-fatal if absent — the SGEMM mm2 remains.
+      cl_int me;
+      rt->mm_tc_kernel_ = clCreateKernel(rt->tc_mega_program_, "mm_tc", &me);
+      if (me != CL_SUCCESS) rt->mm_tc_kernel_ = nullptr;
+      // §38: the standalone fp16 WMMA SGEMM lives in the same NV_PTX program.
+      // Non-fatal if absent — the tf32 mm_tc / SGEMM remain the fallback.
+      cl_int fe;
+      rt->mm_tc_fp16_kernel_ = clCreateKernel(rt->tc_mega_program_, "mm_tc_fp16", &fe);
+      if (fe != CL_SUCCESS) rt->mm_tc_fp16_kernel_ = nullptr;
+      // §39: fp16-INPUT tile (reads pre-packed fp16 scratch, halves staging
+      // bytes -> ~107 TF/s) + its f32->fp16 pack kernel. Same NV_PTX program.
+      cl_int pe;
+      rt->mm_tc_fp16p_kernel_ =
+          clCreateKernel(rt->tc_mega_program_, "mm_tc_fp16p", &pe);
+      if (pe != CL_SUCCESS) rt->mm_tc_fp16p_kernel_ = nullptr;
+      cl_int ke;
+      rt->pack_f16_kernel_ = clCreateKernel(rt->tc_mega_program_, "pack_f16", &ke);
+      if (ke != CL_SUCCESS) rt->pack_f16_kernel_ = nullptr;
     }
+    // §38 opt-in: PJRT_OCL_MM_FP16=1 routes big matmuls (LaunchMatmul fast path
+    // + MM_HYBRID phases) through the fp16 WMMA tile instead of tf32 mm_tc.
+    if (const char* e = std::getenv("PJRT_OCL_MM_FP16"); e && e[0] && e[0] != '0')
+      rt->mm_fp16_ = true;
+    // §39 packed fp16-INPUT path — MEASURED A WASH in-plugin (the mandatory
+    // f32->fp16 conversion pass negates the halved-input-read savings the
+    // standalone 107 TF/s assumed from pre-existing fp16 inputs). Default OFF;
+    // opt-in via PJRT_OCL_MM_FP16_PACK=1 for the record.
+    if (const char* e = std::getenv("PJRT_OCL_MM_FP16_PACK");
+        e && e[0] && e[0] != '0')
+      rt->mm_fp16_pack_ = true;
+    // Advertise 128 to the scheduler ONLY if the 128x128 TF32 kernel is the one
+    // that will execute (built AND non-null). If it failed, mma_t_ stays 64 and
+    // the portable fallback runs a matching 64x64 schedule.
+    if (big_tile && rt->vm_tc_kernel_) rt->mma_t_ = 128;
     if (!rt->vm_tc_kernel_ && rt->tc_mega_program_) {
       std::string log(1 << 14, '\0');
       size_t ls = 0;
@@ -459,6 +546,19 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
     }
     // "auto" (or anything else) keeps the default.
   }
+  // §36 hybrid needs the segmented (host-dispatch) engine so big-matmul phases
+  // can be interleaved with standalone mm_tc launches on the in-order queue; the
+  // single persistent megakernel launch cannot be split mid-flight. Forcing it
+  // here makes PJRT_OCL_MM_HYBRID=1 a one-switch gate.
+  if (const char* e = std::getenv("PJRT_OCL_MM_HYBRID"); e && e[0] && e[0] != '0') {
+    // Record whether HYBRID is the SOLE reason for host-dispatch: only then can
+    // a matmul-light program safely fall back to the megakernel per-program.
+    // (If the device already required host-dispatch — CPU / no device fence /
+    // ENGINE=host — the megakernel is unavailable and this stays false.)
+    if (!rt->host_dispatch_ && rt->can_use_megakernel())
+      rt->hybrid_forces_hd_ = true;
+    rt->host_dispatch_ = true;
+  }
 
   // Execution tracing (PJRT_OCL_VM_TRACE=<path>): per-entry event profiling
   // only exists on the host-dispatch engine (the megakernel's entries are not
@@ -487,6 +587,12 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
       rt->ngroups_ = std::min(rt->ngroups_, measured_res);
   if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
+  // Host-dispatch tile work-group size. On CPU, lsz=1 removes the collaborative
+  // reduce-tree barriers (pessimal when a work-group is one serial CPU thread —
+  // see seg_lsz()); GPUs forced into host-dispatch keep 256. Env overrides both.
+  rt->seg_lsz_ = rt->info_.is_gpu ? 256 : 1;
+  if (const char* s = std::getenv("PJRT_OCL_CPU_LSZ"); s && s[0])
+    rt->seg_lsz_ = std::max(1, std::atoi(s));
   if (const char* v = std::getenv("PJRT_OCL_INFO"); v && v[0])
     std::fprintf(stderr,
                  "[pjrt-ocl] engine=%s in-program-matmul=%s lanes=%u "
@@ -553,9 +659,14 @@ OclRuntime::~OclRuntime() {
   if (vm_seg_kernel_) clReleaseKernel(vm_seg_kernel_);
   if (vm_one_kernel_) clReleaseKernel(vm_one_kernel_);
   if (mm_kernel_) clReleaseKernel(mm_kernel_);
+  if (mm_tc_kernel_) clReleaseKernel(mm_tc_kernel_);
+  if (mm_tc_fp16_kernel_) clReleaseKernel(mm_tc_fp16_kernel_);
+  if (mm_tc_fp16p_kernel_) clReleaseKernel(mm_tc_fp16p_kernel_);
+  if (pack_f16_kernel_) clReleaseKernel(pack_f16_kernel_);
   if (gemv_kernel_) clReleaseKernel(gemv_kernel_);
   if (mm_pack_kernel_) clReleaseKernel(mm_pack_kernel_);
   if (mm_packed_kernel_) clReleaseKernel(mm_packed_kernel_);
+  if (mm_packed_epi_kernel_) clReleaseKernel(mm_packed_epi_kernel_);
   if (dummy_buf_) clReleaseMemObject(dummy_buf_);
   for (auto& [sz, v] : buf_pool_)
     for (cl_mem m : v) clReleaseMemObject(m);
@@ -578,6 +689,42 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
   lp->rt_ = rt;
   lp->prog_ = std::move(prog);
   const VmProgram& p = lp->prog_;
+
+  // Per-program host-dispatch work-group size. The runtime's preference
+  // (rt->seg_lsz(), default 1 on CPU) removes the collaborative reduce-tree
+  // barriers that are pure overhead when a work-group is one serial CPU thread.
+  // But some tile ops are collaborative — a barriered workgroup reduction that
+  // is INCORRECT at lsz=1 (flash-attention hits PoCL 5.0's barriered-loop
+  // miscompile, §18/§19a; matmul/conv assume lsz>1 lanes). Use the preferred
+  // lsz only when EVERY op is in the lsz=1-safe set; otherwise pin to 256. When
+  // PJRT_OCL_CPU_LSZ is set explicitly it is honored as-is (A/B lever).
+  {
+    static const bool cpu_lsz_env = [] {
+      const char* e = std::getenv("PJRT_OCL_CPU_LSZ");
+      return e && e[0];
+    }();
+    lp->seg_lsz_ = rt->seg_lsz();
+    if (!cpu_lsz_env && lp->seg_lsz_ < 256) {
+      auto safe_at_lsz1 = [](uint32_t op) {
+        switch (op) {
+          case kTopEw: case kTopGather: case kTopRedPart: case kTopRedComb:
+          case kTopIotaDim: case kTopScatter: case kTopDynGather:
+          case kTopDynScatter: case kTopRedSeg: case kTopSoftmaxSeg:
+          case kTopLayernormSeg:
+            return true;
+          // kTopRedStrided is EXCLUDED: its tiles hold up to EW_TS outputs, so a
+          // large partial-axis reduce is 1-2 tiles = little lane parallelism, and
+          // lsz=1 also removes the within-work-group work-item split PoCL relied
+          // on (measured: 8192x512 axis-0 reduce 58 -> 116 ms). Such programs keep
+          // lsz=256. (Small strided reduces are a wash either way.)
+          default:  // kTopMma, kTopFlashAttn, kTopConv, kTopRedWindow,
+            return false;  // kTopMapRegion, kTopGatherIndex, kTopRedStrided
+        }
+      };
+      for (const auto& t : p.tasks)
+        if (!safe_at_lsz1(t.tile_op & 0xFFu)) { lp->seg_lsz_ = 256; break; }
+    }
+  }
 
   // f64 gate: the VM's f64 path is compiled only under cl_khr_fp64, so on a
   // device without it an f64 program would silently fall back to f32. Refuse.
@@ -648,6 +795,29 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
     t.b = elem_off(t.b);
     if ((t.tile_op & 0xFFu) == kTopEw && t.p0 == kEwSubSelect)
       t.p3 = elem_off(t.p3);
+    // §34 flash-attention: the V-cache buffer rides in p0 as a buffer id (a=Q,
+    // b=K, p0=V); resolve it to a byte offset / port exactly like dst/a/b. p3
+    // (the aux descriptor word-offset) and p1/p2 (H,T) are NOT buffers.
+    if ((t.tile_op & 0xFFu) == kTopFlashAttn)
+      t.p0 = elem_off(t.p0);
+    // §33 R2c: a matmul epilogue's second input (residual/bias) rides in p7 as a
+    // buffer id; resolve it to a byte offset / port exactly like dst/a/b. Only
+    // meaningful when p6 (the epilogue descriptor) is present. Gated on the MMA
+    // tile op so other ops may use p6/p7 for non-buffer fields.
+    if ((t.tile_op & 0xFFu) == kTopMma && t.p6)
+      t.p7 = elem_off(t.p7);
+    // §28 follow-up: a multi-input map-region carries its extra inputs (beyond
+    // a/b) in p2..p7 as buffer handles; resolve them to byte offsets / ports
+    // like dst/a/b. The descriptor's n_in bounds how many the kernel reads, but
+    // resolving all of them is harmless (unused fields alias in0's handle).
+    if ((t.tile_op & 0xFFu) == kTopMapRegion) {
+      t.p2 = elem_off(t.p2);
+      t.p3 = elem_off(t.p3);
+      t.p4 = elem_off(t.p4);
+      t.p5 = elem_off(t.p5);
+      t.p6 = elem_off(t.p6);
+      t.p7 = elem_off(t.p7);
+    }
   }
 
   // Patch dynamic_slice/update start-scalar locations in the aux pool:
@@ -659,6 +829,34 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
   std::vector<int32_t> aux = p.aux;
   for (const VmTask& t : p.tasks) {  // unpatched copy: dyn p0 = aux offset
     const uint32_t base_op = t.tile_op & 0xFFu;
+    if (base_op == kTopGatherIndex) {
+      // §38 general gather aux header: [out_rank, nidx, si_vec_stride, is64,
+      // idx_byteoff(placeholder), idx_bufid, ...]. The start_indices buffer
+      // location (word 4) is patched here from its buffer id (word 5), exactly
+      // like dynamic_slice's start scalars — arena offsets / port handles are
+      // only known at load time. The kernel reads it through AP().
+      const size_t x = t.p0;
+      if (x + 6 > aux.size()) {
+        *err = "LoadedProgram: gather-index aux block out of range";
+        return nullptr;
+      }
+      aux[x + 4] = static_cast<int32_t>(
+          elem_off(static_cast<uint32_t>(aux[x + 5])));
+      continue;
+    }
+    if (base_op == kTopScatterIndex) {
+      // §42 general scatter aux header: [out_rank, nidx, si_vec_stride, is64,
+      // idx_byteoff(placeholder), idx_bufid, kind, ...]. Same start_indices
+      // location patch as the gather (word 4 from the buffer id in word 5).
+      const size_t x = t.p0;
+      if (x + 7 > aux.size()) {
+        *err = "LoadedProgram: scatter-index aux block out of range";
+        return nullptr;
+      }
+      aux[x + 4] = static_cast<int32_t>(
+          elem_off(static_cast<uint32_t>(aux[x + 5])));
+      continue;
+    }
     if (base_op != kTopDynGather && base_op != kTopDynScatter) continue;
     const size_t x = t.p0;
     const int32_t rank = aux[x];
@@ -678,9 +876,11 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
   // Exclude VIEW-folded matmuls (p4/p5 != 0): the standalone mm2/gemv kernels
   // read contiguous operands and have no view descriptor path — those stay on
   // the megakernel, which does implement the strided operand read.
+  // Exclude epilogue-fused matmuls (p6 != 0): the standalone mm2/gemv kernels
+  // have no store-epilogue path (§33 R2c), so those stay on the megakernel.
   if (tasks.size() == 1 && (tasks[0].tile_op & 0xFFu) == kTopMma &&
       ((tasks[0].tile_op >> 8) & 0xFFu) == kDtF32 && tasks[0].p3 <= 1 &&
-      tasks[0].p4 == 0 && tasks[0].p5 == 0) {
+      tasks[0].p4 == 0 && tasks[0].p5 == 0 && tasks[0].p6 == 0) {
     bool clean = true;
     for (const VmEntry& en : p.entries)
       if (en.task == kEntBarrier || en.task == kEntWhile ||
@@ -731,6 +931,56 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
       }
     }
   }
+  // CPU in-program matmul hybrid (docs/decisions.md §12/§13): the megakernel's
+  // scalar-4x4 vmo_mma_tile is pessimal on PoCL (__local staging + WG barriers
+  // force loop-splits — §12 root cause 2), so any f32 matmul EMBEDDED in a
+  // larger program crawls (~10 GFLOP/s vs the packed mm2p's ~400+). Mirror the
+  // NVIDIA mm_tc hybrid on CPU: at execute time peel pure-matmul phases out to
+  // mm2p. Here we only size the shared B-panel scratch to the largest routable
+  // matmul (routing predicate must match the one in LaunchHostDispatch). Gated
+  // on the packed kernels existing (non-GPU build) and not the single-matmul
+  // fast path (that already uses mm_bp_). PJRT_OCL_MM_HYBRID_CPU=0 disables.
+  if (!rt->is_gpu() && rt->mm_pack_kernel() && !lp->mm_ok_) {
+    const char* off = std::getenv("PJRT_OCL_MM_HYBRID_CPU");
+    if (!(off && off[0] == '0')) {
+      size_t max_kn = 0;
+      for (const VmTask& tk : tasks)
+        if ((tk.tile_op & 0xFFu) == kTopMma &&
+            ((tk.tile_op >> 8) & 0xFFu) == kDtF32 && tk.p3 <= 1 &&
+            tk.p4 == 0 && tk.p5 == 0 && tk.p1 % 16u == 0 &&
+            tk.p0 >= 6 && tk.p1 >= 16 && tk.p2 >= 16)
+          max_kn = std::max(max_kn, size_t{tk.p2} * tk.p1);
+      if (max_kn) {
+        lp->hy_bp_bytes_ = max_kn * 4;
+        lp->hy_bp_ = rt->PoolAlloc(lp->hy_bp_bytes_, err);
+        if (!lp->hy_bp_) return nullptr;
+      }
+    }
+  }
+  // Per-program engine selection. Default to the client-wide choice. But when
+  // host-dispatch was forced SOLELY by MM_HYBRID (GPU + megakernel available),
+  // a program with no routable big-matmul phase gains nothing from routing and
+  // pays host-dispatch's per-phase penalty — so fall it back to the megakernel.
+  // Proxy for "has a routable phase": at least one individually routable big
+  // matmul task exists (the per-phase all-routable check happens at execute; a
+  // program with zero routable tasks can never route). Mirrors the GPU gate in
+  // LaunchHostDispatch (fp16 uses a compute-volume gate; tf32 uses dims).
+  lp->host_dispatch_ = rt->host_dispatch();
+  if (rt->host_dispatch() && rt->hybrid_forces_hd() && rt->trace_path().empty()) {
+    bool any_routable = false;
+    for (const VmTask& tk : tasks) {
+      if ((tk.tile_op & 0xFFu) != kTopMma ||
+          ((tk.tile_op >> 8) & 0xFFu) != kDtF32 || tk.p3 > 1 || tk.p4 || tk.p5 ||
+          tk.p6)
+        continue;
+      const uint64_t vol = (uint64_t)tk.p0 * (uint64_t)tk.p1 * (uint64_t)tk.p2;
+      const bool routable = rt->mm_fp16()
+                                ? (vol >= (1ull << 30))
+                                : (tk.p0 >= 512 && tk.p1 >= 512 && tk.p2 >= 256);
+      if (routable) { any_routable = true; break; }
+    }
+    if (!any_routable) lp->host_dispatch_ = false;  // use the megakernel
+  }
   // Patch control-entry cond buffer ids.
   std::vector<VmEntry> entries = p.entries;
   for (VmEntry& en : entries)
@@ -738,6 +988,7 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
       en.signal_flag = elem_off(en.signal_flag);
   lp->tasks_buf_ = make_buf(tasks.data(), tasks.size() * sizeof(VmTask), "tasks");
   if (!lp->tasks_buf_) return nullptr;
+  lp->tasks_patched_ = tasks;  // §36 hybrid: patched dst/a/b handles for mm_tc
   lp->entries_buf_ =
       make_buf(entries.data(), entries.size() * sizeof(VmEntry), "entries");
   if (!lp->entries_buf_) return nullptr;
@@ -770,6 +1021,9 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
 
 LoadedProgram::~LoadedProgram() {
   if (mm_bp_) rt_->PoolFree(mm_bp_, mm_bp_bytes_);
+  if (hy_bp_) rt_->PoolFree(hy_bp_, hy_bp_bytes_);
+  if (mm_f16a_) rt_->PoolFree(mm_f16a_, mm_f16a_bytes_);
+  if (mm_f16b_) rt_->PoolFree(mm_f16b_, mm_f16b_bytes_);
   for (cl_mem m : {arena_, aux_buf_, tasks_buf_, entries_buf_, lane_tab_buf_,
                    bar_buf_, stats_buf_, seg_tab_buf_})
     if (m) clReleaseMemObject(m);
@@ -843,8 +1097,8 @@ bool LoadedProgram::Execute(const std::vector<const void*>& inputs,
     }
   }
 
-  if (!(rt_->host_dispatch() ? LaunchHostDispatch(q, err)
-                             : LaunchKernel(q, err))) {
+  if (!(host_dispatch_ ? LaunchHostDispatch(q, err)
+                       : LaunchKernel(q, err))) {
     cleanup();
     return false;
   }
@@ -880,6 +1134,15 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
   cl_kernel k = rt_->vm_exec_kernel();
   cl_uint nlanes = p.n_lanes;
   size_t lsz = 256, gsz = size_t{nlanes} * lsz;
+  // §29 phase-timestamp instrumentation: zero the stats buffer so unwritten
+  // barrier rows read 0 (the kernel writes %globaltimer per lane per barrier
+  // when built -DVMO_PHASE_TS). Off unless PJRT_OCL_PHASE_TS is set.
+  static const bool phase_ts = std::getenv("PJRT_OCL_PHASE_TS") != nullptr;
+  if (phase_ts) {
+    std::vector<uint32_t> z(size_t{4096} * nlanes, 0u);
+    clEnqueueWriteBuffer(q, stats_buf_, CL_FALSE, 0, z.size() * 4, z.data(), 0,
+                         nullptr, nullptr);
+  }
   clSetKernelArg(k, 0, sizeof(arena_), &arena_);
   clSetKernelArg(k, 1, sizeof(aux_buf_), &aux_buf_);
   clSetKernelArg(k, 2, sizeof(tasks_buf_), &tasks_buf_);
@@ -901,61 +1164,228 @@ bool LoadedProgram::LaunchKernel(cl_command_queue q, std::string* err) {
 }
 
 // Standalone SGEMM launch: one 256-thread workgroup per 128x128 output tile.
+// Packed CPU SGEMM: enqueue mm2_pack (B -> 16-col panels in `bp`) then the
+// mm2p 6x16 KC-sweeps (2D grid: 6-row blocks x panel-groups). Requires
+// N % 16 == 0 and a `bp` scratch >= K*N*4. No drain — the caller's in-order
+// queue serializes this after prior work and before the next; reusing one `bp`
+// across several matmuls is safe because pack_{i+1} is ordered after sweeps_i.
+bool LoadedProgram::EnqueuePackedMM(cl_command_queue q, uint32_t M, uint32_t N,
+                                    uint32_t K, uint32_t dst, uint32_t a,
+                                    uint32_t bh, cl_mem bp, uint32_t p6,
+                                    uint32_t p7, std::string* err) {
+  cl_kernel kp = rt_->mm_pack_kernel();
+  clSetKernelArg(kp, 0, sizeof(arena_), &arena_);
+  for (int pt = 0; pt < kNIoPorts; ++pt) {
+    cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+    clSetKernelArg(kp, 1 + pt, sizeof(cl_mem), &b);
+  }
+  clSetKernelArg(kp, 9, sizeof(uint32_t), &N);
+  clSetKernelArg(kp, 10, sizeof(uint32_t), &K);
+  clSetKernelArg(kp, 11, sizeof(uint32_t), &bh);
+  clSetKernelArg(kp, 12, sizeof(bp), &bp);
+  size_t pg = size_t{N / 16} * K;
+  if (clEnqueueNDRangeKernel(q, kp, 1, nullptr, &pg, nullptr, 0, nullptr,
+                             nullptr) != CL_SUCCESS) {
+    *err = "Execute: mm2_pack launch failed";
+    return false;
+  }
+  // 2D grid: dim0 = 6-row blocks, dim1 = panel-groups of VMO_MM_PC=2 panels
+  // (32 cols). Splitting N gives ~N/32x more workgroups so PoCL (1 WI/WG =
+  // 1 host thread) fills all cores and each WG's B slice stays cache-hot
+  // (poc/18: @2048 297->555, @1024 230->500 GFLOP/s). Must match VMO_MM_PC.
+  constexpr uint32_t kPC = 2;
+  const uint32_t npanels = N / 16;
+  size_t mg[2] = {(M + 5) / 6, (npanels + kPC - 1) / kPC};
+  size_t ml[2] = {1, 1};
+  if (p6) {
+    // Epilogue-fused matmul (bias/relu/residual, §33 R2c): one K-sweep + the
+    // per-element micro-program at store (mm2p_epi). No KC blocking — routing
+    // only takes this for K where a single sweep is fine.
+    cl_kernel km = rt_->mm_packed_epi_kernel();
+    clSetKernelArg(km, 0, sizeof(arena_), &arena_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(km, 1 + pt, sizeof(cl_mem), &b);
+    }
+    clSetKernelArg(km, 9, sizeof(cl_mem), &aux_buf_);
+    clSetKernelArg(km, 10, sizeof(uint32_t), &M);
+    clSetKernelArg(km, 11, sizeof(uint32_t), &N);
+    clSetKernelArg(km, 12, sizeof(uint32_t), &K);
+    clSetKernelArg(km, 13, sizeof(uint32_t), &dst);
+    clSetKernelArg(km, 14, sizeof(uint32_t), &a);
+    clSetKernelArg(km, 15, sizeof(bp), &bp);
+    clSetKernelArg(km, 16, sizeof(uint32_t), &p6);
+    clSetKernelArg(km, 17, sizeof(uint32_t), &p7);
+    if (clEnqueueNDRangeKernel(q, km, 2, nullptr, mg, ml, 0, nullptr,
+                               nullptr) != CL_SUCCESS) {
+      *err = "Execute: mm2p_epi launch failed";
+      return false;
+    }
+    return true;
+  }
+  cl_kernel km = rt_->mm_packed_kernel();
+  clSetKernelArg(km, 0, sizeof(arena_), &arena_);
+  for (int pt = 0; pt < kNIoPorts; ++pt) {
+    cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+    clSetKernelArg(km, 1 + pt, sizeof(cl_mem), &b);
+  }
+  clSetKernelArg(km, 9, sizeof(uint32_t), &M);
+  clSetKernelArg(km, 10, sizeof(uint32_t), &N);
+  clSetKernelArg(km, 11, sizeof(uint32_t), &K);
+  clSetKernelArg(km, 12, sizeof(uint32_t), &dst);
+  clSetKernelArg(km, 13, sizeof(uint32_t), &a);
+  clSetKernelArg(km, 14, sizeof(bp), &bp);
+  // KC=1024 sweeps keep the packed-B panel L2-resident for large K; C is
+  // reloaded between sweeps (a tiny 6x32 tile per WG, cheap).
+  constexpr uint32_t kKC = 1024;
+  for (uint32_t kc = 0; kc < K; kc += kKC) {
+    const uint32_t kc1 = std::min(kc + kKC, K);
+    clSetKernelArg(km, 15, sizeof(uint32_t), &kc);
+    clSetKernelArg(km, 16, sizeof(uint32_t), &kc1);
+    if (clEnqueueNDRangeKernel(q, km, 2, nullptr, mg, ml, 0, nullptr,
+                               nullptr) != CL_SUCCESS) {
+      *err = "Execute: mm2p launch failed";
+      return false;
+    }
+  }
+  return true;
+}
+
+// §39 fp16-INPUT matmul. Pack A(MxK) and B(KxN) from f32 (arena/port) into fp16
+// device scratch with a padded leading dim, then run mm_tc_fp16p (reads fp16 =>
+// half the global staging bytes vs the f32-arena mm_tc_fp16, ~107 vs ~85 TF/s
+// @4096). Padding lda/ldb to (dim+8) breaks the power-of-2 (K=2048) cache-set
+// aliasing that dips the f32-arena tile. No drain: pack -> tile -> caller's next
+// op serialize on the in-order queue; the shared scratch is safe because
+// pack_{i+1} is ordered after tile_i (which fully consumes it). Only the pad
+// column of the LAST row is unwritten, and the tile never reads it.
+bool LoadedProgram::EnqueueFp16Matmul(cl_command_queue q, uint32_t M,
+                                      uint32_t N, uint32_t K, uint32_t dst,
+                                      uint32_t ah, uint32_t bh,
+                                      std::string* err) {
+  // Pad the fp16 leading dim (contiguous axis) to break power-of-2 aliasing
+  // while keeping 16-byte row alignment (8 halves = 16 B) for the vectorized
+  // ushort8 staging loads. +8 is enough to move consecutive rows off the same
+  // L2 set; a no-op perf-wise for non-power-of-2 dims.
+  auto padld = [](uint32_t d) -> uint32_t {
+    return ((d & (d - 1u)) == 0u && d >= 512u) ? d + 8u : d;
+  };
+  const uint32_t lda = padld(K), ldb = padld(N);
+  const size_t abytes = (size_t)M * lda * sizeof(cl_ushort);
+  const size_t bbytes = (size_t)K * ldb * sizeof(cl_ushort);
+  if (mm_f16a_bytes_ < abytes) {
+    if (mm_f16a_) rt_->PoolFree(mm_f16a_, mm_f16a_bytes_);
+    mm_f16a_ = rt_->PoolAlloc(abytes, err);
+    if (!mm_f16a_) return false;
+    mm_f16a_bytes_ = abytes;
+  }
+  if (mm_f16b_bytes_ < bbytes) {
+    if (mm_f16b_) rt_->PoolFree(mm_f16b_, mm_f16b_bytes_);
+    mm_f16b_ = rt_->PoolAlloc(bbytes, err);
+    if (!mm_f16b_) return false;
+    mm_f16b_bytes_ = bbytes;
+  }
+  // pack_f16(arena, io0..io7, dst, srch, rows, cols, ld)
+  cl_kernel kp = rt_->pack_f16_kernel();
+  auto enqueue_pack = [&](cl_mem dstbuf, uint32_t srch, uint32_t rows,
+                          uint32_t cols, uint32_t ld) -> bool {
+    clSetKernelArg(kp, 0, sizeof(arena_), &arena_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(kp, 1 + pt, sizeof(cl_mem), &b);
+    }
+    clSetKernelArg(kp, 9, sizeof(cl_mem), &dstbuf);
+    clSetKernelArg(kp, 10, sizeof(uint32_t), &srch);
+    clSetKernelArg(kp, 11, sizeof(uint32_t), &rows);
+    clSetKernelArg(kp, 12, sizeof(uint32_t), &cols);
+    clSetKernelArg(kp, 13, sizeof(uint32_t), &ld);
+    // 2D grid: dim0 = columns (contiguous, coalesced), dim1 = rows. Cap each
+    // extent so residency stays bounded; the kernel grid-strides the remainder.
+    size_t gcols = ((cols + 255u) / 256u) * 256u;
+    if (gcols > 4096) gcols = 4096;
+    size_t grows = rows < 512u ? rows : 512u;
+    size_t g2[2] = {gcols, grows};
+    size_t l2[2] = {256, 1};
+    return clEnqueueNDRangeKernel(q, kp, 2, nullptr, g2, l2, 0, nullptr,
+                                  nullptr) == CL_SUCCESS;
+  };
+  static const bool nopack_dbg =
+      std::getenv("PJRT_OCL_MM_FP16_NOPACK_DBG") != nullptr;
+  if (!nopack_dbg &&
+      !enqueue_pack(mm_f16a_, ah, M, K, lda)) {
+    *err = "Execute: pack_f16(A) launch failed";
+    return false;
+  }
+  if (!nopack_dbg && !enqueue_pack(mm_f16b_, bh, K, N, ldb)) {
+    *err = "Execute: pack_f16(B) launch failed";
+    return false;
+  }
+  // mm_tc_fp16p(arena, io0..io7, Af, Bf, M, N, K, dsth, lda, ldb)
+  cl_kernel km = rt_->mm_tc_fp16p_kernel();
+  clSetKernelArg(km, 0, sizeof(arena_), &arena_);
+  for (int pt = 0; pt < kNIoPorts; ++pt) {
+    cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+    clSetKernelArg(km, 1 + pt, sizeof(cl_mem), &b);
+  }
+  clSetKernelArg(km, 9, sizeof(cl_mem), &mm_f16a_);
+  clSetKernelArg(km, 10, sizeof(cl_mem), &mm_f16b_);
+  clSetKernelArg(km, 11, sizeof(uint32_t), &M);
+  clSetKernelArg(km, 12, sizeof(uint32_t), &N);
+  clSetKernelArg(km, 13, sizeof(uint32_t), &K);
+  clSetKernelArg(km, 14, sizeof(uint32_t), &dst);
+  clSetKernelArg(km, 15, sizeof(uint32_t), &lda);
+  clSetKernelArg(km, 16, sizeof(uint32_t), &ldb);
+  constexpr uint32_t kTM = 256, kTN = 128;   // must match MHF_TM/MHF_TN
+  const size_t tiles_m = (M + kTM - 1) / kTM;
+  const size_t tiles_n = (N + kTN - 1) / kTN;
+  size_t lsz = 1024, gsz = tiles_m * tiles_n * lsz;  // one WG per 256x128 tile
+  if (clEnqueueNDRangeKernel(q, km, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                             nullptr) != CL_SUCCESS) {
+    *err = "Execute: mm_tc_fp16p launch failed";
+    return false;
+  }
+  return true;
+}
+
 // mm2(arena, io0..io7, M, N, K, dst, a, b). No barrier buffer / lanes / tasks.
 // N==1 routes to gemv(arena, io0..io7, M, K, dst, a, b) — one row per WI.
 // Geometry per engine: GPU mm2 = one 256-WI workgroup per 128x64 output tile;
 // CPU mm2 (VMO_CPU_TILES body) = one single-WI workgroup per 4-row block.
 bool LoadedProgram::LaunchMatmul(cl_command_queue q, std::string* err) {
   const bool is_gemv = mm_N_ == 1;
-  cl_kernel k = is_gemv ? rt_->gemv_kernel() : rt_->mm_kernel();
+  // §36: on GPU/TF32 prefer the standalone WMMA SGEMM (mm_tc, ~47/57 TF/s) over
+  // the scalar mm2 SGEMM (~21/24 TF/s). Same (M,N,K,dst,a,b) ABI; grid-strided.
+  const bool use_tc = !is_gemv && rt_->is_gpu() && rt_->mm_tc_kernel();
+  // §38: PJRT_OCL_MM_FP16=1 prefers the fp16 WMMA tile (~72/92 TF/s) over the
+  // tf32 mm_tc (~47/57). Different tile geometry: 256x128 W8x4 = 1024 threads.
+  const bool use_fp16 = use_tc && rt_->mm_fp16();
+  // §39: the packed fp16-INPUT path (pack A/B to fp16 scratch, then read fp16 =
+  // half the staging bytes) supersedes the f32-arena fp16 tile when enabled.
+  if (use_fp16 && rt_->mm_fp16_pack())
+    return EnqueueFp16Matmul(q, mm_M_, mm_N_, mm_K_, mm_dst_, mm_a_, mm_b_, err);
+  cl_kernel k = is_gemv ? rt_->gemv_kernel()
+                        : (use_fp16 ? rt_->mm_tc_fp16_kernel()
+                                    : (use_tc ? rt_->mm_tc_kernel()
+                                              : rt_->mm_kernel()));
   size_t gsz, lsz;
   if (is_gemv) {
     lsz = 256;
     gsz = (mm_M_ + lsz - 1) / lsz * lsz;
+  } else if (use_fp16) {
+    constexpr uint32_t kTM = 256, kTN = 128;   // must match MHP_TM/MHP_TN
+    const size_t tiles_m = (mm_M_ + kTM - 1) / kTM;
+    const size_t tiles_n = (mm_N_ + kTN - 1) / kTN;
+    lsz = 1024;                                // MHP_NTHREADS (W8x4)
+    gsz = tiles_m * tiles_n * lsz;             // one 1024-thread WG per 256x128 tile
+  } else if (use_tc) {
+    constexpr uint32_t kTM = 128, kTN = 128;   // must match MMTC_TM/MMTC_TN
+    const size_t tiles_m = (mm_M_ + kTM - 1) / kTM;
+    const size_t tiles_n = (mm_N_ + kTN - 1) / kTN;
+    lsz = 256;
+    gsz = tiles_m * tiles_n * lsz;             // one 256-thread WG per 128x128 tile
   } else if (!rt_->is_gpu() && mm_bp_) {
-    // Packed path: pack B panels, then KC sweeps of the 6x16 kernel, all
-    // enqueued back-to-back on the in-order queue (caller drains).
-    cl_kernel kp = rt_->mm_pack_kernel();
-    clSetKernelArg(kp, 0, sizeof(arena_), &arena_);
-    for (int pt = 0; pt < kNIoPorts; ++pt) {
-      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
-      clSetKernelArg(kp, 1 + pt, sizeof(cl_mem), &b);
-    }
-    clSetKernelArg(kp, 9, sizeof(uint32_t), &mm_N_);
-    clSetKernelArg(kp, 10, sizeof(uint32_t), &mm_K_);
-    clSetKernelArg(kp, 11, sizeof(uint32_t), &mm_b_);
-    clSetKernelArg(kp, 12, sizeof(mm_bp_), &mm_bp_);
-    size_t pg = size_t{mm_N_ / 16} * mm_K_;
-    if (clEnqueueNDRangeKernel(q, kp, 1, nullptr, &pg, nullptr, 0, nullptr,
-                               nullptr) != CL_SUCCESS) {
-      *err = "Execute: mm2_pack launch failed";
-      return false;
-    }
-    cl_kernel km = rt_->mm_packed_kernel();
-    clSetKernelArg(km, 0, sizeof(arena_), &arena_);
-    for (int pt = 0; pt < kNIoPorts; ++pt) {
-      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
-      clSetKernelArg(km, 1 + pt, sizeof(cl_mem), &b);
-    }
-    clSetKernelArg(km, 9, sizeof(uint32_t), &mm_M_);
-    clSetKernelArg(km, 10, sizeof(uint32_t), &mm_N_);
-    clSetKernelArg(km, 11, sizeof(uint32_t), &mm_K_);
-    clSetKernelArg(km, 12, sizeof(uint32_t), &mm_dst_);
-    clSetKernelArg(km, 13, sizeof(uint32_t), &mm_a_);
-    clSetKernelArg(km, 14, sizeof(mm_bp_), &mm_bp_);
-    constexpr uint32_t kKC = 512;
-    size_t mg = (mm_M_ + 5) / 6, ml = 1;
-    for (uint32_t kc = 0; kc < mm_K_; kc += kKC) {
-      const uint32_t kc1 = std::min(kc + kKC, mm_K_);
-      clSetKernelArg(km, 15, sizeof(uint32_t), &kc);
-      clSetKernelArg(km, 16, sizeof(uint32_t), &kc1);
-      if (clEnqueueNDRangeKernel(q, km, 1, nullptr, &mg, &ml, 0, nullptr,
-                                 nullptr) != CL_SUCCESS) {
-        *err = "Execute: mm2p launch failed";
-        return false;
-      }
-    }
-    return true;
+    return EnqueuePackedMM(q, mm_M_, mm_N_, mm_K_, mm_dst_, mm_a_, mm_b_,
+                           mm_bp_, 0, 0, err);
   } else if (!rt_->is_gpu()) {
     lsz = 1;
     gsz = (mm_M_ + 3) / 4;
@@ -1053,6 +1483,12 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
   uint32_t ring = 0;    // first slot of the currently staged group
   uint32_t staged = 0;  // phases staged since the last flush
 
+  // Perf instrumentation (PJRT_OCL_PHASE_STATS): count phases, kernel enqueues,
+  // seg_tab writes and drains (clFinish) per Execute — the host-dispatch cost
+  // model. Printed to stderr at the end of the walk.
+  static const bool phase_stats = std::getenv("PJRT_OCL_PHASE_STATS") != nullptr;
+  uint64_t n_kenq = 0, n_write = 0, n_drain = 0;
+
   struct Frame { uint32_t pc, end, widx; int phase; };
   std::vector<std::vector<Frame>> st(n);
   for (uint32_t L = 0; L < n; ++L)
@@ -1063,7 +1499,8 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     return p.entries[p.lane_tab[L].off + pc];
   };
 
-  enum Ev { EV_BARRIER, EV_COND_DONE, EV_BODY_DONE, EV_FOR_DONE, EV_DONE };
+  enum Ev { EV_BARRIER, EV_COND_DONE, EV_BODY_DONE, EV_FOR_DONE, EV_IF,
+            EV_DONE };
   // Advance lane L to its next barrier/transition, collecting its contiguous
   // tile-entry run into seg[2L..2L+1]. Direct mirror of vm2's interpreter.
   auto advance = [&](uint32_t L) -> Ev {
@@ -1085,6 +1522,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       }
       const VmEntry& en = lane_entry(L, f.pc);
       if (en.task == kEntBarrier) return EV_BARRIER;
+      if (en.task == kEntIf) return EV_IF;  // resolve cond at the driver level
       if (en.task == kEntWhile) {
         if (static_cast<int>(st[L].size()) >= MAX_DEPTH) return EV_DONE;
         st[L].push_back({en.tile_lo, en.tile_lo + en.tile_hi, f.pc, 0});
@@ -1176,8 +1614,10 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         *err = "host-dispatch: seg_tab upload failed";
         return false;
       }
+      n_write++;
       cl_kernel k = rt_->vm_seg_kernel();
-      size_t lsz = 256, gsz = size_t{n} * lsz;
+      size_t lsz = seg_lsz_, gsz = size_t{n} * lsz;
+      n_kenq += staged;
       for (uint32_t i = 0; i < staged; ++i) {
         const cl_uint seg_base = (ring + i) * n;  // uint2 index of the slot
         clSetKernelArg(k, 5 + kNIoPorts, sizeof(seg_base), &seg_base);
@@ -1195,9 +1635,114 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         *err = "host-dispatch: clFinish (drain) failed";
         return false;
       }
+      n_drain++;
       ring = 0;
     }
     return true;
+  };
+
+  // §36 HYBRID (PJRT_OCL_MM_HYBRID=1): route a phase that is exactly one big
+  // TF32 matmul's tiles to the standalone WMMA kernel (mm_tc, ~47/57 TF/s) while
+  // the VM keeps every other phase. The pending staged phases are flushed
+  // (enqueued, NOT drained) first so the in-order queue serializes mm_tc after
+  // them and the following phases after mm_tc — no clFinish, launch cost is just
+  // the enqueue. Only when mm_tc built (NV_PTX / GPU). Returns task idx or -1.
+  static const bool mm_hybrid = [] {
+    const char* e = std::getenv("PJRT_OCL_MM_HYBRID");
+    return e && e[0] && e[0] != '0';
+  }();
+  const bool hybrid_ok = mm_hybrid && rt_->is_gpu() && rt_->mm_tc_kernel();
+  // CPU analog: route pure-matmul phases to the packed mm2p (default ON, sized
+  // scratch hy_bp_ allocated at load). Same peel-and-flush structure as mm_tc.
+  const bool hybrid_cpu = !rt_->is_gpu() && rt_->mm_pack_kernel() && hy_bp_;
+  // Collect the phase's distinct big-TF32-matmul task ids into `mm_tasks`, but
+  // ONLY when EVERY task in the phase is such a matmul. The scheduler packs the
+  // independent projection matmuls (Q/K/V/out) into one barrier phase, so a
+  // routable phase carries several matmul tasks; a phase mixing a matmul with
+  // any non-matmul op stays on the VM (return false). Threshold keeps small
+  // matmuls (attention per-head, base dims) on the VM where they're faster.
+  std::vector<uint32_t> mm_tasks;
+  auto routable_phase = [&]() -> bool {
+    mm_tasks.clear();
+    for (uint32_t L = 0; L < n; ++L)
+      for (uint32_t e = seg[2 * L]; e < seg[2 * L] + seg[2 * L + 1]; ++e) {
+        if (p.entries[e].task == kEntNop) continue;
+        const uint32_t t = p.entries[e].task;
+        const VmTask& tk = p.tasks[t];
+        // Size gate: keep small matmuls (attention per-head, base dims) on the
+        // VM where they're faster. The fp16 tile is a 256x128 1024-thread WG —
+        // its per-launch/occupancy floor is far higher than the tf32 128x128
+        // 256-thread tile, so on SMALL matmuls (base: M=512, vol<=5.4e8) routing
+        // to fp16 REGRESSES (measured 5.4->6.1 ms base). fp16 only pays off on
+        // compute-bound large matmuls (vol>=~1e9): use a stricter volume gate
+        // for fp16 so base stays in the tf32 megakernel (no regression) while
+        // large (vol>=2e9) still routes. tf32 hybrid keeps its dim threshold.
+        const uint64_t vol =
+            (uint64_t)tk.p0 * (uint64_t)tk.p1 * (uint64_t)tk.p2;
+        const bool big_enough =
+            rt_->mm_fp16() ? (vol >= (1ull << 30))
+                           : (tk.p0 >= 512 && tk.p1 >= 512 && tk.p2 >= 256);
+        const bool ok = (tk.tile_op & 0xFFu) == kTopMma &&
+                        ((tk.tile_op >> 8) & 0xFFu) == kDtF32 && tk.p3 <= 1 &&
+                        tk.p4 == 0 && tk.p5 == 0 && tk.p6 == 0 && big_enough;
+        if (!ok) { mm_tasks.clear(); return false; }  // any non-matmul -> VM
+        if (std::find(mm_tasks.begin(), mm_tasks.end(), t) == mm_tasks.end())
+          mm_tasks.push_back(t);
+      }
+    return !mm_tasks.empty();
+  };
+  // §38: prefer the fp16 WMMA tile (256x128 W8x4, 1024 threads) when opted in.
+  const bool hy_fp16 = rt_->mm_fp16();
+  auto enqueue_mm_tc = [&](const VmTask& tk) -> bool {
+    cl_kernel km = hy_fp16 ? rt_->mm_tc_fp16_kernel() : rt_->mm_tc_kernel();
+    clSetKernelArg(km, 0, sizeof(arena_), &arena_);
+    for (int pt = 0; pt < kNIoPorts; ++pt) {
+      cl_mem b = io_bufs_[pt] ? io_bufs_[pt] : rt_->dummy_buf();
+      clSetKernelArg(km, 1 + pt, sizeof(cl_mem), &b);
+    }
+    const uint32_t M = tk.p0, N = tk.p1, Kd = tk.p2;
+    clSetKernelArg(km, 9, sizeof(uint32_t), &M);
+    clSetKernelArg(km, 10, sizeof(uint32_t), &N);
+    clSetKernelArg(km, 11, sizeof(uint32_t), &Kd);
+    clSetKernelArg(km, 12, sizeof(uint32_t), &tk.dst);
+    clSetKernelArg(km, 13, sizeof(uint32_t), &tk.a);
+    clSetKernelArg(km, 14, sizeof(uint32_t), &tk.b);
+    const uint32_t tm = hy_fp16 ? 256 : 128, tn = 128;
+    const size_t tiles_m = (M + tm - 1) / tm, tiles_n = (N + tn - 1) / tn;
+    size_t lsz = hy_fp16 ? 1024 : 256, gsz = tiles_m * tiles_n * lsz;
+    if (clEnqueueNDRangeKernel(q, km, 1, nullptr, &gsz, &lsz, 0, nullptr,
+                               nullptr) != CL_SUCCESS) {
+      *err = "host-dispatch: mm_tc (hybrid) launch failed";
+      return false;
+    }
+    return true;
+  };
+
+  // CPU hybrid: a phase is routable iff EVERY task in it is a plain f32 matmul
+  // the packed mm2p can execute (no batch/view/epilogue, N%16==0). Fills
+  // mm_tasks with the distinct task ids. Predicate must match the load-time
+  // hy_bp_ sizing scan.
+  auto routable_phase_cpu = [&]() -> bool {
+    mm_tasks.clear();
+    for (uint32_t L = 0; L < n; ++L)
+      for (uint32_t e = seg[2 * L]; e < seg[2 * L] + seg[2 * L + 1]; ++e) {
+        if (p.entries[e].task == kEntNop) continue;
+        const uint32_t t = p.entries[e].task;
+        const VmTask& tk = p.tasks[t];
+        const bool ok = (tk.tile_op & 0xFFu) == kTopMma &&
+                        ((tk.tile_op >> 8) & 0xFFu) == kDtF32 && tk.p3 <= 1 &&
+                        tk.p4 == 0 && tk.p5 == 0 &&
+                        tk.p1 % 16u == 0 && tk.p0 >= 6 && tk.p1 >= 16 &&
+                        tk.p2 >= 16;
+        if (!ok) { mm_tasks.clear(); return false; }
+        if (std::find(mm_tasks.begin(), mm_tasks.end(), t) == mm_tasks.end())
+          mm_tasks.push_back(t);
+      }
+    return !mm_tasks.empty();
+  };
+  auto enqueue_mm_cpu = [&](const VmTask& tk) -> bool {
+    return EnqueuePackedMM(q, tk.p0, tk.p1, tk.p2, tk.dst, tk.a, tk.b, hy_bp_,
+                           tk.p6, tk.p7, err);
   };
 
   for (long guard = 0;; ++guard) {
@@ -1216,7 +1761,26 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       }
       if (seg[2 * L + 1] > 0) any = true;
     }
-    if (any) {
+    const bool route = any && hybrid_ok && !tracing && routable_phase();
+    const bool route_cpu =
+        !route && any && hybrid_cpu && !tracing && routable_phase_cpu();
+    if ((route || route_cpu) && std::getenv("PJRT_OCL_MM_HYBRID_DBG"))
+      for (uint32_t t : mm_tasks)
+        std::fprintf(stderr, "[hybrid] ph%u -> %s %ux%ux%u\n", phase_i,
+                     route ? "mm_tc" : "mm2p", p.tasks[t].p0, p.tasks[t].p1,
+                     p.tasks[t].p2);
+    if (route || route_cpu) {
+      // Flush pending VM phases (enqueue only, no drain), then run each of this
+      // phase's matmuls on the dedicated kernel — the in-order queue keeps them
+      // after the flushed phases and before the next phase; no clFinish.
+      if (!flush_group(false)) { release_tevs(); return false; }
+      for (uint32_t t : mm_tasks)
+        if (!(route ? enqueue_mm_tc(tasks_patched_[t])
+                    : enqueue_mm_cpu(tasks_patched_[t]))) {
+          release_tevs();
+          return false;
+        }
+    } else if (any) {
       if (ring + staged == kSegSlots && !flush_group(true)) {  // ring wrap
         release_tevs();
         return false;
@@ -1255,6 +1819,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
         release_tevs();
         return false;
       }
+      n_drain++;  // the blocking cond read is itself a drain
       ring = 0;  // the blocking read drained the in-order queue: ring is free
       for (uint32_t L = 0; L < n; ++L) {
         Frame& f = st[L].back();
@@ -1267,6 +1832,43 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
           st[L].pop_back();
           st[L].back().pc++;
         }
+      }
+    } else if (ev == EV_IF) {
+      // N-way case / if arm. Read the shared branch flag (all lanes' IF entries
+      // name the same buffer; the flag producer ran in a prior phase), then
+      // push the selected branch's frame per lane. Empty selected branch: skip
+      // the IF. The branch pops back to the parent (advance's kEntIf case) with
+      // no closing barrier — the parent's level-separator barrier syncs it.
+      const VmEntry& w0 = lane_entry(0, st[0].back().pc);
+      uint32_t cbits = 0;
+      const uint64_t off = p.buffers[w0.signal_flag].arena_byte_offset;
+      if (!flush_group(false)) {  // enqueue pending phases before the read
+        release_tevs();
+        return false;
+      }
+      if (clEnqueueReadBuffer(q, arena_, CL_TRUE, off, 4, &cbits, 0, nullptr,
+                              nullptr) != CL_SUCCESS) {
+        *err = "host-dispatch: IF cond read failed";
+        release_tevs();
+        return false;
+      }
+      n_drain++;  // the blocking read is itself a drain
+      ring = 0;
+      for (uint32_t L = 0; L < n; ++L) {
+        Frame& f = st[L].back();
+        const VmEntry& w = lane_entry(L, f.pc);  // the IF entry
+        const uint32_t start = cbits != 0 ? w.tile_lo : w.wait_flag;
+        const uint32_t length = cbits != 0 ? w.tile_hi : w.wait_count;
+        if (length == 0) {  // empty selected branch: step past the IF
+          f.pc++;
+          continue;
+        }
+        if (static_cast<int>(st[L].size()) >= MAX_DEPTH) {
+          *err = "host-dispatch: IF nesting exceeds MAX_DEPTH";
+          release_tevs();
+          return false;
+        }
+        st[L].push_back({start, start + length, f.pc, 2});
       }
     } else if (ev == EV_FOR_DONE) {
       // Fixed-trip iteration done: decrement and loop or pop. NO cond read,
@@ -1331,6 +1933,12 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     }
     release_tevs();
   }
+  if (phase_stats)
+    std::fprintf(stderr,
+                 "[phase_stats] phases=%u kernel_enq=%llu seg_writes=%llu "
+                 "drains=%llu n_lanes=%u\n",
+                 phase_i, (unsigned long long)n_kenq,
+                 (unsigned long long)n_write, (unsigned long long)n_drain, n);
   return true;
 }
 
@@ -1390,9 +1998,9 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
   if (prof) clFinish(q);
   auto t1 = clk();
 
-  if (!(mm_ok_               ? LaunchMatmul(q, err)
-        : rt_->host_dispatch() ? LaunchHostDispatch(q, err)
-                             : LaunchKernel(q, err))) {
+  if (!(mm_ok_          ? LaunchMatmul(q, err)
+        : host_dispatch_ ? LaunchHostDispatch(q, err)
+                         : LaunchKernel(q, err))) {
     for (cl_mem m : *outputs) if (m) clReleaseMemObject(m);
     outputs->clear();
     return false;
@@ -1422,6 +2030,51 @@ bool LoadedProgram::ExecuteDevice(const std::vector<cl_mem>& inputs,
     auto t3 = clk();
     fprintf(stderr, "PROFILE in_copy=%.4f kernel=%.4f out_copy=%.4f total=%.4f ms\n",
             msec(t0, t1), msec(t1, t2), msec(t2, t3), msec(t0, t3));
+  }
+  // §29 per-phase timestamp dump (mega engine only). Reads back the per-lane
+  // %globaltimer arrivals and prints, per barrier phase b: wall time (release[b]
+  // - release[b-1], where release == last-lane arrival) and idle-at-barrier skew
+  // (max - min arrival). CSV to stderr for post-processing.
+  if (std::getenv("PJRT_OCL_PHASE_TS") && !host_dispatch_ && !mm_ok_) {
+    const uint32_t nl = prog_.n_lanes;
+    std::vector<uint32_t> ts(size_t{4096} * nl);
+    if (clEnqueueReadBuffer(q, stats_buf_, CL_TRUE, 0, ts.size() * 4, ts.data(),
+                            0, nullptr, nullptr) == CL_SUCCESS) {
+      uint64_t prev_release = 0, sum_wall = 0, sum_skew = 0, sum_idle = 0;
+      uint32_t nbar = 0;
+      for (uint32_t b = 0; b < 4096; ++b) {
+        uint32_t amin = 0xFFFFFFFFu, amax = 0;
+        uint64_t asum = 0;
+        uint32_t nz = 0;
+        for (uint32_t l = 0; l < nl; ++l) {
+          uint32_t v = ts[size_t{b} * nl + l];
+          if (v) { amin = std::min(amin, v); amax = std::max(amax, v);
+                   asum += v; ++nz; }
+        }
+        if (nz == 0) break;
+        nbar = b + 1;
+        uint64_t wall = (b == 0) ? 0 : (uint64_t)(amax - prev_release);
+        uint64_t skew = (uint64_t)(amax - amin);
+        // Average per-lane idle at this barrier = release - mean_arrival. Sums
+        // lane-idle over ALL lanes (not just max-min), so idle/wall = the mean
+        // fraction of the phase a lane spends waiting = 1 - lane utilization.
+        double mean_arr = (double)asum / nz;
+        uint64_t idle = (b == 0) ? 0 : (uint64_t)((double)amax - mean_arr);
+        prev_release = amax;
+        sum_wall += wall;
+        sum_skew += skew;
+        sum_idle += idle;
+        fprintf(stderr,
+                "PHASETS b=%u nz=%u wall_ns=%llu skew_ns=%llu idle_ns=%llu\n", b,
+                nz, (unsigned long long)wall, (unsigned long long)skew,
+                (unsigned long long)idle);
+      }
+      fprintf(stderr,
+              "PHASETS_SUMMARY nbar=%u sum_wall_us=%.2f sum_skew_us=%.2f "
+              "sum_idle_us=%.2f mean_lane_util=%.3f\n",
+              nbar, sum_wall / 1000.0, sum_skew / 1000.0, sum_idle / 1000.0,
+              sum_wall ? 1.0 - (double)sum_idle / sum_wall : 0.0);
+    }
   }
   return true;
 }
@@ -1504,6 +2157,7 @@ constexpr uint32_t kEwSubMul = 1, kEwSubFill = 18;
 // then `tiles` tiles of the measured op.
 class CalBuilder {
  public:
+  explicit CalBuilder(uint32_t ew_tile) : ew_tile_(ew_tile) {}
   uint32_t Buf(uint64_t elems) {
     prog_.buffers.push_back({arena_, elems * 4, kDtF32});
     arena_ += (elems * 4 + 63) & ~uint64_t{63};
@@ -1512,7 +2166,7 @@ class CalBuilder {
   void Fill(uint32_t buf, uint64_t elems) {
     const uint32_t one = 0x3f800000u;  // 1.0f
     Op({kTopEw, buf, 0, 0, kEwSubFill, static_cast<uint32_t>(elems), one, 0},
-       static_cast<uint32_t>((elems + kEwTile - 1) / kEwTile));
+       static_cast<uint32_t>((elems + ew_tile_ - 1) / ew_tile_));
   }
   void Op(VmTask t, uint32_t tiles) {
     prog_.tasks.push_back(t);
@@ -1531,18 +2185,20 @@ class CalBuilder {
     prog_.entries = entries_;
     return std::move(prog_);
   }
-  static constexpr uint32_t kEwTile = 16384;  // scheduler TILE_SIZE
+  uint32_t ew_tile() const { return ew_tile_; }  // scheduler TILE_SIZE
   std::vector<int32_t>* aux() { return &prog_.aux; }
 
  private:
   VmProgram prog_;
   uint64_t arena_ = 0;
   std::vector<VmEntry> entries_;
+  uint32_t ew_tile_;
 };
 
-VmProgram BuildCalProgram(uint32_t family, uint32_t tiles) {
-  CalBuilder b;
-  const uint64_t kEw = CalBuilder::kEwTile;
+VmProgram BuildCalProgram(uint32_t family, uint32_t tiles, uint32_t ew_tile,
+                          uint32_t mma_edge) {
+  CalBuilder b(ew_tile);
+  const uint64_t kEw = ew_tile;
   switch (family) {
     case kTopEw: {
       const uint64_t n = tiles * kEw;
@@ -1554,8 +2210,11 @@ VmProgram BuildCalProgram(uint32_t family, uint32_t tiles) {
       break;
     }
     case kTopMma: {
-      // 64x64 output tiles (kernel MMA_TM/TN): M = 64*tiles, N = 64, K = 256.
-      const uint32_t M = 64 * tiles, N = 64, K = 256;
+      // One MMA output tile per `tiles` (kernel MMA_TM/TN == mma_edge): M =
+      // mma_edge*tiles, N = mma_edge, K = 256. Must track the kernel tile edge
+      // (64, or 128 under -DVMO_MEGA_BIGTILE) so the schedule's tile count
+      // matches the kernel's tile->(tr,tc) mapping and stays in bounds.
+      const uint32_t M = mma_edge * tiles, N = mma_edge, K = 256;
       uint32_t a = b.Buf(uint64_t{M} * K), c = b.Buf(uint64_t{K} * N),
                d = b.Buf(uint64_t{M} * N);
       b.Fill(a, uint64_t{M} * K);
@@ -1592,7 +2251,8 @@ VmProgram BuildCalProgram(uint32_t family, uint32_t tiles) {
 double TimeCalProgram(OclRuntime* rt, uint32_t family, uint32_t tiles,
                       std::string* err) {
   std::unique_ptr<LoadedProgram> lp =
-      LoadedProgram::Load(rt, BuildCalProgram(family, tiles), err);
+      LoadedProgram::Load(rt, BuildCalProgram(family, tiles, rt->ew_ts(),
+                                              rt->mma_t()), err);
   if (!lp) return -1.0;
   std::vector<std::vector<uint8_t>> outs;
   if (!lp->Execute({}, &outs, err)) return -1.0;  // warmup
@@ -1632,7 +2292,8 @@ void OclRuntime::CalibrateCosts() {
   // go stale when the kernels (or their device-keyed variants) change.
   const std::string key =
       info_.platform_name + "|" + info_.device_name + "|" +
-      info_.driver_version + "|" + info_.build_opts;
+      info_.driver_version + "|" + info_.build_opts + "|mma" +
+      std::to_string(mma_t_);
   uint64_t hash = 1469598103934665603ull;
   for (unsigned char c : key) hash = (hash ^ c) * 1099511628211ull;
   for (const char* c = kVmClSource; *c; ++c)

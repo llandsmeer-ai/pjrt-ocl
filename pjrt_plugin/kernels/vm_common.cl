@@ -22,7 +22,15 @@
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #endif
 
+/* EW tile size (elements). Overridden per device via -DEW_TS at program build
+ * (runtime.cc chooses it; the python scheduler reads the same value from
+ * PJRT_OCL_EW_TS so host tiling and kernel tile->range mapping agree). GPUs
+ * use a smaller tile: a 16K tile is one workgroup's serial latency chain, so
+ * ops < ~lanes*EW_TS elements leave most lanes idle and each lane
+ * latency-bound (measured flat 15 us/op for any N in 16K..2M on Blackwell). */
+#ifndef EW_TS
 #define EW_TS 16384u
+#endif
 
 /* Buffer addressing. A buffer's 32-bit `base` is EITHER an arena byte offset
  * (intermediates, consts) OR — with bit 31 set — an I/O PORT: the low bits index
@@ -66,7 +74,47 @@ static ushort vmo_f32_to_bf16(float f)
 enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
        TOP_RED_COMB = 4, TOP_IOTA_DIM = 5, TOP_SCATTER = 6,
        TOP_DYN_GATHER = 7, TOP_DYN_SCATTER = 8, TOP_RED_WINDOW = 9,
-       TOP_RED_SEG = 10 };
+       TOP_RED_SEG = 10,
+       /* Fused segmented norms (§19): one segment per tile, whole workgroup
+        * collaborates in local memory (one global read + one write).
+        * SOFTMAX (p0=n_out, p1=seg); LAYERNORM core (p0=n_out, p1=seg,
+        * p2=as_float eps). Kernels: vmo_softmax_seg / vmo_layernorm_seg. */
+       TOP_SOFTMAX_SEG = 11, TOP_LAYERNORM_SEG = 12,
+       /* §27/§28 register-resident fused map-region: a run of pure-map EW
+        * micro-ops interpreted over per-thread float4 slots (one global load per
+        * input, one store), collapsing a K-op EW chain into one barrier-free
+        * phase. p0=aux descriptor word-offset, p1=n. Kernel: vmo_map_region
+        * (ops/region.cl); recognizer: lowering _fuse_region. */
+       TOP_MAP_REGION = 13,
+       /* §34 fused flash-attention: one workgroup per (head,query) streams the
+        * KV cache with online softmax — QKᵀ→scale→softmax→AV in ONE phase, no
+        * materialized score matrix. a=Q b=K p0=V dst=out; p1=H p2=T; p3=aux
+        * descriptor [H,T,C,hd,scale,causal,qv,kv,vv]. Kernel: vmo_flash_attn
+        * (ops/attention.cl); recognizer: lowering _fuse_attention. */
+       TOP_FLASH_ATTN = 14,
+       /* Partial-axis reduce over a contiguous interior/prefix axis block.
+        * Input viewed (outer, red, inner); out[o*inner+i] = reduce_r
+        * in[(o*red+r)*inner+i]. p0=n_out (outer*inner), p1=red, p2=inner (stride),
+        * p3=kind. EW-style output tiling (EW_TS outputs per tile, grid-stride,
+        * no workgroup barriers). Kernel: vmo_redstrided_tile. */
+       TOP_RED_STRIDED = 15,
+       /* §38 general data-dependent gather (stablehlo.gather): each output
+        * element reads its operand base offset from a runtime start_indices
+        * buffer. Kernel: vmo_gather_index_tile (ops/gather.cl). (16: 15=RED_STRIDED) */
+       TOP_GATHER_INDEX = 16,
+       /* §39 direct N-D convolution (NHWC input / HWIO kernel). Each output
+        * element serially accumulates over the kernel window and input channels:
+        * out[b,osp,oc] = sum_{win,ic} in[b, osp*stride+win*dil-pad, ic] * w[win,ic,oc].
+        * a=input b=weights p0=aux word-offset p1=n_out; EW-style output tiling.
+        * Kernel: vmo_conv_tile (ops/conv.cl); loader: ops/conv.py. */
+       TOP_CONV = 17,
+       /* §42 general data-dependent scatter (stablehlo.scatter): mirror of
+        * TOP_GATHER_INDEX. Iterate over UPDATE elements; each maps to an operand
+        * location via window coords + a runtime scatter_indices buffer, and its
+        * value is combined into the operand result (kind 0 set / 1 add / 2 max /
+        * 3 min; add/max/min via global atomics). Kernel: vmo_scatter_index_tile
+        * (ops/scatter.cl); loader: ops/scatter_index.py. (18: 17 = TOP_CONV) */
+       TOP_SCATTER_INDEX = 18 };
 enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,
        SUB_ABS, SUB_FLOOR, SUB_CEIL, SUB_SIGN, SUB_FILL, SUB_IOTA_FLAT,
@@ -85,7 +133,17 @@ enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        /* fused affine: d = a*s + t, s=as_float(p2), t=as_float(p3). Folds a
         * scalar-const scale/bias (and composed chains) into one in-place pass;
         * see python lowering _fold_scalar / _compose_affines. */
-       SUB_AFFINE };
+       SUB_AFFINE,
+       /* fused GELU tanh-approx unary (§19b/§24): computes the whole
+        * 0.5*x*(1+tanh(0.7978845608*(x+0.044715*x^3))) per element in registers,
+        * one global read + one write. Routed as a unary subop (vmo_ew_is_un()
+        * range-extended) so it rides the existing TILE_EW float4 fast path. */
+       SUB_GELU,
+       /* integer shifts (i32/u32 only; threefry RNG uses SHL|SHR_L). Appended at
+        * the tail so existing subop values are unchanged. SHR_L is logical
+        * (zero-fill, unsigned view); SHR_A is arithmetic (sign-fill). Dedicated
+        * dispatch in vmo_ew_tile_i32. */
+       SUB_SHL, SUB_SHR_L, SUB_SHR_A };
 
 #define ENT_NOP     0xFFFFFFFFu
 #define ENT_BARRIER 0xFFFFFFFEu
@@ -99,8 +157,43 @@ enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
 #define FLAG_NONE   0xFFFFFFFFu
 
 typedef struct {
-    uint tile_op, dst, a, b, p0, p1, p2, p3, p4, p5;
-} task_t;   /* p4/p5: MMA operand VIEW aux-offsets (+1; 0 = contiguous) */
+    uint tile_op, dst, a, b, p0, p1, p2, p3, p4, p5, p6, p7;
+} task_t;   /* p4/p5: MMA operand VIEW aux-offsets (+1; 0 = contiguous).
+             * p6/p7 (§33 R2c matmul epilogue): p6 = epilogue descriptor aux
+             * word-offset (+1; 0 = no epilogue); p7 = the epilogue's second-input
+             * buffer handle (residual/bias), loader-patched to a byte offset. */
+
+/* §33 R2c: shared straight-line map micro-op interpreter over a per-thread
+ * value. Used by BOTH ops/region.cl (OP_MAP_REGION, float4-vectorized) and
+ * ops/mma.cl (the matmul store-epilogue, scalar per accumulator element). The
+ * builtins MUST byte-match ops/ew.cl so a fused region/epilogue is numerically
+ * identical to the decomposed EW chain it replaces. `kind` is a SUB_* opcode
+ * (the pure-map ALU subset the recognizers emit). Defined here (concatenated
+ * first) so it precedes both callers in the single translation unit. */
+static float4 vmo_region_micro(const uint kind, const float4 x, const float4 y,
+                               const float s, const float t)
+{
+    switch (kind) {
+    case SUB_ADD:    return x + y;
+    case SUB_MUL:    return x * y;
+    case SUB_SUB:    return x - y;
+    case SUB_DIV:    return x / y;
+    case SUB_MAX:    return fmax(x, y);
+    case SUB_MIN:    return fmin(x, y);
+    case SUB_NEG:    return -x;
+    case SUB_EXP:    return exp(x);
+    case SUB_LOG:    return log(x);
+    case SUB_SQRT:   return sqrt(x);
+    case SUB_RSQRT:  return rsqrt(x);
+    case SUB_TANH:   return tanh(x);
+    case SUB_ABS:    return fabs(x);
+    case SUB_AFFINE: return mad(x, (float4)(s), (float4)(t));  /* x*s + t */
+    /* GELU tanh-approx — byte-identical to ops/ew.cl VMO_GELU_BODY / vmo_gelu4. */
+    case SUB_GELU:   return 0.5f * x * (1.0f + tanh(0.7978845608f *
+                            (x + 0.044715f * x * x * x)));
+    default:         return x;
+    }
+}
 
 typedef struct {
     uint task, tile_lo, tile_hi, wait_flag, wait_count, signal_flag,
@@ -160,6 +253,32 @@ typedef union { float f; int i; uint u; } slot_t;
 #define VMO_LOAD_PHASE(p) atomic_load_explicit( \
     (volatile __global atomic_uint *)(p), memory_order_relaxed, \
     memory_scope_device)
+#endif
+
+/* §29 investigation: per-phase device timestamps. Each lane (workgroup) records
+ * the GPU-global nanosecond clock (%globaltimer — one counter shared across all
+ * SMs, so arrival times ARE comparable across workgroups, unlike per-SM clock64)
+ * into stats[barrier_i*nlanes+lane] at every barrier arrival. Host reads it back
+ * (PJRT_OCL_PHASE_TS) → per-phase wall time (max-arrival delta) + idle-at-barrier
+ * skew (max-min arrival). Low 32 bits of ns: wraps at ~4.29 s, never within a
+ * phase. Only the VMO_NV_PTX build has globaltimer; portable build records 0. */
+#ifdef VMO_PHASE_TS
+#ifdef VMO_NV_PTX
+static inline uint vmo_now_ns(void) {
+    ulong t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return (uint)t;
+}
+#else
+static inline uint vmo_now_ns(void) { return 0u; }
+#endif
+#define VMO_TS_REC(stats, bi, lane, nl)                                        \
+    do {                                                                       \
+        if (get_local_id(0) == 0u && (bi) < 4096u)                             \
+            (stats)[(bi) * (nl) + (lane)] = vmo_now_ns();                       \
+    } while (0)
+#else
+#define VMO_TS_REC(stats, bi, lane, nl) do {} while (0)
 #endif
 
 static void vmo_barrier(volatile __global uint *bar, const uint ngroups)

@@ -140,6 +140,31 @@ OP_REDUCE_WINDOW = 50    # windowed reduction (pooling); aux = kind,rank,out/win
 OP_AFFINE_F32 = 51       # fused scalar affine d = a*s + t; imm = f32(s) bits, aux = f32(t) bits
 OP_REDUCE_SEG = 52       # segmented reduce over the innermost `seg` elems; imm = (kind<<28)|seg
 OP_FOR = 53              # fixed-trip loop: body = instrs [n, n+imm), b = trip count
+OP_SOFTMAX = 54          # fused softmax over the innermost `seg` elems; imm = seg (§19)
+OP_LAYERNORM = 55        # fused layernorm core over innermost `seg`; imm = seg, imm2 = eps bits
+OP_GELU = 56             # fused GELU tanh-approx unary EW op (§19b/§24); a = input, no imm
+OP_MAP_REGION = 57       # §27/§28 register-resident fused map-region: a=in0, b=in1,
+                         # n=elems, aux=descriptor word-offset (slots + micro-program)
+OP_FLASH_ATTN = 58       # §34 fused flash-attention (online softmax): a=Q b=K src,
+                         # imm2=V src, n=H, imm=T, aux=descriptor word-offset
+                         # ([H,T,C,hd,scale,causal,qv,kv,vv]); dst=out
+OP_REDUCE_STRIDED = 59   # partial-axis reduce over a CONTIGUOUS interior/prefix
+                         # axis block (inner stride > 1): input viewed (outer,
+                         # red, inner); out[o*inner+i]=reduce_r in[(o*red+r)*inner+i].
+                         # n = n_out (outer*inner), imm = (kind<<28)|red, imm2 = inner
+OP_GATHER_INDEX = 60     # §38 general data-dependent gather (stablehlo.gather):
+                         # a=operand, aux=descriptor word-offset, reads start_indices
+                         # (its buffer id rides in aux + reads_hint). (60: 59 = REDUCE_STRIDED)
+OP_SHL = 61              # stablehlo.shift_left (int32/uint32) (61-63: 59/60 taken)
+OP_SHR_L = 62            # stablehlo.shift_right_logical (zero-fill)
+OP_SHR_A = 63            # stablehlo.shift_right_arithmetic (sign-fill)
+OP_CONV = 64             # stablehlo.convolution (direct N-D NHWC/HWIO conv, §39):
+                         # a=input, b=weights, aux=descriptor word-offset
+                         # (sdim,Cin,Cout, out/win/stride/pad_low/dil/in spatial dims)
+OP_SCATTER_INDEX = 65    # §42 general data-dependent scatter (stablehlo.scatter):
+                         # a=updates, dst=operand result, aux=descriptor word-offset,
+                         # reads scatter_indices (id in aux + reads_hint). kind in aux
+                         # (0 set / 1 add / 2 max / 3 min). (65: 64 = OP_CONV)
 OP_NAMES = {
     OP_NOP: "nop", OP_ADD_F32: "add_f32", OP_MUL_F32: "mul_f32",
     OP_SUB_F32: "sub_f32", OP_FILL_F32: "fill_f32", OP_IOTA_F32: "iota_f32",
@@ -166,6 +191,15 @@ OP_NAMES = {
     OP_AFFINE_F32: "affine_f32",
     OP_REDUCE_SEG: "reduce_seg",
     OP_FOR: "for",
+    OP_SOFTMAX: "softmax",
+    OP_LAYERNORM: "layernorm",
+    OP_GELU: "gelu",
+    OP_MAP_REGION: "map_region",
+    OP_FLASH_ATTN: "flash_attn",
+    OP_REDUCE_STRIDED: "reduce_strided", OP_GATHER_INDEX: "gather_index",
+    OP_SHL: "shl", OP_SHR_L: "shr_l", OP_SHR_A: "shr_a",
+    OP_CONV: "convolution",
+    OP_SCATTER_INDEX: "scatter_index",
 }
 
 # v3 header: 48 bytes. After n_outputs, insert n_aux u32 + pad u32, then the
@@ -215,6 +249,16 @@ class Instr:
     # ins.aux (written by _finalize_matmul_views, so it survives serialization).
     aview: int = 0
     bview: int = 0
+    # OP_DOT matmul epilogue (§33 R2c), set by _fuse_mma_epilogue. NOT serialized:
+    # the scheduler reads these in-memory -> task p6/p7; the epilogue descriptor
+    # itself lives in the (serialized) aux pool and the kernel finds it via p6.
+    epi: int = 0        # epilogue descriptor aux word-offset (+1; 0 = none)
+    epi_res: int = 0    # epilogue second-input (residual/bias) buffer id
+    # OP_MAP_REGION multi-input handles (§28 follow-up): the FULL ordered list of
+    # region input buffer ids (len ≤ 8). Rides task fields a,b,p2..p7 (all
+    # loader-patched). NOT serialized: the scheduler reads it in-memory to build
+    # the task + its dependency read-set; the tensor validator reads it too.
+    region_inputs: tuple = ()
 
 
 def _pad8(out: bytearray) -> None:
@@ -307,6 +351,12 @@ class _Ctx:
         self.buffers: list[Buffer] = []
         self.consts: list[tuple[int, bytes]] = []
         self.value_to_buf: dict = {}       # ir.Value -> buffer id
+        # complex64/128 SSA values are represented split into a (real, imag) pair
+        # of f32 buffers entirely in the lowering (the arena stays 4-byte-slotted
+        # f32; no complex arena dtype). ops/complex_fft.py populates this;
+        # buf_pair/_alias_value below propagate it across call/return like
+        # value_to_buf does for scalar values. See docs/decisions.md §43.
+        self.cbuf: dict = {}               # ir.Value (complex) -> (re_id, im_id)
         self.instrs: list[Instr] = []
         self.inputs: list[int] = []
         self.outputs: list[int] = []
@@ -368,9 +418,24 @@ def _elem_dtype(element_type) -> int:
         if w == 1:
             return DT_BOOL                 # i1 predicate/mask
         if w == 32:
-            # stablehlo integers are signless; treat as i32 (jax uses i32 for
-            # indices/counters). unsigned is distinguished by the op, not type.
-            return DT_I32
+            # StableHLO integers are signless (i32) EXCEPT genuinely unsigned
+            # values, which carry the `ui32` type (element_type.is_unsigned).
+            # Reporting the correct signedness matters at the host boundary:
+            # PJRT_Buffer_ElementType is derived from this dtype, so a ui32
+            # device array (e.g. a threefry RNG key) must round-trip to numpy
+            # as uint32 — otherwise np.asarray(key) yields int32 and JAX
+            # materialises the key constant as tensor<2xi32>, mismatching its
+            # own ui32 @_threefry_split signature (verifier error; blocks any
+            # closed-over-key jit on this platform, e.g. brax reset+step).
+            # U32 is a 4-byte Tier-1 slot; elementwise/bitwise/shift/bitcast ops
+            # are bit-identical to I32 (the threefry/uniform RNG path uses only
+            # shl/shr_l/xor/add/iota + bitcast_convert, all bit-exact — verified
+            # vs JAX-CPU golden). KNOWN GAP (pre-existing, orthogonal): the
+            # DEVICE convert (u32->f32) and integer compare still run the SIGNED
+            # path, so u32 values with the high bit set convert/compare wrong vs
+            # JAX-CPU. Not hit by RNG/brax; fixing needs unsigned device kernels
+            # (tracked with reduce(and) as the next brax op gap, §42).
+            return DT_U32 if element_type.is_unsigned else DT_I32
         if w == 64:
             return DT_I64                  # Tier 2
         raise LoweringError(
@@ -515,6 +580,23 @@ def _lower_constant(ctx: _Ctx, op):
         ctx.const_scalar[op.results[0]] = float(np.asarray(arr).reshape(-1)[0])
 
 
+def _lower_sdy_identity(ctx: _Ctx, op):
+    """Shardy sharding hints are no-ops on our single OpenCL device: every
+    sdy op that carries a value through (sharding_constraint / reshard) is the
+    identity here, so alias each result to its like-typed operand. `sdy.mesh`
+    (module-level, no results) and other result-less sdy ops simply do nothing.
+    General infra: this is what makes ANY sharded JAX program lowerable — the
+    dialect is registered in deserialize_artifact, and its value-carrying ops
+    collapse to identity here (brax/MJX emit sdy.sharding_constraint)."""
+    for res, operand in zip(op.results, op.operands):
+        ctx.value_to_buf[res] = ctx.buf_for(operand)
+
+
+OP_HANDLERS["sdy.sharding_constraint"] = _lower_sdy_identity
+OP_HANDLERS["sdy.reshard"] = _lower_sdy_identity
+OP_HANDLERS["sdy.mesh"] = _lower_sdy_identity          # module-level, no results
+
+
 @_handles("func.return")
 def _lower_return(ctx: _Ctx, op):
     # v1 has no COPY opcode: results are whatever buffer produced the value.
@@ -551,14 +633,24 @@ def _inline_call(ctx: _Ctx, o) -> None:
         raise LoweringError(f"func.call to unknown function @{callee_name}")
     block = callee.regions[0].blocks[0]
     for arg, operand in zip(block.arguments, o.operands):
-        ctx.value_to_buf[arg] = ctx.buf_for(operand)
+        _alias_value(ctx, arg, operand)
     for inner in block.operations:
         io = inner.operation
         if io.name == "func.return":
             for ret_val, call_res in zip(io.operands, o.results):
-                ctx.value_to_buf[call_res] = ctx.buf_for(ret_val)
+                _alias_value(ctx, call_res, ret_val)
             return
         _lower_op(ctx, io)
+
+
+def _alias_value(ctx: _Ctx, dst, src) -> None:
+    """Alias SSA value `dst` to `src` across a call/return boundary, carrying
+    a split-complex (real, imag) pair when `src` is complex, else the scalar
+    buffer id."""
+    if src in ctx.cbuf:
+        ctx.cbuf[dst] = ctx.cbuf[src]
+    else:
+        ctx.value_to_buf[dst] = ctx.buf_for(src)
 
 
 @dataclasses.dataclass
@@ -586,6 +678,7 @@ _EW_INPLACE_SAFE = frozenset({
     OP_COS_F32, OP_TAN_F32, OP_ROUND_NEAREST_EVEN_F32, OP_ROUND_NEAREST_AFZ_F32,
     OP_COPY_F32, OP_CONVERT, OP_BITCAST, OP_CMP_F32, OP_SELECT_F32, OP_AND,
     OP_OR, OP_XOR, OP_NOT, OP_IS_FINITE, OP_AFFINE_F32,
+    OP_SHL, OP_SHR_L, OP_SHR_A,
 })
 
 
@@ -1030,6 +1123,157 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
                                           n=body_start, imm=body_len)
 
 
+# --- stablehlo.if / stablehlo.case : N-way region control (OP_IF) ------------
+
+_CMP_EQ = 0   # OP_CMP_F32 predicate for ==  (mirrors ops.elementwise pred table)
+
+
+@dataclasses.dataclass
+class _IfJob:
+    """A deferred region-lowering job for one OP_IF instruction (used for both
+    stablehlo.if and each arm of a lowered stablehlo.case). `if_idx` is the
+    index of the OP_IF placeholder in ctx.instrs; `cond_buf` is the f32 0/1
+    branch flag the device reads atomically; `results` is the shared list of
+    (buf, n_elems, dtype) carries every taken branch writes into (the if/case
+    results alias these). `else_block` is None for a case arm (empty else)."""
+    if_idx: int
+    then_block: object
+    else_block: object
+    cond_buf: int
+    results: list
+
+
+def _lower_branch_into(ctx: _Ctx, block, results: list) -> None:
+    """Lower a region block (no block arguments; captures enclosing SSA values)
+    and commit its returns into the shared result carries via COPY. Emits into
+    ctx.instrs at the current position (a region sub-list)."""
+    ret = None
+    for inner in block.operations:
+        io = inner.operation
+        if io.name in ("stablehlo.return", "func.return"):
+            ret = [ctx.buf_for(v) for v in io.operands]
+        else:
+            _lower_op(ctx, io)
+    if ret is None or len(ret) != len(results):
+        raise LoweringError("case/if branch return arity mismatch")
+    for (rbuf, n_elems, _dt), rb in zip(results, ret):
+        ctx.emit(Instr(OP_COPY_F32, dst=rbuf, a=rb, n=n_elems))
+
+
+def _lower_if_regions(ctx: _Ctx, job: _IfJob) -> None:
+    """Lower a queued OP_IF's then/else sub-lists (appended after the root, at
+    indices >= main_len — root_len rule) and patch the placeholder. Nested
+    regions inside a branch enqueue further jobs (drained in turn)."""
+    then_start = len(ctx.instrs)
+    _lower_branch_into(ctx, job.then_block, job.results)
+    then_len = len(ctx.instrs) - then_start
+    else_start = len(ctx.instrs)
+    if job.else_block is not None:
+        _lower_branch_into(ctx, job.else_block, job.results)
+    else_len = len(ctx.instrs) - else_start
+    ctx.instrs[job.if_idx] = Instr(OP_IF, dst=job.cond_buf,
+                                   a=then_start, b=then_len,
+                                   n=else_start, imm=else_len)
+
+
+def _alloc_results(ctx: _Ctx, op) -> list:
+    """Allocate one result carry buffer per op result and alias the results to
+    them. Returns [(buf, n_elems, dtype), ...]."""
+    results = []
+    for res in op.results:
+        _, n_elems, dtype = _tensor_info(res.type)
+        rbuf = ctx.new_buffer(n_elems, dtype)
+        results.append((rbuf, n_elems, dtype))
+        ctx.value_to_buf[res] = rbuf
+    return results
+
+
+@_handles("stablehlo.if")
+def _lower_if(ctx: _Ctx, op):
+    """stablehlo.if(pred) -> OP_IF over then/else region sub-lists. pred is an
+    i1 scalar; convert to an f32 0/1 flag the device reads atomically (same as
+    the while cond)."""
+    cond = ctx.buf_for(op.operands[0])
+    cond_f32 = ctx.new_buffer(1, DT_F32)
+    ctx.emit(Instr(OP_CONVERT, dst=cond_f32, a=cond, n=1))
+    results = _alloc_results(ctx, op)
+    if_idx = len(ctx.instrs)
+    ctx.emit(Instr(OP_IF))                 # placeholder; patched once regions lower
+    ctx.region_queue.append(_IfJob(if_idx, op.regions[0].blocks[0],
+                                   op.regions[1].blocks[0], cond_f32, results))
+
+
+@_handles("stablehlo.case")
+def _lower_case(ctx: _Ctx, op):
+    """stablehlo.case(index) -> an N-branch region op. StableHLO selects branch
+    `index`, clamping index<0 or index>=N to the LAST branch. We express the
+    N-way switch as N flat sibling OP_IFs sharing one set of result carries:
+    branch k runs iff its selection flag sel_k is 1. For k<N-1, sel_k =
+    (index==k) (exact); the default (out-of-range OR ==N-1) is sel_{N-1} =
+    1 - Σ_{k<N-1} sel_k (at most one earlier flag is set, so this is 0/1).
+    Guarding EVERY branch (incl. the last) keeps branches that never run — a
+    nested while, an expensive cone — from executing, unlike a select-all
+    lowering; frame depth stays 1 (siblings, not nested)."""
+    n_branches = len(op.regions)
+    if n_branches == 0:
+        raise LoweringError("stablehlo.case with no branches")
+
+    # N==1: index is irrelevant (always clamps to branch 0). Inline the single
+    # branch with no control, aliasing the case results to its returns.
+    if n_branches == 1:
+        block = op.regions[0].blocks[0]
+        ret = None
+        for inner in block.operations:
+            io = inner.operation
+            if io.name in ("stablehlo.return", "func.return"):
+                ret = [ctx.buf_for(v) for v in io.operands]
+            else:
+                _lower_op(ctx, io)
+        if ret is None or len(ret) != len(op.results):
+            raise LoweringError("stablehlo.case branch return arity mismatch")
+        for res, rb in zip(op.results, ret):
+            ctx.value_to_buf[res] = rb
+        return
+
+    results = _alloc_results(ctx, op)
+
+    # index -> f32 (exact for small branch indices) for scalar == compares.
+    _, idx_n, idx_dt = _tensor_info(op.operands[0].type)
+    idx_f32 = ctx.buf_for(op.operands[0])
+    if idx_dt != DT_F32:
+        idx_f32 = ctx.new_buffer(idx_n, DT_F32)
+        ctx.emit(Instr(OP_CONVERT, dst=idx_f32, a=ctx.buf_for(op.operands[0]),
+                       n=idx_n))
+
+    sels = []                              # f32 0/1 flags for branches 0..N-2
+    for k in range(n_branches - 1):
+        kconst = ctx.new_buffer(1, DT_F32)
+        ctx.emit(Instr(OP_FILL_F32, dst=kconst, imm=_f32_bits(float(k)), n=1))
+        cmpb = ctx.new_buffer(1, DT_BOOL)
+        ctx.emit(Instr(OP_CMP_F32, dst=cmpb, a=idx_f32, b=kconst, n=1,
+                       imm=_CMP_EQ))
+        selk = ctx.new_buffer(1, DT_F32)
+        ctx.emit(Instr(OP_CONVERT, dst=selk, a=cmpb, n=1))
+        sels.append(selk)
+    # sel_last = 1 - Σ sel_k  (n_branches >= 2 here, so `sels` is non-empty)
+    acc = sels[0]
+    for s in sels[1:]:
+        nacc = ctx.new_buffer(1, DT_F32)
+        ctx.emit(Instr(OP_ADD_F32, dst=nacc, a=acc, b=s, n=1))
+        acc = nacc
+    one = ctx.new_buffer(1, DT_F32)
+    ctx.emit(Instr(OP_FILL_F32, dst=one, imm=_f32_bits(1.0), n=1))
+    sel_last = ctx.new_buffer(1, DT_F32)
+    ctx.emit(Instr(OP_SUB_F32, dst=sel_last, a=one, b=acc, n=1))
+    all_sels = sels + [sel_last]
+
+    for k in range(n_branches):
+        if_idx = len(ctx.instrs)
+        ctx.emit(Instr(OP_IF))             # placeholder; patched once regions lower
+        ctx.region_queue.append(_IfJob(if_idx, op.regions[k].blocks[0], None,
+                                       all_sels[k], results))
+
+
 def _lower_op(ctx: _Ctx, o) -> None:
     if o.name == "func.call":
         _inline_call(ctx, o)
@@ -1059,6 +1303,20 @@ def _reads_of(ins: Instr) -> set[int]:
     if op == OP_SELECT_F32:
         base |= {ins.imm}                # select predicate rides in imm
     return base
+
+
+def _reader_index(instrs: list) -> dict:
+    """buf_id -> list of live instr indices that read it. Built once per fusion
+    round so the view-fold passes look up a gather's readers in O(readers)
+    instead of rescanning the whole stream per gather (O(n²)→O(n) per round;
+    matters on large graphs like the brax step, ~19k instrs)."""
+    idx: dict[int, list[int]] = {}
+    for j, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        for b in _reads_of(ins):
+            idx.setdefault(b, []).append(j)
+    return idx
 
 
 def _compose_affines(ctx: _Ctx) -> None:
@@ -1186,6 +1444,7 @@ def _fuse_views(ctx: _Ctx) -> None:
         for idx, ins in enumerate(instrs):
             if ins.op != OP_NOP:
                 writer_idxs.setdefault(ins.dst, []).append(idx)
+        rmap = _reader_index(instrs)
         for gi, g in enumerate(instrs):
             if g.op != OP_GATHER_STRIDED or g.dst in outs:
                 continue
@@ -1202,8 +1461,10 @@ def _fuse_views(ctx: _Ctx) -> None:
             if any(w > gi for w in writer_idxs.get(g.a, ())):
                 continue
             gbuf = g.dst
-            readers = [(j, ins) for j, ins in enumerate(instrs)
-                       if ins.op != OP_NOP and gbuf in _reads_of(ins)]
+            # rmap is built once per round; re-filter live (an earlier fold this
+            # round may have NOP'd/retargeted a listed reader).
+            readers = [(j, instrs[j]) for j in rmap.get(gbuf, ())
+                       if instrs[j].op != OP_NOP and gbuf in _reads_of(instrs[j])]
             if not readers:
                 continue
             def foldable(r):
@@ -1226,6 +1487,839 @@ def _fuse_views(ctx: _Ctx) -> None:
                 instrs[j] = r
             instrs[gi] = Instr(OP_NOP)
             changed = True
+
+
+# --- fused segmented norms (softmax / layernorm), §19 -----------------------
+
+# Max segment size the collaborative in-local-memory kernel can stage (one row
+# in __local As, sized MMA_ASZ = 1024 floats in the portable build). Larger
+# suffix reductions fall back to the decomposed reduce+broadcast lowering.
+_NORM_SEG_MAX = 1024
+_RSEG_SUM, _RSEG_MAX = 0, 1        # OP_REDUCE_SEG imm kind field (imm >> 28)
+
+
+def _f32_from_bits(bits: int) -> float:
+    return float(np.frombuffer(struct.pack("<I", bits & 0xFFFFFFFF), "<f4")[0])
+
+
+def _fuse_norm(ctx: _Ctx) -> None:
+    """Recognize the softmax / layernorm-core reduce→broadcast idioms in OUR
+    lowered VM-instr stream and collapse each into a SINGLE fused op
+    (OP_SOFTMAX / OP_LAYERNORM) done in local memory by one workgroup-per-segment
+    kernel — one global read + one write instead of 5–7 cross-workgroup phases
+    (§19). Matches on our own instrs (robust to jaxlib/StableHLO variation: both
+    idioms funnel through OP_REDUCE_SEG + viewed EW ops).
+
+    GATED HARD: only fires on the exact innermost-suffix dataflow chain with the
+    right op kinds and producer→consumer linkage; on ANY mismatch it leaves the
+    decomposed lowering untouched (an unfused norm is correct, only slower).
+    PJRT_OCL_FUSE_NORM=0 disables it (A/B + revert lever). Runs before
+    _reuse_arena; the following _dce_nops removes the now-dead intermediates."""
+    if os.environ.get("PJRT_OCL_FUSE_NORM", "1") == "0":
+        return
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+
+    # unique writer per buffer (None if 0 or >1 non-NOP writers: multi-write
+    # carries and RMW pairs must not be traced through).
+    def _writer_map() -> dict:
+        seen: dict = {}
+        multi: set = set()
+        for idx, ins in enumerate(instrs):
+            if ins.op == OP_NOP:
+                continue
+            d = ins.dst
+            if d in seen or d in multi:
+                seen.pop(d, None)
+                multi.add(d)
+            else:
+                seen[d] = idx
+        return seen
+
+    # f32 scalar/broadcast consts (all elements equal) -> python float.
+    const_f: dict = {}
+    for bid, data in ctx.consts:
+        if bid < len(ctx.buffers) and ctx.buffers[bid].dtype == DT_F32:
+            arr = np.frombuffer(data, "<f4")
+            if arr.size >= 1 and np.all(arr == arr[0]):
+                const_f[bid] = float(arr[0])
+
+    def _redseg(imm: int):
+        return imm >> 28, imm & 0x0FFFFFFF        # kind, seg
+
+    changed = True
+    while changed:
+        changed = False
+        writers = _writer_map()
+
+        def bcast_src(buf: int) -> int:
+            """Follow a chain of OP_GATHER_STRIDED (reshape/broadcast) producers
+            back to the ultimate source buffer id."""
+            seen: set = set()
+            while (buf in writers and buf not in seen
+                   and instrs[writers[buf]].op == OP_GATHER_STRIDED):
+                seen.add(buf)
+                buf = instrs[writers[buf]].a
+            return buf
+
+        def find(pred):
+            for j, ins in enumerate(instrs):
+                if ins.op != OP_NOP and pred(j, ins):
+                    return j, ins
+            return None
+
+        def is_op(buf: int, op: int):
+            w = writers.get(buf)
+            return None if w is None else (instrs[w] if instrs[w].op == op else None)
+
+        for r1i, R1 in enumerate(instrs):
+            if R1.op != OP_REDUCE_SEG:
+                continue
+            kind1, seg = _redseg(R1.imm)
+            if seg == 0 or seg > _NORM_SEG_MAX:
+                continue
+            X, n_out = R1.a, R1.n
+            total = n_out * seg
+
+            # ---- softmax: max -> sub(x,·) -> exp -> sum -> div(exp,·) --------
+            if kind1 == _RSEG_MAX:
+                mSUB = find(lambda j, s: s.op == OP_SUB_F32 and s.a == X
+                            and s.n == total and bcast_src(s.b) == R1.dst)
+                if mSUB is None:
+                    continue
+                _, SUB = mSUB
+                mEXP = find(lambda j, s: s.op == OP_EXP_F32 and s.a == SUB.dst)
+                if mEXP is None:
+                    continue
+                _, EXP = mEXP
+                mR2 = find(lambda j, s: s.op == OP_REDUCE_SEG and s.a == EXP.dst
+                           and _redseg(s.imm) == (_RSEG_SUM, seg) and s.n == n_out)
+                if mR2 is None:
+                    continue
+                _, R2 = mR2
+                mDIV = find(lambda j, s: s.op == OP_DIV_F32 and s.a == EXP.dst
+                            and s.n == total and bcast_src(s.b) == R2.dst)
+                if mDIV is None:
+                    continue
+                di, DIV = mDIV
+                if DIV.dst in outs and X == DIV.dst:
+                    continue
+                instrs[di] = Instr(OP_SOFTMAX, dst=DIV.dst, a=X, b=X,
+                                   n=n_out, imm=seg)
+                changed = True
+                break
+
+            # ---- layernorm core ---------------------------------------------
+            if kind1 != _RSEG_SUM:
+                continue
+            # mu = mean(x) = sum(x) / seg
+            mMU = find(lambda j, s: s.op == OP_DIV_F32 and s.n == n_out
+                       and bcast_src(s.a) == R1.dst
+                       and const_f.get(s.b) == float(seg))
+            if mMU is None:
+                continue
+            _, MU = mMU
+            muv = MU.dst
+
+            def is_x_minus_mu(buf: int) -> bool:
+                s = is_op(buf, OP_SUB_F32)
+                return bool(s and s.a == X and s.n == total
+                            and bcast_src(s.b) == muv)
+
+            # (x-mu)^2 -> sum -> var = mean - mu^2 chain
+            mSQ = find(lambda j, s: s.op == OP_MUL_F32 and s.a == s.b
+                       and s.n == total and is_x_minus_mu(s.a))
+            if mSQ is None:
+                continue
+            _, SQ = mSQ
+            mR2 = find(lambda j, s: s.op == OP_REDUCE_SEG and s.a == SQ.dst
+                       and _redseg(s.imm) == (_RSEG_SUM, seg) and s.n == n_out)
+            if mR2 is None:
+                continue
+            _, R2 = mR2
+            mVAR = find(lambda j, s: s.op == OP_DIV_F32 and s.n == n_out
+                        and bcast_src(s.a) == R2.dst
+                        and const_f.get(s.b) == float(seg))
+            if mVAR is None:
+                continue
+            _, VAR = mVAR
+            # var + eps (affine, scale 1) -> ^-0.5 (pow) -> (x-mu)*rsqrt
+            mAFF = find(lambda j, s: s.op == OP_AFFINE_F32 and s.a == VAR.dst
+                        and s.n == n_out and _f32_from_bits(s.imm) == 1.0)
+            if mAFF is None:
+                continue
+            _, AFF = mAFF
+            eps_bits = AFF.imm2
+            mPOW = find(lambda j, s: s.op == OP_POW_F32 and s.a == AFF.dst
+                        and const_f.get(s.b) == -0.5)
+            if mPOW is None:
+                continue
+            _, POW = mPOW
+            mOUT = find(lambda j, s: s.op == OP_MUL_F32 and s.n == total
+                        and is_x_minus_mu(s.a) and bcast_src(s.b) == POW.dst)
+            if mOUT is None:
+                continue
+            oi, OUT = mOUT
+            if OUT.dst in outs and X == OUT.dst:
+                continue
+            instrs[oi] = Instr(OP_LAYERNORM, dst=OUT.dst, a=X, b=X,
+                               n=n_out, imm=seg, imm2=eps_bits)
+            changed = True
+            break
+
+
+# GPT-2 tanh-approx GELU constants, compared as f32 (jax folds these exact
+# literals into OP_AFFINE_F32 scales; see _fuse_gelu).
+_GELU_C_CUBE = float(np.float32(0.044715))      # inner cubic coefficient
+_GELU_C_SQRT = float(np.float32(0.7978845608))  # sqrt(2/pi)
+
+
+def _capprox(v, ref: float, rtol: float = 1e-6) -> bool:
+    return v is not None and abs(v - ref) <= rtol * abs(ref) + 1e-12
+
+
+def _fuse_gelu(ctx: _Ctx) -> None:
+    """Recognize the GPT-2 tanh-approx GELU idiom
+    `0.5*x*(1+tanh(0.7978845608*(x + 0.044715*x^3)))` in OUR lowered VM-instr
+    stream and collapse it into a SINGLE dedicated unary op (OP_GELU) that
+    computes the whole thing per element in registers — one global read + one
+    write instead of ~8 EW ops each round-tripping an intermediate through the
+    arena (§19b/§24: dedicated OP_GELU ~4× on its component at base, where the
+    general region-op manages only 1.3×).
+
+    Pure elementwise (no reduce/segment): this is a plain EW-unary subop on the
+    existing TILE_EW path — no new SLM, no tile-op family.
+
+    Both spellings of the idiom reach us with an identical backbone (all ops
+    reuse the input buffer X):
+        x2  = x*x                        (MUL, a==b==X)
+        x3  = x2*x                       (MUL, {x2, X})
+        c   = 0.044715 * x3              (AFFINE s=0.044715, t=0)
+        s   = x + c                      (ADD, {X, c})
+        i   = 0.7978845608 * s           (AFFINE s=0.7978845608, t=0)
+        t   = tanh(i)                    (TANH)
+    …and differ ONLY in how the `0.5*x*(1+tanh)` tail is factored:
+      - jax.nn.gelu:      out = x * (0.5*t + 0.5)      (TF s=t=0.5;  x direct)
+      - manual `0.5*x*(1+tanh)`: out = (0.5*x) * (1*t + 1)  (TF s=t=1; XF s=0.5)
+    Generalize the tail: the final MUL is `(s_x·X) · (s_t·(t+1))` where the tanh
+    factor is an affine with bias==scale (= k·(tanh+1)) and the x factor is X
+    directly (s_x=1) or `affine(X, s_x, 0)`, gated on `s_x·s_t == 0.5`. This
+    matches any mathematically-equivalent factoring (correctness rests on the
+    algebra, not a specific spelling), while the backbone constants
+    0.044715 / 0.7978845608 stay exact-checked and X stays reused throughout.
+
+    GATED HARD on every op kind + the exact backbone constants + producer→
+    consumer linkage + the reused-X thread + the tail scale product; ANY
+    mismatch leaves the decomposed chain untouched (never wrong, only
+    sometimes-unfused). PJRT_OCL_FUSE_GELU=0 disables it. Runs after _fuse_norm
+    on the cleaned stream (post view-fold / affine-compose / DCE); the following
+    _dce_nops removes the dead chain."""
+    if os.environ.get("PJRT_OCL_FUSE_GELU", "1") == "0":
+        return
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+
+    def _writer_map() -> dict:
+        seen: dict = {}
+        multi: set = set()
+        for idx, ins in enumerate(instrs):
+            if ins.op == OP_NOP:
+                continue
+            d = ins.dst
+            if d in seen or d in multi:
+                seen.pop(d, None)
+                multi.add(d)
+            else:
+                seen[d] = idx
+        return seen
+
+    changed = True
+    while changed:
+        changed = False
+        writers = _writer_map()
+
+        def producer(buf: int, op: int):
+            """The unique writer of `buf` if it is `op`, else None."""
+            w = writers.get(buf)
+            return None if w is None else (instrs[w] if instrs[w].op == op else None)
+
+        def affine_c(buf: int, s_ref: float, t_ref: float):
+            """producer of `buf` iff OP_AFFINE_F32 with matching scale/bias."""
+            a = producer(buf, OP_AFFINE_F32)
+            if a is None or not _capprox(_f32_from_bits(a.imm), s_ref):
+                return None
+            return a if _capprox(_f32_from_bits(a.imm2), t_ref) else None
+
+        def backbone(tanh_in: int, total: int):
+            """Verify tanh_in = 0.7978845608*(X + 0.044715*X^3) and return X,
+            else None. Tries both add-operand orderings to locate X."""
+            AFFI = affine_c(tanh_in, _GELU_C_SQRT, 0.0)
+            if AFFI is None or AFFI.n != total:
+                return None
+            ADD = producer(AFFI.a, OP_ADD_F32)
+            if ADD is None or ADD.n != total or ADD.imm or ADD.imm2:
+                return None
+            for X, cbuf in ((ADD.a, ADD.b), (ADD.b, ADD.a)):
+                AFFC = affine_c(cbuf, _GELU_C_CUBE, 0.0)
+                if AFFC is None or AFFC.n != total:
+                    continue
+                MUL3 = producer(AFFC.a, OP_MUL_F32)
+                if MUL3 is None or MUL3.n != total or MUL3.imm or MUL3.imm2:
+                    continue
+                x2 = (MUL3.b if MUL3.a == X else
+                      MUL3.a if MUL3.b == X else None)
+                if x2 is None:
+                    continue
+                MUL2 = producer(x2, OP_MUL_F32)
+                if (MUL2 is None or MUL2.n != total or MUL2.imm or MUL2.imm2
+                        or MUL2.a != X or MUL2.b != X):
+                    continue
+                return X
+            return None
+
+        for oi, OUT in enumerate(instrs):
+            # anchor: the final `out = (s_x·x) · (s_t·(1+tanh))`
+            if OUT.op != OP_MUL_F32 or OUT.imm or OUT.imm2:
+                continue          # a direct (unviewed) multiply only
+            total = OUT.n
+            done = False
+            # one operand is the tanh factor, the other the x factor
+            for tf_buf, xf_buf in ((OUT.a, OUT.b), (OUT.b, OUT.a)):
+                # tanh factor: affine(tanh, s_t, t_t) with t_t == s_t (= k*(1+t))
+                TF = producer(tf_buf, OP_AFFINE_F32)
+                if TF is None or TF.n != total:
+                    continue
+                s_t = _f32_from_bits(TF.imm)
+                if not _capprox(_f32_from_bits(TF.imm2), s_t):
+                    continue
+                TANH = producer(TF.a, OP_TANH_F32)
+                if TANH is None or TANH.n != total:
+                    continue
+                X = backbone(TANH.a, total)
+                if X is None:
+                    continue
+                # x factor: X directly (s_x=1) or affine(X, s_x, 0)
+                if xf_buf == X:
+                    s_x = 1.0
+                else:
+                    XF = producer(xf_buf, OP_AFFINE_F32)
+                    if (XF is None or XF.a != X or XF.n != total
+                            or not _capprox(_f32_from_bits(XF.imm2), 0.0)):
+                        continue
+                    s_x = _f32_from_bits(XF.imm)
+                # combined scale must be exactly 0.5: (s_x·X)·(s_t·(1+t))
+                if not _capprox(s_x * s_t, 0.5):
+                    continue
+                # in-place self-write guard (mirror _fuse_norm).
+                if OUT.dst in outs and X == OUT.dst:
+                    continue
+                instrs[oi] = Instr(OP_GELU, dst=OUT.dst, a=X, b=X, n=total)
+                changed = done = True
+                break
+            if done:
+                break
+
+
+# --- general register-resident map-region fusion (§23/§27/§28) ---------------
+#
+# The culmination of the §23 arc: collapse a maximal run of pure-map f32 EW ops
+# whose intermediates round-trip through the arena into ONE register-resident
+# OP_MAP_REGION. K ops + K−1 barrier phases + K global round-trips → 1 phase, 1
+# load per input + 1 store, intermediates kept in per-thread float4 slots. This
+# GENERALIZES the hand-fusions (§11 chain, §19 norms, §26 gelu) into one
+# mechanism; the dedicated OP_SOFTMAX/LAYERNORM/GELU are single ops = REGION
+# BOUNDARIES (not in _REGION_KIND), as are all cross-lane ops (reduce, matmul,
+# gather/scatter, dynamic index) — the region is bounded by anything non-map.
+#
+# Occupancy is FREE inside the one megakernel (§27, measured): per-thread float4
+# slots overlap the matmul case's registers (max-not-sum), no SLM. So no VM
+# split, no relaunch.
+
+# tensor opcode -> (region micro-op SUB_* kind, arity). SUB_* MUST match
+# vm_common.cl / ops/region.cl (the kernel switches on these). arity picks how
+# operand/imm fields map to the {a_slot,b_slot,s,t} micro-op word.
+_RSUB_ADD, _RSUB_MUL, _RSUB_SUB, _RSUB_DIV, _RSUB_MAX, _RSUB_MIN = 0, 1, 2, 3, 4, 5
+_RSUB_NEG, _RSUB_EXP, _RSUB_LOG, _RSUB_SQRT, _RSUB_RSQRT = 8, 9, 10, 11, 12
+_RSUB_TANH, _RSUB_ABS, _RSUB_AFFINE = 13, 14, 40
+_REGION_NONE = 0xFFFF
+
+_REGION_KIND = {
+    OP_ADD_F32: (_RSUB_ADD, "bin"), OP_SUB_F32: (_RSUB_SUB, "bin"),
+    OP_MUL_F32: (_RSUB_MUL, "bin"), OP_DIV_F32: (_RSUB_DIV, "bin"),
+    OP_MAX_F32: (_RSUB_MAX, "bin"), OP_MIN_F32: (_RSUB_MIN, "bin"),
+    OP_NEG_F32: (_RSUB_NEG, "un"), OP_EXP_F32: (_RSUB_EXP, "un"),
+    OP_LOG_F32: (_RSUB_LOG, "un"), OP_SQRT_F32: (_RSUB_SQRT, "un"),
+    OP_RSQRT_F32: (_RSUB_RSQRT, "un"), OP_TANH_F32: (_RSUB_TANH, "un"),
+    OP_ABS_F32: (_RSUB_ABS, "un"), OP_AFFINE_F32: (_RSUB_AFFINE, "affine"),
+}
+
+# Kernel per-thread slot budget (ops/region.cl REGION_NSLOTS). The recognizer's
+# budget may be set lower via env to force the over-budget split in tests.
+_REGION_NSLOTS = 8
+# Max region inputs (ops/region.cl REGION_MAXIN): a, b, p2..p7 task fields.
+_REGION_MAXIN = 8
+
+
+def _region_budget() -> int:
+    try:
+        b = int(os.environ.get("PJRT_OCL_REGION_SLOTS", str(_REGION_NSLOTS)))
+    except ValueError:
+        b = _REGION_NSLOTS
+    return max(2, min(b, _REGION_NSLOTS))
+
+
+def _region_operands(ins: Instr) -> tuple[int, ...]:
+    """Ordered (a[, b]) operand buffers of an eligible EW instr — the values the
+    micro-op reads. Binary reads a,b; unary/affine read a only."""
+    _, arity = _REGION_KIND[ins.op]
+    return (ins.a,) if arity != "bin" else (ins.a, ins.b)
+
+
+def _region_eligible(ctx: _Ctx, ins: Instr) -> bool:
+    """A pure-map f32 EW op the region interpreter can execute. Gated HARD:
+    result + every operand f32, and (for viewable binary/unary ops) operands
+    read DIRECTLY — a folded strided VIEW (imm/imm2 != 0) is not fused in v1
+    (the kernel reads region inputs contiguously). Affine's imm/imm2 are its
+    s/t immediates, not views, so it is always direct."""
+    kind = _REGION_KIND.get(ins.op)
+    if kind is None:
+        return False
+    if ctx.buffers[ins.dst].dtype != DT_F32:
+        return False
+    for b in _region_operands(ins):
+        if b >= len(ctx.buffers) or ctx.buffers[b].dtype != DT_F32:
+            return False
+    if kind[1] != "affine" and (ins.imm != 0 or ins.imm2 != 0):
+        return False                    # viewed operand — not fused in v1
+    return True
+
+
+def _region_slots(members: list[int], instrs, inputs: list[int],
+                  out_buf: int) -> dict[int, int] | None:
+    """Linear-scan slot allocation over a region (members in SSA order). Values =
+    external `inputs` (live from the start) + each member's dst. Returns
+    {buffer_id: slot} whose max slot < budget, or None if it needs more slots
+    than the budget allows. `out_buf` lives past the region (used at the end)."""
+    budget = _region_budget()
+    k = len(members)
+    produced = {instrs[m].dst for m in members}   # region-internal buffer ids
+    in_set = set(inputs)
+    # last use position of each value (member index that last reads it); out_buf
+    # is read at the end (k). Inputs/temps: last member reading them.
+    last: dict[int, int] = {}
+    for i, m in enumerate(members):
+        for b in _reads_of(instrs[m]):
+            if b in produced or b in in_set:
+                last[b] = max(last.get(b, -1), i)
+    for b in (*inputs, *produced):
+        last.setdefault(b, -1)
+    last[out_buf] = k                    # externally live: survives the region
+
+    active: dict[int, int] = {}          # value -> slot
+    free: list[int] = []
+    nxt = [0]
+
+    def alloc() -> int:
+        if free:
+            return free.pop()
+        s = nxt[0]
+        nxt[0] += 1
+        return s
+
+    slot: dict[int, int] = {}
+    for b in inputs:                     # inputs live from step 0
+        slot[b] = alloc()
+        active[b] = slot[b]
+    for i, m in enumerate(members):
+        # expire strictly-dead values (last use < i) so their slots free up
+        for v in [v for v in list(active) if last.get(v, -1) < i]:
+            free.append(active.pop(v))
+        d = instrs[m].dst
+        s = alloc()
+        slot[d] = s
+        active[d] = s
+        if nxt[0] > budget:
+            return None                  # peak distinct slots exceeds budget
+    return slot if nxt[0] <= budget else None
+
+
+def _region_phase_map(ctx: _Ctx, main_len: int) -> dict[int, int]:
+    """Instr index -> scheduler phase number (only for root compute instrs).
+    Mirrors _reuse_arena: two ops fuse into a region ONLY if the scheduler
+    co-locates them in one barrier phase, so a lane-local map chain fuses but a
+    dependency threading the whole program (the residual stream, whose links sit
+    in different phases separated by the attention/FFN/norm boundaries between
+    them) never does."""
+    from . import scheduler as S
+
+    class _PV:
+        pass
+    pv = _PV()
+    pv.instrs = ctx.instrs
+    pv.buffers = ctx.buffers
+    pv.main_len = main_len
+    sc = S._Scheduler(pv, S.DeviceConfig.from_env(), 1)
+    levels = sc._build_levels(list(range(main_len)))
+    tphase: dict[int, int] = {}
+    for ph, (kind, payload) in enumerate(levels):
+        if kind == "compute":
+            for idx in payload:
+                tphase[idx] = ph
+    return tphase
+
+
+def _region_phase_map_scoped(ctx: _Ctx, main_len: int) -> dict[int, int]:
+    """Like _region_phase_map, but also phases every loop-body sub-list so
+    region fusion can fire INSIDE a while/for body (§28's "next step": the
+    laggard scan/loop workloads run a long serial per-iteration EW chain that
+    never leaves the body sub-range, so root-only fusion never sees it).
+
+    Each scope (root + every FOR/WHILE body, nested included) is phased with the
+    SAME scheduler `_build_levels` that drives the barrier layout, then given a
+    DISJOINT phase-number band so the within-phase gate in _fuse_region can only
+    connect ops that are co-scheduled in ONE barrier phase of the SAME sub-list
+    — never a root op to a body op, never across two bodies. Loop carries stay
+    excluded by the global multi-writer test in _fuse_region (a carry is written
+    by its root init-copy AND its body commit ⇒ multi ⇒ never a region member or
+    the fused read's definition), so a region only ever produces fresh in-body
+    SSA temporaries and reads carries/inputs read-only — the previous iteration's
+    value, exactly as the decomposed chain does."""
+    from . import scheduler as S
+
+    class _PV:
+        pass
+    pv = _PV()
+    pv.instrs = ctx.instrs
+    pv.buffers = ctx.buffers
+    pv.main_len = main_len
+    sc = S._Scheduler(pv, S.DeviceConfig.from_env(), 1)
+    tphase: dict[int, int] = {}
+    base = 0
+
+    def _do(indices: list[int]) -> None:
+        nonlocal base
+        levels = sc._build_levels(indices)
+        for ph, (kind, payload) in enumerate(levels):
+            if kind == "compute":
+                for idx in payload:
+                    tphase[idx] = base + ph
+        base += len(levels) + 1          # disjoint band per scope
+
+    _do(list(range(main_len)))
+    for ins in ctx.instrs:
+        if ins.op in (OP_FOR, OP_WHILE) and ins.imm:
+            _do(list(range(ins.n, ins.n + ins.imm)))
+    return tphase
+
+
+def _fuse_region(ctx: _Ctx, main_len: int) -> None:
+    """Recognize maximal map-regions — WITHIN-PHASE connected runs of pure-map
+    f32 EW ops (elementwise + affine) bounded by cross-lane ops and the
+    dedicated fused ops — and collapse each single-output region into ONE
+    OP_MAP_REGION whose aux descriptor carries a slot map + straight-line
+    micro-program (one global load per input, one store; intermediates stay in
+    per-thread float4 registers). Over-budget or >2-input regions are SPLIT into
+    budget-sized single-output sub-regions (still one kernel; each sub-region's
+    boundary tensor is materialized in the arena and read by the next). GATED
+    HARD: co-scheduled in one phase, single externally-live output, ≤2 inputs
+    per (sub)region, ≤budget slots, all-f32, no viewed operands; any mismatch
+    leaves the decomposed chain untouched. A split that yields only singletons
+    (no op-count reduction) is skipped. PJRT_OCL_FUSE_REGION=0 reverts. Runs
+    after the other fusion passes; the following _dce_nops drops the now-dead
+    members."""
+    if os.environ.get("PJRT_OCL_FUSE_REGION", "1") == "0":
+        return
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+    budget = _region_budget()
+    # PJRT_OCL_FUSE_REGION_LOOP (default on): also fuse inside while/for bodies —
+    # the serial per-iteration EW chains of scan/loop workloads live in the body
+    # sub-range and root-only fusion never reaches them (§28 follow-up).
+    loop_fuse = os.environ.get("PJRT_OCL_FUSE_REGION_LOOP", "1") != "0"
+    if not loop_fuse:
+        phase = _region_phase_map(ctx, main_len)
+    else:
+        phase = _region_phase_map_scoped(ctx, main_len)
+    # Loop-body index ranges. A region inside a body is barrier-ISOLATED (a
+    # map-region is a phase boundary), so it only pays off when it collapses a
+    # LONG lane-local chain — a body's whole EW chain runs in one barrier-free
+    # phase, and replacing a short run of it with a region that needs its own
+    # phase can add barriers for little op-count win (rk4's 3–7-op cones). Gate
+    # loop-body cones on a minimum size; the root has no such penalty (its
+    # regions sit between shaped-op phase boundaries that exist anyway) and is
+    # ungated. PJRT_OCL_REGION_LOOP_MIN overrides the threshold.
+    body_ranges = [(ins.n, ins.n + ins.imm) for ins in instrs
+                   if ins.op in (OP_FOR, OP_WHILE) and ins.imm] if loop_fuse else []
+    try:
+        loop_min = int(os.environ.get("PJRT_OCL_REGION_LOOP_MIN", "8"))
+    except ValueError:
+        loop_min = 8
+
+    def _in_loop_body(idx: int) -> bool:
+        return any(lo <= idx < hi for lo, hi in body_ranges)
+
+    # unique writer of each buffer (multi-write buffers, e.g. loop carries, are
+    # excluded from regions — the fused reads must see one definition).
+    writer: dict[int, int] = {}
+    multi: set[int] = set()
+    for idx, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        if ins.dst in writer or ins.dst in multi:
+            writer.pop(ins.dst, None)
+            multi.add(ins.dst)
+        else:
+            writer[ins.dst] = idx
+
+    elig = [idx for idx, ins in enumerate(instrs)
+            if _region_eligible(ctx, ins) and ins.dst not in multi
+            and idx in phase]
+    if len(elig) < 2:
+        return
+    eset = set(elig)
+
+    # union-find: connect two eligible members in the SAME phase when one reads
+    # the other's dst (a lane-local map dep — the scheduler runs them on one lane
+    # already; the region additionally keeps the intermediate off the arena).
+    parent = {i: i for i in elig}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for j in elig:
+        for b in _reads_of(instrs[j]):
+            w = writer.get(b)
+            if (w is not None and w in eset and phase[w] == phase[j]
+                    and find(w) != find(j)):
+                parent[find(w)] = find(j)
+
+    comps: dict[int, list[int]] = {}
+    for i in elig:
+        comps.setdefault(find(i), []).append(i)
+
+    for members in comps.values():
+        if len(members) < 2:
+            continue
+        members = sorted(members)                 # SSA (topological) order
+        mset = set(members)
+        n = instrs[members[0]].n
+        if any(instrs[m].n != n for m in members):
+            continue                              # all one element count
+        produced = {instrs[m].dst for m in members}
+        # externally-live members: dst is a program output, or read by a
+        # non-member live instr, or written more than once.
+        readers_out: dict[int, int] = {}          # member dst -> external reads
+        for j, ins in enumerate(instrs):
+            if ins.op == OP_NOP or j in mset:
+                continue
+            for b in _reads_of(ins):
+                if b in produced:
+                    readers_out[b] = readers_out.get(b, 0) + 1
+        live_outs = [m for m in members
+                     if instrs[m].dst in outs or readers_out.get(instrs[m].dst)]
+        live_dsts = {instrs[m].dst for m in live_outs}
+        # ROOT regions keep the pre-existing behavior (single live output, ≤2
+        # inputs) so tuned root scheduling is byte-unchanged. LOOP-BODY regions
+        # (§28 follow-up) get the new lever: split a multi-output connected
+        # component into one single-output sub-region per live output = its
+        # backward fan-in cone (stopping at — and reading as inputs — other live
+        # outputs and members SHARED by ≥2 cones, which stay decomposed). Every
+        # emitted region still has ONE writer/output, so the scheduler/arena/
+        # liveness are untouched; up to REGION_MAXIN inputs let a carry's whole
+        # rate chain collapse (HH neuron's new_m/new_h/new_n/new_V).
+        in_body = _in_loop_body(members[0])
+        maxin = _REGION_MAXIN if in_body else 2
+        if in_body:
+            cones = _output_cones(instrs, members, mset, produced, live_dsts)
+        elif len(live_dsts) == 1:
+            cones = [(members, next(iter(live_dsts)))]
+        else:
+            continue                              # root single-output gate
+        for cone_members, out_buf in cones:
+            if len(cone_members) < 2:
+                continue
+            # loop-body cones must be long enough to earn their barrier phase.
+            if in_body and len(cone_members) < loop_min:
+                continue
+            subregions = _split_region(instrs, cone_members, out_buf, budget, maxin)
+            if subregions is None:
+                continue                          # can't fit/split → decomposed
+            # a split into only singletons replaces plain EW ops with regions
+            # 1:1 — no phase/round-trip win; leave that cone decomposed.
+            if max(len(s) for s, _ in subregions) < 2:
+                continue
+            for sub_members, sub_out in subregions:
+                _emit_region(ctx, sub_members, sub_out)
+
+
+def _output_cones(instrs, members: list[int], mset: set, produced: set,
+                  live_dsts: set):
+    """Split a connected map-region component into one single-output sub-region
+    per live output. Each is the output's backward fan-in cone within the
+    component, stopping at (reading as inputs) other live outputs and any member
+    SHARED by ≥2 output cones. Shared members stay decomposed EW ops producing
+    real buffers, so every emitted region has exactly one writer/output — the
+    scheduler/arena/liveness never see a multi-write. Returns [(cone_members
+    (SSA order), out_buf), ...]."""
+    dstof = {instrs[m].dst: m for m in members}   # unique writer within comp
+    live_out_members = [m for m in members if instrs[m].dst in live_dsts]
+
+    def cone_of(om: int, stop_dsts: set) -> set:
+        seen: set = set()
+        stack = [om]
+        while stack:
+            m = stack.pop()
+            if m in seen:
+                continue
+            seen.add(m)
+            for b in _region_operands(instrs[m]):
+                if b in produced and b not in stop_dsts:
+                    w = dstof.get(b)
+                    if w is not None and w in mset and w != m:
+                        stack.append(w)
+        return seen
+
+    # raw cones (stop only at OTHER live outputs) to find shared members
+    fanin: dict[int, int] = {}
+    for om in live_out_members:
+        O = instrs[om].dst
+        for m in cone_of(om, live_dsts - {O}):
+            fanin[m] = fanin.get(m, 0) + 1
+    shared = {instrs[m].dst for m, c in fanin.items()
+              if c > 1 and instrs[m].dst not in live_dsts}
+
+    result = []
+    for om in sorted(live_out_members):
+        O = instrs[om].dst
+        cm = sorted(cone_of(om, (live_dsts - {O}) | shared))
+        result.append((cm, O))
+    return result
+
+
+def _split_region(instrs, members: list[int], out_buf: int, budget: int,
+                  maxin: int = 2):
+    """Partition `members` (SSA order) into consecutive single-output sub-regions
+    each ≤maxin inputs / ≤budget slots. Returns [(sub_members, out_buf), ...] in
+    order, or None if it cannot be split cleanly (→ fall back to decomposed).
+    A sub-region's output is the member whose dst is read outside the sub-region
+    (later members or externally); a clean cut needs exactly one such value."""
+    produced_here: set[int] = set()      # boundary buffers already emitted
+    later_reads: list[set[int]] = []     # reads by members strictly after i
+    acc: set[int] = set()
+    for m in reversed(members):
+        later_reads.append(set(acc))
+        for b in _reads_of(instrs[m]):
+            acc.add(b)
+    later_reads.reverse()                # later_reads[i] = reads of members[i+1:]
+
+    def analyze(sub: list[int]):
+        prod = {instrs[m].dst for m in sub}
+        inputs = []
+        seen = set()
+        for m in sub:
+            for b in _region_operands(instrs[m]):
+                if b not in prod and b not in seen:
+                    seen.add(b)
+                    inputs.append(b)
+        return prod, inputs
+
+    subs: list[tuple[list[int], int]] = []
+    cur: list[int] = []
+    for i, m in enumerate(members):
+        trial = cur + [m]
+        _, inputs = analyze(trial)
+        slot = _region_slots(trial, instrs, inputs, out_buf)
+        fits = len(inputs) <= maxin and slot is not None
+        if fits:
+            cur = trial
+            continue
+        if not cur:
+            return None                  # a single op doesn't fit → give up
+        cut = _finalize_sub(instrs, cur, members, i, out_buf)
+        if cut is None:
+            return None
+        subs.append(cut)
+        produced_here.add(cut[1])
+        cur = [m]
+        _, inputs = analyze(cur)
+        if (len(inputs) > maxin
+                or _region_slots(cur, instrs, inputs, out_buf) is None):
+            return None
+    if cur:
+        subs.append((cur, out_buf))
+    # a single sub covering everything is the no-split case (still valid).
+    return subs
+
+
+def _finalize_sub(instrs, sub: list[int], members: list[int], next_i: int,
+                  out_buf: int):
+    """Close a sub-region `sub` (a prefix of `members`, members[next_i:] remain).
+    Its output = the single member dst read by a later member or externally;
+    returns (sub, out_buf) or None if the live-out is not exactly one value."""
+    subset = set(sub)
+    later = set(members[next_i:])
+    live: set[int] = set()
+    for m in sub:
+        d = instrs[m].dst
+        # read by a member NOT in this sub (later member or the whole-region out)
+        read_later = any(d in _reads_of(instrs[o]) for o in later)
+        if read_later or d == out_buf:
+            live.add(d)
+    if len(live) != 1:
+        return None
+    return (sub, next(iter(live)))
+
+
+def _emit_region(ctx: _Ctx, members: list[int], out_buf: int) -> None:
+    """Encode one single-output sub-region into the aux pool + emit OP_MAP_REGION
+    at the output-producing member's index; NOP the rest. members: SSA order,
+    ≤REGION_MAXIN external inputs, fits the slot budget (guaranteed by
+    _split_region). Inputs ride task fields a,b,p2..p7 (region_inputs, ordered)."""
+    instrs = ctx.instrs
+    produced = {instrs[m].dst for m in members}
+    inputs: list[int] = []
+    seen: set[int] = set()
+    for m in members:
+        for b in _region_operands(instrs[m]):
+            if b not in produced and b not in seen:
+                seen.add(b)
+                inputs.append(b)
+    slot = _region_slots(members, instrs, inputs, out_buf)
+    assert slot is not None and len(inputs) <= _REGION_MAXIN
+
+    n = instrs[members[0]].n
+    # descriptor: [n_in, out_slot, n_micro, in_slot×n_in] + n_micro×6 words
+    #   + in_handle×n_in (buffer ids, for the tensor validator after re-parse;
+    #   the device/schedule-sim read the handles from the task's a,b,p2..p7).
+    desc = [len(inputs), slot[out_buf], len(members)]
+    desc += [slot[b] for b in inputs]
+    for m in members:
+        ins = instrs[m]
+        kind, arity = _REGION_KIND[ins.op]
+        a_slot = slot[ins.a]
+        if arity == "bin":
+            b_slot = slot[ins.b]
+            s_bits, t_bits = 0, 0
+        elif arity == "affine":
+            b_slot = a_slot
+            s_bits, t_bits = ins.imm, ins.imm2
+        else:                            # unary
+            b_slot = a_slot
+            s_bits, t_bits = 0, 0
+        desc += [kind, slot[ins.dst], a_slot, b_slot, s_bits, t_bits]
+    desc += list(inputs)                 # trailing input handles (validator a)
+    aux_off = ctx.add_aux(desc)
+
+    out_idx = max(m for m in members if instrs[m].dst == out_buf)
+    in0 = inputs[0]
+    b_field = inputs[1] if len(inputs) >= 2 else in0
+    for m in members:
+        instrs[m] = Instr(OP_NOP)
+    instrs[out_idx] = Instr(OP_MAP_REGION, dst=out_buf, a=in0, b=b_field, n=n,
+                            aux=aux_off, region_inputs=tuple(inputs))
 
 
 def _fuse_matmul_views(ctx: _Ctx) -> None:
@@ -1258,14 +2352,17 @@ def _fuse_matmul_views(ctx: _Ctx) -> None:
     changed = True
     while changed:
         changed = False
+        rmap = _reader_index(instrs)
         for gi, g in enumerate(instrs):
             if g.op != OP_GATHER_STRIDED or g.dst in outs:
                 continue
             if ctx.buffers[g.dst].dtype != DT_F32:
                 continue
             gbuf = g.dst
-            readers = [(j, ins) for j, ins in enumerate(instrs)
-                       if ins.op != OP_NOP and gbuf in _reads_of(ins)]
+            # rmap is built once per round; re-filter live (an earlier fold this
+            # round may have NOP'd/retargeted a listed reader).
+            readers = [(j, instrs[j]) for j in rmap.get(gbuf, ())
+                       if instrs[j].op != OP_NOP and gbuf in _reads_of(instrs[j])]
             if not readers:
                 continue
 
@@ -1300,15 +2397,361 @@ def _fuse_matmul_views(ctx: _Ctx) -> None:
 
 
 def _finalize_matmul_views(ctx: _Ctx) -> None:
-    """Mirror each folded DOT's (aview, bview) into a 2-word aux header and point
-    ins.aux at it, so the tensor-interpreter validator (which runs on the
-    re-parsed, serialized bytecode and cannot see the in-memory aview/bview) can
-    recover the views. The scheduler uses the in-memory fields directly; the
-    device uses the resulting task p4/p5."""
+    """Mirror each folded DOT's (aview, bview) AND its §33 R2c epilogue (epi
+    descriptor offset + residual buf) into a 4-word aux header, pointing ins.aux
+    at it, so the tensor-interpreter validator (which runs on the re-parsed,
+    serialized bytecode and cannot see the in-memory aview/bview/epi) can recover
+    them. The scheduler uses the in-memory fields directly (-> task p4/p5/p6/p7);
+    the device uses the resulting task fields. Runs AFTER _fuse_mma_epilogue so
+    the epilogue fields are settled."""
     for idx, ins in enumerate(ctx.instrs):
-        if ins.op == OP_DOT and (ins.aview or ins.bview):
-            hdr = ctx.add_aux([ins.aview, ins.bview])
+        if ins.op == OP_DOT and (ins.aview or ins.bview or ins.epi):
+            hdr = ctx.add_aux([ins.aview, ins.bview, ins.epi, ins.epi_res])
             ctx.instrs[idx] = dataclasses.replace(ins, aux=hdr)
+
+
+# --- §33 R2c: matmul-inclusive epilogue fusion --------------------------------
+#
+# A matmul computes its output TILE in registers/accumulators before the store
+# (ops/mma.cl vmo_mma_tile). Fold a following pure-map EW chain
+# (scale/bias/gelu/+residual) into that store so `matmul → {scale,gelu,+residual}`
+# collapses from ≥2 barrier phases into ONE. The micro-program rides in the aux
+# pool (task.p6) and the kernel runs the shared vmo_region_micro on each
+# accumulator value before storing. Attacks the §29/§32 phase-count wall at the
+# matmul boundary the §19/§26/§28 EW fusion never touched.
+
+# SUB_* opcodes the epilogue micro-program uses (MUST match vm_common.cl).
+_EPI_ADD, _EPI_AFFINE, _EPI_GELU = 0, 40, 41
+# src: 0 = unary on the accumulator; 1 = binary reading p7 per-element
+# (residual: p7[g*M*N + gr*N + gc]); 2 = binary reading p7 per-column (bias).
+_EPI_SELF, _EPI_ELEM, _EPI_COL = 0, 1, 2
+
+
+def _fuse_mma_epilogue(ctx: _Ctx, main_len: int) -> None:
+    """Fold each matmul's following pure-map EW chain into the matmul store
+    (§33 R2c). For every OP_DOT that will use TILE_MMA (skip the N==1 gemv route
+    and viewed-output cases), greedily walk the SINGLE consumer of the matmul
+    output while it is a fusible epilogue op with matching element count and is
+    not a program output:
+      OP_GELU            → gelu on the accumulator          (unary)
+      OP_AFFINE_F32      → x*s+t on the accumulator          (unary; QKᵀ scale)
+      OP_ADD_F32 + a full-size external `res` → +residual    (binary, one per DOT)
+    Stop at the first non-eligible/multi-consumer/second-binary/size-mismatch.
+    Retarget the DOT dst to the last folded op's dst, NOP the folded ops, encode
+    the micro-program into aux, set DOT.epi / epi_res / reads_hint. Gated HARD;
+    any mismatch leaves the decomposed chain untouched.  PJRT_OCL_FUSE_MMA_EPI=0
+    reverts. Runs after _fuse_norm/_fuse_gelu/_fuse_region (so GELU/scale are
+    already single ops) and before _reuse_arena."""
+    if os.environ.get("PJRT_OCL_FUSE_MMA_EPI", "1") == "0":
+        return
+    # §36 hybrid: the standalone TF32 kernel (mm_tc) has no store-epilogue path,
+    # so a matmul with a fused epilogue cannot be routed to it. When the hybrid
+    # is enabled we keep the big FFN/projection matmuls epilogue-free (the GELU/
+    # residual run as their own cheap VM phases) so they route to mm_tc — the
+    # 1.4x large-config win depends on it. One switch: MM_HYBRID implies this.
+    if os.environ.get("PJRT_OCL_MM_HYBRID", "0") not in ("", "0"):
+        return
+    instrs = ctx.instrs
+
+    def _elems(buf: int) -> int:
+        return ctx.buffers[buf].size_bytes // 4
+
+    # unique writer + total reader count per buffer (over live, non-NOP instrs).
+    writer: dict[int, int] = {}
+    multi: set[int] = set()
+    readers: dict[int, list[int]] = {}
+    for idx, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        d = ins.dst
+        if d in writer or d in multi:
+            writer.pop(d, None)
+            multi.add(d)
+        else:
+            writer[d] = idx
+        for b in _reads_of(ins):
+            readers.setdefault(b, []).append(idx)
+    outs = set(ctx.outputs)
+
+    for di, DOT in enumerate(instrs):
+        if DOT.op != OP_DOT:
+            continue
+        M, N = DOT.n, DOT.imm >> 16
+        G = max(1, DOT.imm2)
+        total = M * N * G
+        # N==1 routes to the segmented-reduce gemv path (no epilogue) — skip.
+        # A viewed OUTPUT never happens (dot writes contiguous); operand views
+        # (aview/bview) are fine and independent of the epilogue.
+        if N == 1 and G == 1:
+            continue
+
+        micros: list[tuple[int, int, int, int]] = []   # (kind, src, s, t)
+        consumed: list[int] = []
+        res_buf = 0
+        binary_used = False
+        cur = DOT.dst
+        last_dst = DOT.dst
+        while True:
+            live_rs = [j for j in readers.get(cur, [])
+                       if instrs[j].op != OP_NOP and j != di]
+            if len(live_rs) != 1 or cur in outs or cur in multi:
+                break
+            ci = live_rs[0]
+            c = instrs[ci]
+            if c.dst in multi or c.n != total:
+                break
+            if c.op == OP_GELU and c.a == cur:
+                micros.append((_EPI_GELU, _EPI_SELF, 0, 0))
+            elif c.op == OP_AFFINE_F32 and c.a == cur:
+                micros.append((_EPI_AFFINE, _EPI_SELF, c.imm, c.imm2))
+            elif (c.op == OP_ADD_F32 and not binary_used and not c.imm
+                  and not c.imm2 and (c.a == cur or c.b == cur)):
+                res = c.b if c.a == cur else c.a
+                # residual: a full-size external buffer, distinct from the fused
+                # output, single-writer (not a loop carry), read directly.
+                if res in (cur, c.dst) or res in multi or _elems(res) != total:
+                    break
+                # CRITICAL ordering gate: folding a binary makes the matmul DEPEND
+                # on `res`, but the matmul keeps its (early) position in the instr
+                # stream. `res` must therefore already be produced BEFORE the DOT
+                # (else the tensor interp / same-phase schedule read it stale).
+                # Program inputs (no writer) are available from the start. The
+                # transformer's residual x is always the earlier block input, so
+                # this holds; a `q+matmul` where q is computed later is rejected.
+                wr = writer.get(res)
+                if wr is not None and wr > di:
+                    break
+                micros.append((_EPI_ADD, _EPI_ELEM, 0, 0))
+                res_buf = res
+                binary_used = True
+            else:
+                break
+            consumed.append(ci)
+            last_dst = c.dst
+            cur = c.dst
+
+        if not micros:
+            continue
+        # encode: [n_micro] then n_micro × {kind, src, s_bits, t_bits}
+        desc = [len(micros)]
+        for kind, src, s, t in micros:
+            desc += [kind, src, s & 0xFFFFFFFF, t & 0xFFFFFFFF]
+        off = ctx.add_aux(desc)
+        for ci in consumed:
+            instrs[ci] = Instr(OP_NOP)
+        new_hint = tuple(DOT.reads_hint) + ((res_buf,) if res_buf else ())
+        instrs[di] = dataclasses.replace(
+            DOT, dst=last_dst, epi=off + 1, epi_res=res_buf,
+            reads_hint=new_hint)
+
+
+def _gather_is_identity(ctx: _Ctx, aux_off: int, n: int) -> bool:
+    """True iff the OP_GATHER_STRIDED descriptor at `aux_off` is a pure
+    contiguous reshape (element i ↦ i): src_off == 0 and in_strides equal the
+    row-major strides of out_dims, over exactly `n` elements. Such a gather can
+    be skipped in the flash-attention walk (it only re-labels axes)."""
+    aux = ctx.aux
+    if aux_off + 1 > len(aux):
+        return False
+    rank = aux[aux_off]
+    if rank <= 0 or aux_off + 1 + 2 * rank + 1 > len(aux):
+        return False
+    out_dims = [aux[aux_off + 1 + i] for i in range(rank)]
+    in_strides = [_as_i32(aux[aux_off + 1 + rank + i]) for i in range(rank)]
+    src_off = _as_i32(aux[aux_off + 1 + 2 * rank])
+    total = 1
+    for d in out_dims:
+        total *= d
+    if src_off != 0 or total != n:
+        return False
+    # element i ↦ i iff every axis with dim>1 carries its row-major stride
+    # (size-1 axes never contribute — their index is always 0 — so their stride
+    # is irrelevant; a leading size-1 axis is exactly why we can't require exact
+    # equality). src_off already checked to be 0.
+    acc, want = 1, [0] * rank
+    for i in range(rank - 1, -1, -1):
+        want[i] = acc
+        acc *= out_dims[i]
+    return all(out_dims[i] == 1 or in_strides[i] == want[i]
+               for i in range(rank))
+
+
+def _as_i32(u: int) -> int:
+    return u - (1 << 32) if u >= (1 << 31) else u
+
+
+def _epi_scale(ctx: _Ctx, epi: int):
+    """If a DOT epilogue (aux at epi-1) is EXACTLY one AFFINE(x·s + 0) with a
+    unary self source, return its scale s (float bits); else None (bail). Used to
+    recover the QKᵀ ×(hd**-0.5) that _fuse_mma_epilogue folded into the DOT."""
+    if not epi:
+        return 0  # no epilogue → scale contribution is identity (handled = 1.0)
+    aux = ctx.aux
+    off = epi - 1
+    if off < 0 or off + 1 > len(aux):
+        return None
+    nm = aux[off]
+    if nm != 1 or off + 1 + 4 > len(aux):
+        return None
+    kind, src, s_bits, t_bits = (aux[off + 1], aux[off + 2],
+                                 aux[off + 3], aux[off + 4])
+    if kind != _EPI_AFFINE or src != _EPI_SELF or _bits_to_f32(t_bits) != 0.0:
+        return None
+    return s_bits
+
+
+def _bits_to_f32(bits: int) -> float:
+    import numpy as np
+    return float(np.frombuffer(np.uint32(bits & 0xFFFFFFFF).tobytes(), "<f4")[0])
+
+
+def _fuse_attention(ctx: _Ctx, main_len: int) -> None:
+    """Recognize the batched per-head attention idiom  DOT(QKᵀ)[·scale] →
+    softmax(-1) → DOT(AV)  and collapse it into ONE OP_FLASH_ATTN (online
+    softmax), so the (T×C) score matrix never materializes and the two attention
+    matmuls + the softmax reduce fold from 3 barriered phases into 1 (§34).
+
+    Anchored on OP_SOFTMAX. Walks BACKWARD through an optional identity-reshape
+    gather and an optional scale-affine to reach DOT1 (the QKᵀ matmul, whose
+    ×scale may instead sit in its §33 epilogue), and FORWARD to the single
+    consumer DOT2 (the AV matmul). Q/K/V and their FOLDED views (aview/bview) are
+    carried verbatim into the fused op, which reads them through the SAME strided
+    descriptors the matmuls used — so the result is byte-addressed identically to
+    the decomposed path (decode: kv only; prefill: qv,kv,vv all fold).
+
+    Gated HARD on every shape relation + single-consumer linkage + hd ≤ 256
+    (local staging). Any mismatch leaves the decomposed DOT→softmax→DOT chain
+    untouched (never wrong, only sometimes-unfused).
+
+    DEFAULT OFF (`PJRT_OCL_FLASH=1` enables it): the scalar online-softmax kernel
+    is a MEASURED regression on this workload (§34) — it replaces two TF32
+    tensor-core matmuls with a scalar streaming kernel (prefill: up to 11× slower)
+    and, at decode T=1, runs only H workgroups (severe underutilization). Kept,
+    gated off, as the correct substrate for a future split-KV + tensor-core
+    version. Runs after _fuse_mma_epilogue/_dce_nops (so the scale is a single
+    epilogue or a single affine and softmax is one op) and before
+    _finalize_matmul_views / _reuse_arena (so liveness sees the fused Q/K/V reads)."""
+    if os.environ.get("PJRT_OCL_FLASH", "0") != "1":
+        return
+    instrs = ctx.instrs
+    outs = set(ctx.outputs)
+    _HD_MAX = 256
+
+    def _elems(buf: int) -> int:
+        return ctx.buffers[buf].size_bytes // 4
+
+    # unique-writer + live-reader maps (over non-NOP instrs).
+    writer: dict[int, int] = {}
+    multi: set[int] = set()
+    readers: dict[int, list[int]] = {}
+    for idx, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        d = ins.dst
+        if d in writer or d in multi:
+            writer.pop(d, None)
+            multi.add(d)
+        else:
+            writer[d] = idx
+        for b in _reads_of(ins):
+            readers.setdefault(b, []).append(idx)
+
+    def live_readers(buf: int) -> list[int]:
+        return [j for j in readers.get(buf, []) if instrs[j].op != OP_NOP]
+
+    import numpy as np
+
+    for si, SM in enumerate(instrs):
+        if SM.op != OP_SOFTMAX:
+            continue
+        C = SM.imm            # softmax segment length (= attention key count)
+        n_out = SM.n          # G*M
+        if C <= 0 or C > 0xFFFF:
+            continue
+
+        # --- backward: softmax.a → [reshape] → [affine·scale] → DOT1 -----------
+        walked_scale = np.float32(1.0)
+        consumed_mid: list[int] = []
+        cur = SM.a
+        DOT1i = None
+        for _ in range(4):
+            if cur in outs or cur in multi:
+                break
+            w = writer.get(cur)
+            if w is None:
+                break
+            P = instrs[w]
+            # the producer must be single-consumer (only the chain reads it) so
+            # NOP'ing it later is safe.
+            if len(live_readers(cur)) != 1:
+                break
+            if P.op == OP_DOT:
+                DOT1i = w
+                break
+            if (P.op == OP_AFFINE_F32 and P.a == P.b and not P.imm2 and
+                    _elems(P.dst) == _elems(P.a)):
+                walked_scale = walked_scale * np.float32(_bits_to_f32(P.imm))
+                consumed_mid.append(w)
+                cur = P.a
+                continue
+            if (P.op == OP_GATHER_STRIDED and _elems(P.dst) == _elems(P.a) and
+                    _gather_is_identity(ctx, P.aux, _elems(P.dst))):
+                consumed_mid.append(w)
+                cur = P.a
+                continue
+            break
+        if DOT1i is None:
+            continue
+        DOT1 = instrs[DOT1i]
+        if len(live_readers(DOT1.dst)) != 1:      # its only reader is the chain
+            continue
+
+        G = max(1, DOT1.imm2)
+        M = DOT1.n
+        N1 = DOT1.imm >> 16
+        hd = DOT1.imm & 0xFFFF
+        if N1 != C or n_out != G * M or hd <= 0 or hd > _HD_MAX:
+            continue
+        epi_s = _epi_scale(ctx, DOT1.epi)
+        if epi_s is None:                          # epilogue present but not a pure scale
+            continue
+        scale = walked_scale
+        if DOT1.epi:
+            scale = scale * np.float32(_bits_to_f32(epi_s))
+
+        # --- forward: softmax.dst → DOT2 (AV) ---------------------------------
+        fwd = live_readers(SM.dst)
+        if SM.dst in outs or len(fwd) != 1:
+            continue
+        DOT2i = fwd[0]
+        DOT2 = instrs[DOT2i]
+        if (DOT2.op != OP_DOT or DOT2.a != SM.dst or DOT2.aview != 0
+                or DOT2.epi != 0):
+            continue
+        G2 = max(1, DOT2.imm2)
+        M2 = DOT2.n
+        N2 = DOT2.imm >> 16
+        K2 = DOT2.imm & 0xFFFF
+        if G2 != G or M2 != M or K2 != C or N2 != hd:
+            continue
+
+        Q, qv = DOT1.a, DOT1.aview
+        K, kv = DOT1.b, DOT1.bview
+        V, vv = DOT2.b, DOT2.bview
+        out = DOT2.dst
+        # sanity: the fused op reads Q/K/V/out with the sizes the matmuls used.
+        if (_elems(out) != G * M * hd or _elems(Q) < G * M * hd):
+            continue
+
+        hdr = ctx.add_aux([G, M, C, hd, int(np.float32(scale).view(np.uint32)),
+                           0, qv, kv, vv])   # causal = 0 (idiom has no mask)
+        for j in consumed_mid + [DOT1i, si]:
+            instrs[j] = Instr(OP_NOP)
+        # emit the fused op in DOT2's slot (after Q/K/V are produced; its output
+        # buffer + downstream consumers are unchanged).
+        instrs[DOT2i] = Instr(OP_FLASH_ATTN, dst=out, a=Q, b=K,
+                              n=G, imm=M, imm2=V, aux=hdr,
+                              reads_hint=(V,))
 
 
 def _reuse_arena(ctx: _Ctx, main_len: int) -> None:
@@ -1381,9 +2824,9 @@ def _reuse_arena(ctx: _Ctx, main_len: int) -> None:
             region_ops.append((payload, ph))
 
     def _subranges(ins: Instr) -> list[int]:
-        if ins.op == OP_WHILE:
-            return (list(range(ins.a, ins.a + ins.b))       # cond sub-list
-                    + list(range(ins.n, ins.n + ins.imm)))  # body sub-list
+        if ins.op in (OP_WHILE, OP_IF):
+            return (list(range(ins.a, ins.a + ins.b))       # cond / then sub-list
+                    + list(range(ins.n, ins.n + ins.imm)))  # body / else sub-list
         if ins.op == OP_FOR:
             return list(range(ins.n, ins.n + ins.imm))      # body sub-list
         return []
@@ -1500,15 +2943,36 @@ def lower_module(module) -> VMProgram:
         ctx.inputs.append(buf)
         ctx.input_shapes.append(shape)
 
+    _TP = os.environ.get("PJRT_OCL_TIME_PASSES")
+    if _TP:
+        import sys as _sys, time as _time
+        _t = [_time.time()]
+
+        def _tick(name):
+            now = _time.time()
+            print(f"[time] {name}: {now - _t[0]:.2f}s "
+                  f"(instrs={len(ctx.instrs)} bufs={len(ctx.buffers)})",
+                  file=_sys.stderr, flush=True)
+            _t[0] = now
+    else:
+        def _tick(name):
+            pass
+
     for op in entry_block.operations:
         _lower_op(ctx, op.operation)
+    _tick("root-lower")
 
     # The root list is exactly the entry-block lowering; region sub-lists
     # (cond/body of every while, nested included) are appended after it so the
     # root walk [0, main_len) never enters a sub-range (docs/vmprogram.md).
     main_len = len(ctx.instrs)
     while ctx.region_queue:
-        _lower_while_regions(ctx, ctx.region_queue.pop(0))
+        job = ctx.region_queue.pop(0)
+        if isinstance(job, _IfJob):
+            _lower_if_regions(ctx, job)
+        else:
+            _lower_while_regions(ctx, job)
+    _tick("region-lower")
 
     # perf peepholes (index-stable, NOP-substituting): collapse scale/bias chains
     # into one in-place affine pass, fold shape ops (broadcast/transpose/slice)
@@ -1517,16 +2981,58 @@ def lower_module(module) -> VMProgram:
     # EITHER a dot or EW readers (disjoint by _fuse_views' viewable-EW gate), so
     # order only matters for a gather read by both — those don't fold either way.
     _compose_affines(ctx)
+    _tick("compose_affines")
     _fuse_matmul_views(ctx)
+    _tick("fuse_matmul_views")
     _fuse_views(ctx)
-    _finalize_matmul_views(ctx)
+    _tick("fuse_views")
     _dce_nops(ctx)
+    _tick("dce_nops")
+
+    # Recognize softmax/layernorm reduce→broadcast idioms and collapse each into
+    # one fused local-memory op (§19), then DCE the now-dead intermediates. Runs
+    # on the cleaned stream (after view-fold/affine-compose/DCE) so the idiom is
+    # in its canonical form; before _reuse_arena so liveness sees the fused op.
+    _fuse_norm(ctx)
+    _tick("fuse_norm")
+    _fuse_gelu(ctx)
+    _tick("fuse_gelu")
+    # General register-resident map-region fusion (§23/§27/§28): collapse the
+    # remaining pure-map EW chains (bounded by the dedicated fused ops above and
+    # all cross-lane ops) into one OP_MAP_REGION each — K phases → 1. Runs last
+    # so softmax/layernorm/gelu are already single ops (= region boundaries).
+    _fuse_region(ctx, main_len)
+    _tick("fuse_region")
+    # DCE first so the dead gelu/norm backbones (_fuse_gelu leaves them for later
+    # DCE) are gone — the epilogue recognizer's single-consumer test must see the
+    # matmul output's ONLY live reader (the fused GELU/affine/residual op).
+    _dce_nops(ctx)
+    # §33 R2c: fold post-matmul map chains (scale/gelu/+residual) into the DOT
+    # store-epilogue, collapsing the matmul→EW barrier boundary. Runs after the
+    # EW/norm/gelu fusions so those are single ops = epilogue candidates, and
+    # before _reuse_arena so liveness sees the retargeted DOT + residual read.
+    _fuse_mma_epilogue(ctx, main_len)
+    _tick("fuse_mma_epilogue")
+    _dce_nops(ctx)
+    # §34 flash-attention: collapse DOT(QKᵀ)·scale → softmax → DOT(AV) into ONE
+    # online-softmax op (no materialized score matrix). Runs after the epilogue
+    # fold (so QKᵀ's ×scale is a single epilogue/affine and softmax is one op)
+    # and before _finalize_matmul_views/_reuse_arena. Reads Q/K/V through the
+    # DOTs' own folded views, so it must see aview/bview BEFORE they are consumed.
+    _fuse_attention(ctx, main_len)
+    _tick("fuse_attention")
+    _dce_nops(ctx)
+    # Mirror DOT views + epilogue into the serialized aux header now that both
+    # are settled, so the reparsed tensor validator can recover them.
+    _finalize_matmul_views(ctx)
+    _tick("finalize_matmul_views")
 
     # Liveness-reuse: rewrite arena offsets so the arena is bounded by peak
     # concurrent liveness, not the sum of every intermediate (§16). Runs AFTER
     # fusion/DCE (they NOP out buffers) and BEFORE the cap check (the backstop).
     _bump_arena = ctx._arena
     _reuse_arena(ctx, main_len)
+    _tick("reuse_arena")
     if os.environ.get("PJRT_OCL_ARENA_DEBUG"):
         import sys
         print(f"[pjrt_ocl arena] bump={_bump_arena} "
@@ -1557,12 +3063,39 @@ def lower_module(module) -> VMProgram:
     )
 
 
+def _register_optional_dialects(context) -> None:
+    """Register dialects that ride along in a portable artifact as no-ops on a
+    single device but whose ops the deserializer must still be able to parse.
+
+    Shardy ('sdy') is the one that matters in practice: any sharded JAX program
+    (jax.jit under a mesh, shard_map, with_sharding_constraint) serializes its
+    sharding hints as sdy ops (sdy.sharding_constraint / mesh / manual_computation)
+    into the VHLO artifact. On our single OpenCL device these are identity — but
+    without the dialect registered, deserialize_portable_artifact aborts with
+    "dialect 'sdy' is unknown" before we ever see the compute. brax/MuJoCo-MJX
+    hit exactly this. Register the dialect if jaxlib ships its bindings (it does
+    since the Shardy migration); the later stablehlo walk skips sdy ops via the
+    handlers in pjrt_ocl.ops (they carry no tensor result we consume)."""
+    try:
+        from jaxlib.mlir._mlir_libs import _sdy
+    except Exception:  # noqa: BLE001 — older jaxlib without Shardy: nothing to do
+        return
+    try:
+        _sdy.register_dialect(context, load=True)
+    except Exception:  # noqa: BLE001 — best-effort; deserialize reports if needed
+        pass
+
+
 def deserialize_artifact(artifact: bytes):
     """VHLO portable artifact bytes -> stablehlo ir.Module (auto-upgraded)."""
     from jaxlib.mlir import ir
     from jaxlib.mlir.dialects import stablehlo
-    # No explicit dialect registration needed (poc/03 NOTES #5).
-    return stablehlo.deserialize_portable_artifact(ir.Context(), artifact)
+    # No explicit dialect registration needed for stablehlo (poc/03 NOTES #5);
+    # sdy (and any other sharding dialects) must be registered up front so the
+    # portable-artifact deserializer can parse their ops (identity on one device).
+    context = ir.Context()
+    _register_optional_dialects(context)
+    return stablehlo.deserialize_portable_artifact(context, artifact)
 
 
 def lower_artifact(artifact: bytes) -> VMProgram:

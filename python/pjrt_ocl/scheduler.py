@@ -33,8 +33,16 @@ from . import opsem
 
 # --- tile-op vocabulary + sentinels (docs/vmprogram.md v2.1 table) ----------
 
-TILE_SIZE = 16384          # EW tile size (TS)
-MMA_T = 64                 # MMA output tile edge (vm2.cl MMA_TM/MMA_TN)
+# EW tile size (TS). The plugin bakes the device-tuned value into the kernels
+# (-DEW_TS, runtime.cc) and advertises it here via env; both sides must agree
+# on the tile -> element-range mapping. Standalone imports (unit tests) get
+# the CPU/default 16384.
+TILE_SIZE = int(os.environ.get("PJRT_OCL_EW_TS", "16384") or "16384")
+# MMA output tile edge (must equal the kernel's MMA_TM/MMA_TN). Default 64; the
+# runtime advertises 128 via PJRT_OCL_MMA_T when the TF32 megakernel is built
+# with -DVMO_MEGA_BIGTILE (§31 go-to-188). Tile counts (Task.n_tiles) MUST match
+# the kernel's tile->(tr,tc) mapping, so the two sides read the same value.
+MMA_T = int(os.environ.get("PJRT_OCL_MMA_T", "64") or "64")
 
 TILE_EW = 0
 TILE_MMA = 1
@@ -47,6 +55,20 @@ TILE_DYN_GATHER = 7   # dynamic_slice: gather with a runtime base offset
 TILE_DYN_SCATTER = 8  # dynamic_update_slice: scatter with a runtime base offset
 TILE_RED_WINDOW = 9   # windowed reduction (pooling)
 TILE_RED_SEG = 10     # segmented reduce: out[o] = reduce(in[o*seg : (o+1)*seg])
+TILE_SOFTMAX_SEG = 11    # fused softmax over the innermost seg elems (§19)
+TILE_LAYERNORM_SEG = 12  # fused layernorm core over the innermost seg elems (§19)
+TILE_MAP_REGION = 13     # §27/§28 register-resident fused map-region (one phase)
+TILE_FLASH_ATTN = 14     # §34 fused flash-attention (online softmax; one WG per head,query)
+TILE_RED_STRIDED = 15    # partial-axis reduce over interior/prefix axis block:
+                         # out[o*inner+i]=reduce_r in[(o*red+r)*inner+i] (p0=n_out,
+                         # p1=red, p2=inner, p3=kind); EW-style output tiling
+TILE_GATHER_INDEX = 16   # §38 general data-dependent gather (16: 15 = TILE_RED_STRIDED)
+TILE_CONV = 17           # §39 direct N-D convolution (NHWC input / HWIO kernel):
+                         # out[b,osp,oc]=sum_{win,ic} in[b,isp,ic]*w[win,ic,oc].
+                         # a=input b=weights p0=aux word-offset p1=n_out; EW-style tiling
+TILE_SCATTER_INDEX = 18  # §42 general data-dependent scatter (18: 17 = TILE_CONV):
+                         # iterate UPDATE elems; each combines into operand result
+                         # via window coords + runtime scatter_indices (kind in aux)
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -72,14 +94,14 @@ _TENSOR_TO_EW = {
 }
 
 # region ops: scheduled recursively into per-lane control entries + sub-streams
-_REGION_OPS = {L.OP_WHILE, L.OP_FOR}
+_REGION_OPS = {L.OP_WHILE, L.OP_FOR, L.OP_IF}
 
 SCHED_HDR_STRUCT = struct.Struct("<IIII")      # n_tasks,n_entries,n_flags,n_lanes
-TASK_STRUCT = struct.Struct("<IIIIIIIIII")     # 40B (p4/p5 = MMA view offsets)
+TASK_STRUCT = struct.Struct("<IIIIIIIIIIII")   # 48B (p4/p5 view, p6/p7 §33 epi)
 LANETAB_STRUCT = struct.Struct("<IIII")        # 16B: off, count, root_len, pad
 ENTRY_STRUCT = struct.Struct("<IIIIIIII")      # 32B
 assert SCHED_HDR_STRUCT.size == 16
-assert TASK_STRUCT.size == 40
+assert TASK_STRUCT.size == 48
 assert LANETAB_STRUCT.size == 16
 assert ENTRY_STRUCT.size == 32
 
@@ -95,9 +117,11 @@ _COST_KEYS = {
     TILE_EW: "ew_tile_us",
     TILE_MMA: "mma_tile_us",
     TILE_GATHER: "gather_tile_us",
+    TILE_GATHER_INDEX: "gather_tile_us",
     TILE_REDUCE_PART: "reduce_tile_us",
     TILE_REDUCE_COMB: "reduce_tile_us",
     TILE_IOTA_DIM: "ew_tile_us",
+    TILE_SCATTER_INDEX: "gather_tile_us",
 }
 
 
@@ -146,13 +170,19 @@ class Task:
     p3: int = 0
     p4: int = 0           # MMA operand-a VIEW aux-offset (+1; 0 = contiguous)
     p5: int = 0           # MMA operand-b VIEW aux-offset (+1; 0 = contiguous)
+    p6: int = 0           # §33 R2c: matmul epilogue descriptor aux-offset (+1; 0=none)
+    p7: int = 0           # §33 R2c: epilogue second-input (residual/bias) buffer id
     dtype: int = 0        # DT_* result dtype (how the VM writes the output)
     adtype: int = 0       # DT_* operand dtype (compare/convert differ from dtype)
 
     def n_tiles(self) -> int:
         if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM, TILE_SCATTER,
-                             TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW):
+                             TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW,
+                             TILE_MAP_REGION, TILE_GATHER_INDEX, TILE_CONV,
+                             TILE_SCATTER_INDEX):
             return max(1, math.ceil(self.p1 / TILE_SIZE))
+        if self.tile_op == TILE_RED_STRIDED:
+            return max(1, math.ceil(self.p0 / TILE_SIZE))   # p0 = n_out, EW-style
         if self.tile_op == TILE_MMA:
             return (math.ceil(self.p0 / MMA_T) * math.ceil(self.p1 / MMA_T)
                     * max(1, self.p3))          # p3 = batch count
@@ -160,8 +190,10 @@ class Task:
             return max(1, math.ceil(self.p0 / self.p1)) if self.p1 else 1
         if self.tile_op == TILE_REDUCE_COMB:
             return 1
-        if self.tile_op == TILE_RED_SEG:      # ONE segment per tile (p0 = n_out)
-            return max(1, self.p0)
+        if self.tile_op in (TILE_RED_SEG, TILE_SOFTMAX_SEG, TILE_LAYERNORM_SEG):
+            return max(1, self.p0)            # ONE segment per tile (p0 = n_out)
+        if self.tile_op == TILE_FLASH_ATTN:
+            return max(1, self.p1 * self.p2)  # ONE workgroup per (head, query row)
         raise ScheduleError(f"n_tiles: unknown tile_op {self.tile_op}")
 
 
@@ -206,7 +238,7 @@ class Schedule:
         for t in self.tasks:
             out += TASK_STRUCT.pack(
             t.tile_op | (t.dtype << 8) | (t.adtype << 16), t.dst, t.a, t.b,
-            t.p0, t.p1, t.p2, t.p3, t.p4, t.p5)
+            t.p0, t.p1, t.p2, t.p3, t.p4, t.p5, t.p6, t.p7)
         for off, count, root_len in lane_tab:
             out += LANETAB_STRUCT.pack(off, count, root_len, 0)
         for e in flat:
@@ -372,11 +404,15 @@ def _pack_units(units: list[tuple[list[int], int, float]], n_lanes: int
 
 @dataclasses.dataclass
 class _WhileJob:
-    """A deferred region-scheduling job for one WHILE instruction: the per-lane
-    WHILE Entry objects to patch, plus the cond/body instruction index lists."""
+    """A deferred region-scheduling job for one region instruction: the per-lane
+    control Entry objects to patch, plus its two instruction index sub-lists.
+    WHILE: cond_indices = cond range, body_indices = body range.
+    FOR:   cond_indices empty, body_indices = body range.
+    IF:    cond_indices = THEN range, body_indices = ELSE range (`op` = OP_IF)."""
     while_entries: list          # one Entry per lane (patched after scheduling)
     cond_indices: list
     body_indices: list
+    op: int = L.OP_WHILE
 
 
 class _Scheduler:
@@ -412,7 +448,16 @@ class _Scheduler:
     def _is_map(self, i: int) -> bool:
         """Elementwise (map-type): output tile T reads only input tile T, so it
         chains on a lane. Everything that reshuffles tiles across lanes
-        (matmul/reduce/gather/scatter/broadcast/…) is a non-map TILE op."""
+        (matmul/reduce/gather/scatter/broadcast/…) is a non-map TILE op.
+
+        TILE_MAP_REGION is deliberately NOT map here even though it is element-
+        aligned: a region reads/writes in float4 units (thread lid owns float4
+        lid) while a VIEWED EW op (broadcast operand) runs the SCALAR path
+        (thread lid owns scalar lid). Chaining the two lane-local (no fence
+        between entries) would make one thread read another thread's data — a
+        race. Keeping regions on their own barrier phase avoids the mismatch;
+        the fusion win comes from op-count collapse, not from lane-local
+        chaining."""
         return self.tasks[self._task_for(i)].tile_op == TILE_EW
 
     def _build_levels(self, indices: list[int]):
@@ -516,34 +561,63 @@ class _Scheduler:
 
     def _emit_while(self, idx: int) -> None:
         ins = self.prog.instrs[idx]
-        is_for = ins.op == L.OP_FOR
+        op = ins.op
         while_entries = []
         for lane in range(self.n_lanes):
             # WHILE: tile_lo/tile_hi (cond range) + wait_flag/wait_count (body
             # range) are patched once the sub-lists are scheduled; signal_flag
             # carries the cond BUFFER id (executor patches to a byte offset at
             # load). FOR: body range in tile_lo/tile_hi (patched), trip count
-            # in wait_flag, no cond buffer.
-            if is_for:
+            # in wait_flag, no cond buffer. IF: tile_lo/tile_hi (then range) +
+            # wait_flag/wait_count (else range) patched later; signal_flag =
+            # branch-flag buffer id (the device reads it, picks then/else).
+            if op == L.OP_FOR:
                 e = Entry(TASK_FOR, tile_lo=0, tile_hi=0, wait_flag=ins.b,
                           wait_count=0, signal_flag=FLAG_NONE)
+            elif op == L.OP_IF:
+                e = Entry(TASK_IF, tile_lo=0, tile_hi=0, wait_flag=0,
+                          wait_count=0, signal_flag=ins.dst)
             else:
                 e = Entry(TASK_WHILE, tile_lo=0, tile_hi=0, wait_flag=0,
                           wait_count=0, signal_flag=ins.dst)
             self.lanes[lane].append(e)
             while_entries.append(e)
-        self.region_queue.append(_WhileJob(
-            while_entries,
-            [] if is_for else list(range(ins.a, ins.a + ins.b)),  # cond range
-            list(range(ins.n, ins.n + ins.imm))))     # body instr range
+        if op == L.OP_IF:
+            self.region_queue.append(_WhileJob(
+                while_entries,
+                list(range(ins.a, ins.a + ins.b)),        # then range
+                list(range(ins.n, ins.n + ins.imm)),      # else range
+                op=L.OP_IF))
+        else:
+            self.region_queue.append(_WhileJob(
+                while_entries,
+                [] if op == L.OP_FOR else list(range(ins.a, ins.a + ins.b)),
+                list(range(ins.n, ins.n + ins.imm)),      # body instr range
+                op=op))
 
     def schedule_region(self, job: _WhileJob) -> None:
-        """Schedule one while's cond then body sub-lists contiguously into every
-        lane, then patch each lane's WHILE entry with its own (per-lane) cond/
-        body entry ranges (a FOR entry has no cond range: body goes in
-        tile_lo/tile_hi, its trip count is already in wait_flag). Nested whiles
-        enqueue further jobs (drained later, so their sub-ranges land beyond
-        this body)."""
+        """Schedule one region's two sub-lists contiguously into every lane,
+        then patch each lane's control entry with its own (per-lane) entry
+        ranges. WHILE: cond range in tile_lo/tile_hi, body in wait_flag/
+        wait_count. FOR: body in tile_lo/tile_hi (trip already in wait_flag).
+        IF: then range in tile_lo/tile_hi, else in wait_flag/wait_count (only
+        the selected branch executes; a branch pops back with no closing
+        barrier — the parent's level-separator barrier syncs it). Nested
+        regions enqueue further jobs (drained later, sub-ranges land beyond
+        this one)."""
+        if job.op == L.OP_IF:
+            then_start = [len(l) for l in self.lanes]
+            self.schedule_range(job.cond_indices, trailing_barrier=False)
+            else_start = [len(l) for l in self.lanes]
+            self.schedule_range(job.body_indices, trailing_barrier=False)
+            else_end = [len(l) for l in self.lanes]
+            for lane in range(self.n_lanes):
+                e = job.while_entries[lane]
+                e.tile_lo = then_start[lane]
+                e.tile_hi = else_start[lane] - then_start[lane]   # then_len
+                e.wait_flag = else_start[lane]
+                e.wait_count = else_end[lane] - else_start[lane]  # else_len
+            return
         cond_start = [len(l) for l in self.lanes]
         self.schedule_range(job.cond_indices, trailing_barrier=False)
         body_start = [len(l) for l in self.lanes]

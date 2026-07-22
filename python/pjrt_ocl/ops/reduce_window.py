@@ -105,9 +105,15 @@ def _reduce_window(ctx, op):
     if len(op.operands) != 2 or len(op.results) != 1:
         raise L.LoweringError(
             "reduce_window: only single-input reductions are supported")
+    from jaxlib.mlir import ir
     in_shape, in_n, in_dt = L.tensor_info(op.operands[0].type)
     out_shape, out_n, _ = L.tensor_info(op.results[0].type)
     rank = len(in_shape)
+    # recover unsignedness (signless i32 collapses to DT_I32) so windowed
+    # max/min use UNSIGNED compare + the 0 / UINT_MAX identities (reduce.cl).
+    et = ir.ShapedType(op.operands[0].type).element_type
+    if isinstance(et, ir.IntegerType) and et.is_unsigned and et.width == 32:
+        in_dt = L.DT_U32
     if in_dt not in (L.DT_F32, L.DT_I32, L.DT_U32):
         raise L.LoweringError(
             f"reduce_window: element dtype {in_dt} unsupported (f32/i32 only)")

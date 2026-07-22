@@ -9,9 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from oputil import check, to_artifact
-from pjrt_ocl import scheduler
-from pjrt_ocl.lowering import LoweringError
+from oputil import check
 
 RNG = np.random.default_rng(11)
 
@@ -90,9 +88,18 @@ def test_batched_dot_supported():
           arr(3, 5, 6))
 
 
-def test_noncanonical_contract_rejected():
-    # contracting a NON-last lhs axis needs an operand transpose first.
-    art = to_artifact(lambda a, b: jnp.tensordot(a, b, axes=([0], [0])),
-                      arr(4, 3), arr(4, 5))
-    with pytest.raises(LoweringError):
-        scheduler.lower_and_schedule(art)
+def test_noncanonical_contract_via_transpose():
+    # contracting a NON-last lhs axis (and non-first rhs axis) canonicalizes
+    # each operand with a transpose GATHER, then runs the plain matmul.
+    check(lambda a, b: jnp.tensordot(a, b, axes=([0], [0])),
+          arr(4, 3), arr(4, 5))
+
+
+def test_batched_transposed_rhs():
+    # A @ Bᵀ per batch: contracting_dims=[1]x[2] (the brax-step layout).
+    check(lambda a, b: jnp.einsum("bk,bnk->bn", a, b), arr(2, 3), arr(2, 5, 3))
+
+
+def test_lhs_transposed_matmul():
+    # contract lhs axis 0 (Aᵀ @ B): rhs canonical, lhs needs a transpose.
+    check(lambda a, b: jnp.einsum("km,kn->mn", a, b), arr(4, 3), arr(4, 5))

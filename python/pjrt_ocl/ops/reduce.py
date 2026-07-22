@@ -32,7 +32,7 @@ and the scheduler drops a global BARRIER between them automatically — the
 part-phase completes on every lane before any lane starts the comb-phase.
 
 Both instructions share opcode OP_REDUCE (26); the phase + kind ride in
-``Instr.imm`` (``imm = (phase << 2) | kind``) so the phase-free scheduler
+``Instr.imm`` (``imm = (phase << 3) | kind``) so the phase-free scheduler
 mapper, the tensor interp and the tile simulators can all recover them from the
 instruction alone. ``chunk`` is NOT transported: it is a deterministic function
 of ``n`` (``_chunk_for``) recomputed identically by every consumer, so the
@@ -46,12 +46,16 @@ import math
 from .. import lowering as L
 from .. import opsem
 from ..scheduler import (Task, TILE_REDUCE_PART, TILE_REDUCE_COMB, TILE_RED_SEG,
+                         TILE_RED_STRIDED, TILE_SOFTMAX_SEG, TILE_LAYERNORM_SEG,
                          TILE_SIZE)
 
-# reduction kinds (docs/vmprogram.md v2.1 REDUCE table)
-SUM, MAX, MIN, PROD = 0, 1, 2, 3
+# reduction kinds (docs/vmprogram.md v2.1 REDUCE table). Kinds 0..3 are the
+# f32-capable reducers; 4..6 are the bitwise reducers (int/bool only), from
+# stablehlo.and/or/xor (jp.all / jp.any). The kernel's vmo_ired_* table mirrors
+# these exactly.
+SUM, MAX, MIN, PROD, AND, OR, XOR = 0, 1, 2, 3, 4, 5, 6
 
-# imm phase tag (low 2 bits carry kind, bit 2 carries phase)
+# imm phase tag (low 3 bits carry kind 0..6, bit 3 carries phase)
 PHASE_PART = 0
 PHASE_COMB = 1
 
@@ -60,10 +64,17 @@ _KIND_BY_REGION_OP = {
     "stablehlo.maximum": MAX,
     "stablehlo.minimum": MIN,
     "stablehlo.multiply": PROD,
+    "stablehlo.and": AND,
+    "stablehlo.or": OR,
+    "stablehlo.xor": XOR,
 }
 
+# bitwise reducers are valid for integer/bool operands only (never f32).
+_BITWISE_KINDS = frozenset({AND, OR, XOR})
+
 # integer dtypes whose reduce uses integer accumulation + iinfo identities
-# (matches reduce.cl's i32/u32 path). bool/f-types use the float path.
+# (matches reduce.cl's i32/u32 path). bool is 1-byte-stored but rides the same
+# integer kernel path (uchar load, result masked to 0/1); f-types use float.
 _INT_DTYPES = frozenset({L.DT_I32, L.DT_U32, L.DT_I64})
 
 
@@ -81,11 +92,11 @@ def _n_parts(n: int) -> int:
 
 
 def _encode_imm(phase: int, kind: int) -> int:
-    return (phase << 2) | kind
+    return (phase << 3) | kind
 
 
 def _decode_imm(imm: int) -> tuple[int, int]:
-    return (imm >> 2) & 1, imm & 3
+    return (imm >> 3) & 1, imm & 7
 
 
 # --- stablehlo handler ------------------------------------------------------
@@ -102,7 +113,7 @@ def _read_scalar_const(value, dt: int):
             "reduce: init value is not a compile-time constant "
             "(cannot verify it is the reduction identity)")
     attr = op.attributes["value"]
-    if dt in _INT_DTYPES:
+    if dt in _INT_DTYPES or dt == L.DT_BOOL:
         vals = np.asarray(ir.DenseIntElementsAttr(attr)).reshape(-1)
     else:
         vals = np.asarray(ir.DenseFPElementsAttr(attr)).reshape(-1)
@@ -112,14 +123,32 @@ def _read_scalar_const(value, dt: int):
 
 
 def _assert_identity(kind: int, init, dt: int) -> None:
-    if dt in _INT_DTYPES:
+    if dt == L.DT_BOOL:
+        b = bool(init)
+        # and: identity True; or/xor: identity False. (max<->or, min<->and on
+        # 0/1, but jax only emits and/or/xor reducers over bool.)
+        ok = ((kind == AND and b is True) or
+              (kind == OR and b is False) or
+              (kind == XOR and b is False) or
+              (kind == MIN and b is True) or
+              (kind == MAX and b is False))
+    elif dt in _INT_DTYPES:
         import numpy as np
         info = np.iinfo(L.DTYPE_NUMPY[dt])
+        # and-identity is all-ones: -1 signed, info.max (UINT_MAX) unsigned.
+        allones = info.max if dt == L.DT_U32 else -1
         ok = ((kind == SUM and init == 0) or
               (kind == PROD and init == 1) or
               (kind == MAX and init == info.min) or
-              (kind == MIN and init == info.max))
+              (kind == MIN and init == info.max) or
+              (kind == AND and init == allones) or
+              (kind == OR and init == 0) or
+              (kind == XOR and init == 0))
     else:
+        if kind in _BITWISE_KINDS:
+            raise L.LoweringError(
+                f"reduce: bitwise reducer kind {kind} is not valid for a "
+                "floating-point operand")
         ok = ((kind == SUM and init == 0.0) or
               (kind == PROD and init == 1.0) or
               (kind == MAX and math.isinf(init) and init < 0) or
@@ -140,6 +169,13 @@ def _reduce(ctx, op):
 
     in_shape, n_in, in_dt = L.tensor_info(op.operands[0].type)
     in_rank = len(in_shape)
+    # `_elem_dtype` collapses signless/unsigned i32 to DT_I32 (unsigned is
+    # normally distinguished per-op, e.g. compare_type). Reductions need the
+    # signedness for max/min (UNSIGNED compare) and identities (max->0,
+    # min->UINT_MAX), so recover it from the operand type and route to DT_U32.
+    et = ir.ShapedType(op.operands[0].type).element_type
+    if isinstance(et, ir.IntegerType) and et.is_unsigned and et.width == 32:
+        in_dt = L.DT_U32
     dims = sorted(int(x) for x in ir.DenseI64ArrayAttr(op.attributes["dimensions"]))
 
     # classify the reduction kind from the single compute op in the region body
@@ -158,24 +194,41 @@ def _reduce(ctx, op):
 
     in_buf = ctx.buf_for(op.operands[0])
 
-    # Partial reduction over a CONTIGUOUS INNERMOST suffix of axes (softmax /
-    # layernorm reduce the last axis): output element o = reduce of the seg
-    # contiguous inputs at [o*seg, (o+1)*seg). One TILE_RED_SEG task, tiled over
-    # the n_out outputs. Non-suffix axis sets still need a permuting transpose
-    # first (deferred).
+    # Partial reduction over a CONTIGUOUS axis block [k, k+m). Viewing the
+    # row-major input as (outer, red, inner):
+    #   outer = prod(shape[:k]), red = prod(shape[k:k+m]), inner = prod(shape[k+m:])
+    #   out[o*inner + i] = reduce_r in[(o*red + r)*inner + i]
+    # Two sub-cases:
+    #   inner == 1  (block is the innermost suffix) -> TILE_RED_SEG (softmax /
+    #               layernorm idiom, contiguous segments, whole-WG local tree).
+    #   inner  > 1  (interior or prefix block: batchnorm axis-0, nbody axis-1)
+    #               -> OP_REDUCE_STRIDED, a strided partial-axis reduce.
+    # A NON-contiguous axis set (e.g. {0,2} of a rank-3) would need a permuting
+    # transpose first — still rejected (deferred).
     if dims != list(range(in_rank)):
-        if dims != list(range(in_rank - len(dims), in_rank)):
+        k = dims[0]
+        m = len(dims)
+        if dims != list(range(k, k + m)):
             raise L.LoweringError(
-                f"reduce: only full or innermost-suffix reductions are "
+                f"reduce: only full or contiguous-axis-block reductions are "
                 f"supported; got dimensions={dims} of rank-{in_rank} (a "
-                "non-suffix axis set needs a transpose first — not yet done).")
-        seg = 1
+                "non-contiguous axis set needs a transpose first — not yet done).")
+        red = 1
         for d in dims:
-            seg *= in_shape[d]
-        n_out = n_in // seg
+            red *= in_shape[d]
+        inner = 1
+        for ax in range(k + m, in_rank):
+            inner *= in_shape[ax]
+        n_out = n_in // red
         out = ctx.new_buffer(n_out, in_dt)
-        ctx.emit(L.Instr(L.OP_REDUCE_SEG, dst=out, a=in_buf, b=in_buf,
-                         n=n_out, imm=(kind << 28) | seg))
+        if inner == 1:
+            # innermost suffix -> segmented reduce (seg == red)
+            ctx.emit(L.Instr(L.OP_REDUCE_SEG, dst=out, a=in_buf, b=in_buf,
+                             n=n_out, imm=(kind << 28) | red))
+        else:
+            # interior / prefix block -> strided partial-axis reduce
+            ctx.emit(L.Instr(L.OP_REDUCE_STRIDED, dst=out, a=in_buf, b=in_buf,
+                             n=n_out, imm=(kind << 28) | red, imm2=inner))
         ctx.value_to_buf[op.results[0]] = out
         return
 
@@ -197,13 +250,20 @@ def _reduce(ctx, op):
 # --- numpy reference semantics ----------------------------------------------
 
 def _reduce_np(arr, kind):
+    import numpy as np
     if kind == SUM:
         return arr.sum()
     if kind == MAX:
         return arr.max()
     if kind == MIN:
         return arr.min()
-    return arr.prod()
+    if kind == PROD:
+        return arr.prod()
+    if kind == AND:
+        return np.bitwise_and.reduce(arr, axis=None)
+    if kind == OR:
+        return np.bitwise_or.reduce(arr, axis=None)
+    return np.bitwise_xor.reduce(arr, axis=None)
 
 
 def _reduce_interp(ins, rt):
@@ -293,24 +353,176 @@ def _redseg_interp(ins, rt) -> None:
 
 
 def _reduce_np_axis(arr, kind):
+    import numpy as np
     if kind == SUM:
         return arr.sum(-1)
     if kind == MAX:
         return arr.max(-1)
     if kind == MIN:
         return arr.min(-1)
-    return arr.prod(-1)
+    if kind == PROD:
+        return arr.prod(-1)
+    if kind == AND:
+        return np.bitwise_and.reduce(arr, axis=-1)
+    if kind == OR:
+        return np.bitwise_or.reduce(arr, axis=-1)
+    return np.bitwise_xor.reduce(arr, axis=-1)
 
 
 def _redseg_sim(task, entry, rt):
-    # one segment per tile: entry covers segments [tile_lo, tile_hi)
+    # one segment per tile: entry covers segments [tile_lo, tile_hi).
+    # p3=1 is dot mode (GEMV routing, ops/dot.py): each segment is a matrix
+    # row multiplied elementwise by the shared vector at task.b while reducing.
     n_out, seg, kind = task.p0, task.p1, task.p2
     src = rt.view(task.a)
     out = rt.view(task.dst)
+    vec = rt.view(task.b)[:seg] if task.p3 else None
     for o in range(entry.tile_lo, min(entry.tile_hi, n_out)):
-        out[o] = _reduce_np(src[o * seg:(o + 1) * seg], kind)
+        row = src[o * seg:(o + 1) * seg]
+        out[o] = (row * vec).sum() if task.p3 else _reduce_np(row, kind)
 
 
 opsem.register(L.OP_REDUCE_SEG, to_task=_redseg_to_task, interp=_redseg_interp,
                reads=_reduce_reads)
 opsem.register_tile_sim(TILE_RED_SEG, _redseg_sim)
+
+
+# --- strided partial-axis reduce (interior / prefix axis block) --------------
+# Input viewed as (outer, red, inner). n = n_out (outer*inner), imm = (kind<<28)
+# | red, imm2 = inner. out[o*inner + i] = reduce_r in[(o*red + r)*inner + i].
+
+def _redstrided_decode(imm: int) -> tuple[int, int]:
+    return imm >> 28, imm & 0x0FFFFFFF          # kind, red
+
+
+def _redstrided_to_task(ins) -> Task:
+    kind, red = _redstrided_decode(ins.imm)
+    inner = ins.imm2
+    # p0 = n_out (tiling), p1 = red (count), p2 = inner (stride), p3 = kind
+    return Task(TILE_RED_STRIDED, dst=ins.dst, a=ins.a, b=0,
+                p0=ins.n, p1=red, p2=inner, p3=kind)
+
+
+def _redstrided_interp(ins, rt) -> None:
+    kind, red = _redstrided_decode(ins.imm)
+    inner = ins.imm2
+    n_out = ins.n
+    outer = n_out // inner
+    src = rt.view(ins.a, outer * red * inner).reshape(outer, red, inner)
+    rt.view(ins.dst, n_out)[:] = _reduce_np_axis1(src, kind).reshape(-1)
+
+
+def _reduce_np_axis1(arr, kind):
+    import numpy as np
+    if kind == SUM:
+        return arr.sum(1)
+    if kind == MAX:
+        return arr.max(1)
+    if kind == MIN:
+        return arr.min(1)
+    if kind == PROD:
+        return arr.prod(1)
+    if kind == AND:
+        return np.bitwise_and.reduce(arr, axis=1)
+    if kind == OR:
+        return np.bitwise_or.reduce(arr, axis=1)
+    return np.bitwise_xor.reduce(arr, axis=1)
+
+
+def _redstrided_sim(task, entry, rt):
+    n_out, red, inner, kind = task.p0, task.p1, task.p2, task.p3
+    src = rt.view(task.a)
+    out = rt.view(task.dst)
+    ts = rt.tile_size
+    tile_lo = entry.tile_lo * ts
+    tile_hi = min(entry.tile_hi * ts, n_out)
+    for g in range(tile_lo, tile_hi):
+        o = g // inner
+        i = g % inner
+        base = o * red * inner + i
+        vals = src[base:base + red * inner:inner]
+        out[g] = _reduce_np(vals, kind)
+
+
+opsem.register(L.OP_REDUCE_STRIDED, to_task=_redstrided_to_task,
+               interp=_redstrided_interp, reads=_reduce_reads)
+opsem.register_tile_sim(TILE_RED_STRIDED, _redstrided_sim)
+
+
+# --- fused segmented norms (softmax / layernorm core), §19 -------------------
+# Both are recognized in lowering (_fuse_norm) from the reduce->broadcast idiom
+# and lowered to one fused local-memory op: imm = seg (innermost axis length),
+# n = n_out (segment count); layernorm carries eps in imm2 (f32 bits). The numpy
+# reference here MUST mirror the kernel exactly (vmo_softmax_seg / _layernorm_seg
+# in reduce.cl) so the dual validators agree bit-for-bit on re-parsed bytecode.
+
+def _f32_from_bits(bits: int):
+    import numpy as np
+    return np.frombuffer(np.uint32(bits & 0xFFFFFFFF).tobytes(), "<f4")[0]
+
+
+def _softmax_np(x):   # x: (..., seg); stable softmax matching the kernel
+    import numpy as np
+    m = x.max(-1, keepdims=True)
+    e = np.exp(x - m)
+    return e / e.sum(-1, keepdims=True)
+
+
+def _layernorm_np(x, eps):   # one-pass var = E[x^2] - E[x]^2, matching the kernel
+    import numpy as np
+    mu = x.mean(-1, keepdims=True)
+    var = (x * x).mean(-1, keepdims=True) - mu * mu
+    return (x - mu) / np.sqrt(var + eps)
+
+
+def _softmax_to_task(ins) -> Task:
+    return Task(TILE_SOFTMAX_SEG, dst=ins.dst, a=ins.a, b=0,
+                p0=ins.n, p1=ins.imm)
+
+
+def _layernorm_to_task(ins) -> Task:
+    return Task(TILE_LAYERNORM_SEG, dst=ins.dst, a=ins.a, b=0,
+                p0=ins.n, p1=ins.imm, p2=ins.imm2)   # p2 = eps f32 bits
+
+
+def _softmax_interp(ins, rt) -> None:
+    n_out, seg = ins.n, ins.imm
+    src = rt.view(ins.a, n_out * seg).reshape(n_out, seg)
+    rt.view(ins.dst, n_out * seg)[:] = _softmax_np(src).reshape(-1)
+
+
+def _layernorm_interp(ins, rt) -> None:
+    n_out, seg = ins.n, ins.imm
+    eps = float(_f32_from_bits(ins.imm2))
+    src = rt.view(ins.a, n_out * seg).reshape(n_out, seg)
+    rt.view(ins.dst, n_out * seg)[:] = _layernorm_np(src, eps).reshape(-1)
+
+
+def _norm_reads(ins) -> set:
+    return {ins.a}
+
+
+def _softmax_sim(task, entry, rt):
+    import numpy as np
+    n_out, seg = task.p0, task.p1
+    src = rt.view(task.a)
+    out = rt.view(task.dst)
+    for o in range(entry.tile_lo, min(entry.tile_hi, n_out)):
+        out[o * seg:(o + 1) * seg] = _softmax_np(src[o * seg:(o + 1) * seg])
+
+
+def _layernorm_sim(task, entry, rt):
+    n_out, seg = task.p0, task.p1
+    eps = float(_f32_from_bits(task.p2))
+    src = rt.view(task.a)
+    out = rt.view(task.dst)
+    for o in range(entry.tile_lo, min(entry.tile_hi, n_out)):
+        out[o * seg:(o + 1) * seg] = _layernorm_np(src[o * seg:(o + 1) * seg], eps)
+
+
+opsem.register(L.OP_SOFTMAX, to_task=_softmax_to_task, interp=_softmax_interp,
+               reads=_norm_reads)
+opsem.register(L.OP_LAYERNORM, to_task=_layernorm_to_task,
+               interp=_layernorm_interp, reads=_norm_reads)
+opsem.register_tile_sim(TILE_SOFTMAX_SEG, _softmax_sim)
+opsem.register_tile_sim(TILE_LAYERNORM_SEG, _layernorm_sim)
