@@ -4157,7 +4157,7 @@ So neither `vm2_seg`'s unconditional 8 KB of `__local` nor its three-deep
 pointer chase costs anything measurable. The "pass the task descriptor as kernel
 args to skip the chase" idea is therefore dead — it would buy ~0.
 
-**CONFIRMED CAUSE: `vm2_seg` SPILLS.** Added a permanent diagnostic
+**`vm2_seg` SPILLS — but spill is NOT proven to be the dominant term.** Added a permanent diagnostic
 (`PJRT_OCL_INFO=1` now prints kernel resources). On Xe2:
 
 ```
@@ -4167,7 +4167,21 @@ args to skip the chase" idea is therefore dead — it would buy ~0.
 **4352 bytes of private memory PER WORK-ITEM** — i.e. 1.1 MB per 256-thread
 workgroup of spill traffic, paid on EVERY phase no matter which op runs, because
 the compiler must size private memory for the WORST-CASE arm of the opcode
-switch. That is the 4.2-9.0 us against a 2.2 us floor.
+switch.
+
+**CORRECTION — an earlier draft of this entry called that the confirmed cause;
+it is not.** Testing it via Intel's large-GRF mode
+(`PJRT_OCL_EXTRA_BUILD=-cl-intel-256-GRF-per-thread`) cuts spill **4352 -> 1024
+B/work-item**, yet is net SLOWER: nbody 0.51x, batchnorm 0.76x, logistic_map
+0.80x, spring_mass 0.95x, hh_neuron/heat2d ~same, and only rk4_ode gains
+(1.05x). Large GRF halves threads per EU, so it buys less spill at the price of
+occupancy and the trade loses. What this proves: **the occupancy-trading route
+to less spill is a dead end.** What it does NOT prove: that spill is irrelevant
+— an op-family SPLIT would cut private memory WITHOUT halving occupancy, so it
+remains the plausible fix. But it is now an unvalidated hypothesis again, and
+the large-GRF result is a caution that spill may not be the dominant term at
+all. Validate before building: e.g. compile a deliberately stripped VM kernel
+(few op arms) and check whether its per-phase cost approaches the 2.2 us floor.
 
 **Mitigation (evidence-backed now, not speculative): the size of the monolithic `vm2_seg` kernel itself.** It
 carries the ENTIRE op library behind one opcode switch, and a large kernel pays
