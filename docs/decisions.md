@@ -4103,3 +4103,253 @@ pass while `64x10` fails, which any correct theory must explain.
 `embedding_softmax` is where it surfaced, and attention has its own fused kernel
 (`attention.cl`, not this path) so flash-attention is not implicated. Treat Xe2
 softmax results as suspect until fixed.
+
+## 53. The eight NON-loop Xe2 laggards, root-caused: three are below the dispatch floor, the rest are two tile-op defects and one lowering defect (2026-07-22)
+
+*(Numbered after §51/§52, which covered the loop/scan workloads and the hard
+dispatch floor. This entry covers the other eight laggards. Investigation only —
+no code changed; every fix below is a proposal with its measurement.)*
+
+**Method.** For each workload: measure total latency, then measure a FLOOR
+control — the same pytree of inputs through a jit that returns one scalar, so
+the per-Execute + per-I/O-buffer cost of §49 is priced for that workload's exact
+argument list. `compute = total - floor`. Tools added under `tools/`:
+`prof_workload.py` (per-workload total + floor + offline phase census),
+`micro_xe2.py` (per-snippet above-floor timing), `dump_tasks.py` (per-phase task
+list with tile counts), `reduce_bw.py` (reduction throughput sweeps),
+`phase_cost.py` (marginal cost of one extra phase), `mm_pathcmp.py` (mm2 vs
+in-VM MMA), `ewsweep.sh` / `lanesweep.sh` / `minvolsweep.sh`.
+
+**Measured decomposition (Xe2, `PJRT_OCL_DEVICE=Intel`, median-of-5):**
+
+| workload | ours ms | floor ms | compute ms | XLA-CPU ms | floor alone vs CPU |
+|---|---|---|---|---|---|
+| batchnorm | 0.192 | 0.036 | 0.156 | 0.017 | **2.1x SLOWER** |
+| nbody | 0.426 | 0.059 | 0.367 | 0.042 | 1.4x slower |
+| embedding_softmax | 0.127 | 0.041 | 0.086 | 0.012 | **3.4x SLOWER** |
+| fft | 0.177 | 0.034 | 0.143 | 0.010 | **3.4x SLOWER** |
+| monte_carlo | 5.09 | 0.033 | 5.06 | 1.753 | 0.02x |
+| layernorm | 0.259 | 0.038 | 0.221 | 0.105 | 0.36x |
+| cnn | 0.397 | 0.036 | 0.361 | 0.183 | 0.20x |
+| mlp | 0.393 | 0.057 | 0.336 | 0.262 | 0.22x |
+
+**UNWINNABLE — say so plainly (batchnorm, embedding_softmax, fft).** For these
+three the dispatch floor ALONE, with zero arithmetic, already loses to XLA-CPU's
+whole run (2.1x, 3.4x, 3.4x). No kernel or phase work can win them; only cutting
+the §49 host floor could, and even then batchnorm needs the floor under 17 us.
+`fft` has a second, independent reason: we lower `jnp.fft.fft` to a DFT MATMUL
+(4 real 512x512 GEMVs, O(N^2)) while XLA-CPU runs a real O(N log N) FFT — the
+gap gets worse with N, not better. Recommend the scoreboard mark all three
+"dispatch-bound (structural)" as §52 recommends for the loop workloads.
+
+### DEFECT 1 — `TILE_RED_STRIDED` runs a partial-axis reduce on ONE work-group. 17.8x measured on the op.
+
+`Task.n_tiles()` gives `ceil(p0 / TILE_SIZE)` tiles with `TILE_SIZE = EW_TS =
+4096` and `p0 = n_out`, so **any partial-axis reduction whose OUTPUT is <= 4096
+elements is a single tile = one 256-thread work-group = 1/32 of the launch grid**
+(`scheduler.py:184`; the exclusion comment at `runtime.cc:769` already notices
+the symptom). Measured `x.sum(axis=0)` throughput is a flat **4.7 GB/s at every
+shape** vs a plain copy at **105 GB/s** — 22x below the poc/20 streaming ceiling.
+
+Proof it is the tile count and nothing else — same binary, `PJRT_OCL_EW_TS`
+only (which also retiles RED_STRIDED):
+
+| shape | `sum(axis=0)` @EW_TS=4096 | @EW_TS=256 | speedup |
+|---|---|---|---|
+| (128, 4096) | 0.430 ms (4.9 GB/s) | **0.0285 ms (73.7 GB/s)** | 15.1x |
+| (1024, 4096) | 3.529 ms (4.8 GB/s) | **0.208 ms (80.7 GB/s)** | 17.0x |
+| (4096, 4096) | 14.097 ms (4.8 GB/s) | **0.791 ms (84.8 GB/s)** | 17.8x |
+
+(The `(rows, 256)` rows do NOT improve: n_out=256 is still one tile at EW_TS=256.
+And EW_TS=256 globally is NOT the fix — it drops plain-copy bandwidth 105 -> 45
+GB/s and costs monte_carlo 25%.)
+
+**Proposed fix (not implemented):** give `TILE_RED_STRIDED` its own tile size in
+`python/pjrt_ocl/scheduler.py` `Task.n_tiles()` — target at least `n_lanes`
+tiles, e.g. `ts = clamp(ceil(p0 / n_lanes), 8, TILE_SIZE)`; the kernel
+(`vmo_redstrided_tile`, `ops/reduce.cl`) derives its output range from
+`tile * EW_TS`, so the tile stride has to be passed rather than compiled in.
+For n_out smaller than a few hundred (cnn's 128, batchnorm's 256) even that
+leaves few active work-items; the complete fix is a two-stage split of the
+REDUCED axis (the machinery exists: `TILE_REDUCE_PART`/`TILE_REDUCE_COMB`).
+
+Who pays it today: cnn's `mean(axis=(1,2))` (n_out=128) = **0.109 ms of cnn's
+0.361 ms compute, running at exactly 4.7 GB/s**; batchnorm's two `mean(axis=0)`
+(n_out=256) ~0.06 ms; nbody's `sum(axis=1)` (n_out=192).
+
+### DEFECT 2 — `TILE_RED_SEG` costs a fixed ~55 ns PER SEGMENT, whatever the segment length.
+
+`vmo_redseg_tile` runs ONE segment per tile, reduced by the whole 256-thread
+work-group through a `log2(256)` = 8-step `__local` tree (9 barriers). For a
+short row almost every lane contributes the identity and the barriers are the
+entire cost. Sweep at a constant 786432 elements (`tools/reduce_bw.py --seg`):
+
+| shape | ms | GB/s | ns per segment |
+|---|---|---|---|
+| (786432, 1) | 41.42 | 0.1 | 52.7 |
+| (262144, 3) | 13.94 | 0.2 | 53.2 |
+| (24576, 32) | 1.45 | 2.2 | 59.2 |
+| (3072, 256) | 0.174 | 18.1 | 56.6 |
+| (768, 1024) | 0.080 | 39.6 | 103.5 |
+
+Flat 53-63 ns/segment across three orders of magnitude of segment length: the
+cost is the work-group tree, not the data. Cross-checks: the same program on
+PoCL is 33x faster at seg=1 (1.21 vs 41.4 ms) — it is the GPU path, not the
+lowering; XLA-CPU does the seg=3 case in 0.219 ms vs our 13.94 ms.
+
+Who pays it: **nbody**. Its `(d*d).sum(-1)` is 4096 segments of length 3;
+removing just that op (rewriting as `d0^2+d1^2+d2^2`, verified allclose) takes
+nbody 0.385 -> 0.243 ms — **40% of the whole workload is one 48 KB reduction.**
+layernorm's fused `LAYERNORM_SEG` (seg=256) is the same structure at 18 GB/s.
+
+**Proposed fix (not implemented):** in `vmo_redseg_tile` / `vmo_softmax_seg` /
+`vmo_layernorm_seg`, select THREAD-PER-OUTPUT (grid-stride over segments, no
+barriers, one work-item reduces a whole short segment) when `seg` is small and
+`n_out` is large enough to fill the grid — the scheduler already knows both
+(`p0`, `p1`), so it can emit a different tile-op/tile-size rather than branching
+in the kernel. The collaborative tree is the right choice only when `n_out` is
+small (its comment says so: it was written to fix layernorm's n_out=512 starving
+a thread-per-output kernel). This wants to be size-adaptive, not one or the other.
+
+### DEFECT 3 — scalar broadcasts are MATERIALIZED. This is 100% of monte_carlo.
+
+monte_carlo is entirely `jax.random` threefry: 297 VM instructions, **119
+compute phases**, 181 `TILE_EW` tasks and **88 `TILE_GATHER` tasks — 59 of which
+broadcast a SINGLE element into a 131072-element (512 KB) buffer** that the next
+elementwise op then reads (`tools/dump_tasks.py --name monte_carlo`; the gather
+(src_elems -> dst_elems) histogram is `{(1, 131072): 59, (4, 1): 20, ...}`).
+Total materialized traffic is 32 MB of gather output + 53 MB of EW output per
+call; at the ~18 GB/s our strided-gather path achieves that is ~4.8 ms, and the
+measured RNG cost is **4.83 ms of the 5.09 ms** (`jax.random.bits` alone
+measures 4.83 ms; XLA-CPU 1.94 ms, which fuses the whole chain into one pass).
+
+**Proposed fix (not implemented):** in `python/pjrt_ocl/lowering.py`, fold
+`stablehlo.broadcast_in_dim` whose SOURCE has 1 element into the consuming
+elementwise instruction as a scalar operand instead of emitting a gather. The
+constant case is already handled (`emit_affine` / `_affine_st`); the missing
+case is a broadcast of a runtime scalar, and of non-f32 dtypes (threefry is
+ui32: xor/or/shift). Second-order: fuse the EW chain so the 181 EW passes do not
+each round-trip 512 KB.
+
+### The other measured facts
+
+**Strided gather/broadcast runs at ~1/3 of copy bandwidth.** Output-byte rates:
+plain copy 53.8 GB/s-out (= 107 GB/s read+write, at the ceiling), broadcast of a
+(64,1024) to (64,16,1024) 17.9, transpose 16.2. The per-element `vmo_view_idx`
+index computation defeats the coalesced float4 path (consistent with §48). This
+is what makes materialized broadcasts 3x worse than they look.
+
+**Small ops are TILE-STARVED, and the fix must be adaptive.** With EW_TS=4096,
+an op on n elements gets `ceil(n/4096)` work-groups out of 32 — nbody's 12288
+elements use 3 lanes, batchnorm's 32768 use 8. Sweeping `PJRT_OCL_EW_TS`:
+nbody 0.387 -> 0.307 (1.26x) at 512, batchnorm 0.192 -> 0.150 (1.28x) at 1024,
+mlp 0.393 -> 0.321 (1.22x) at 512, layernorm 1.05x, cnn 1.00x, and
+monte_carlo **0.80x (worse)** at 512 — big streaming ops need big tiles. So the
+proposal is the same shape as DEFECT 1's: per-task
+`ts = clamp(ceil(n / n_lanes), 256, EW_TS)`, not a new global constant. Worth
+~1.2-1.3x on four of the eight, for one scheduler expression.
+(`PJRT_OCL_VM_LANES` was swept too and 32 is already optimal: 16 -> 0.43 ms,
+64 -> 0.27, 256 -> 0.37 on layernorm. Not a lever.)
+
+**mlp is ALREADY at CPU parity on compute; its whole gap is the floor.** Our
+compute 0.336 ms vs XLA-CPU's total 0.262 ms, and a single `x@w1`
+(64x256x512) is 0.043 ms for us vs 0.106 ms for XLA-CPU — **we are 2.5x faster
+than the CPU at the matmul itself**. mlp loses only because 7 input buffers cost
+0.057 ms of floor. Best case with everything below fixed: ~1.1x, not a win.
+
+**Embedded small matmuls still take the slower in-VM tile, and the §46 hybrid
+CANNOT fire on these programs.** `tools/mm_pathcmp.py` (mm2 fast path vs the same
+matmul with one EW consumer, which forces `vmo_mma_tile`): 64x256x512 1.47x,
+256x256x256 1.55x, 512x512x512 1.67x, 1024x1024x1024 1.84x slower. Sweeping
+`PJRT_OCL_MM_HYBRID_GPU_MINVOL` down to 1 changes mlp by 0% — and
+`PJRT_OCL_MM_HYBRID_DBG=1` shows why: every phase is rejected `non-mma top=2`
+(TOP_GATHER) / `top=0` (TOP_EW), i.e. **the scheduler co-schedules the bias
+broadcast into the matmul's phase, so no phase is ever "pure matmul"** and the
+peel never triggers. Fixing that (peel the MMA task out of a MIXED phase) is a
+prerequisite for any future routing work; §48 measured that routing at these
+volumes currently regresses, so it is not obviously a win today.
+
+**cnn's convolution is slow in absolute terms.** `TILE_CONV` does the 8x32x32x16
+output (7.1 MFLOP) in 0.256 ms = **28 GFLOP/s**, against 1.5 TFLOP/s for our own
+SGEMM. XLA-CPU does the same conv in 0.128 ms. Not investigated further; the
+obvious route is im2col + mm2 rather than tuning `vmo_conv_tile`.
+
+### Prioritized proposal list (achievable speedup x confidence)
+
+1. **RED_STRIDED tile count** — 17.8x measured on the op; cnn ~1.4x, batchnorm
+   ~1.2x, and it is one expression in `Task.n_tiles()`. Highest confidence.
+2. **Scalar-broadcast folding in the lowering** — monte_carlo is the largest
+   absolute prize (~2-3 ms of 5.09), and it is the one general defect that also
+   helps layernorm (2 materialized 1 MB broadcasts of `g`/`b`), mlp (bias) and
+   nbody (4 broadcasts).
+3. **Size-adaptive EW/reduce tile size** — 1.2-1.3x on four workloads, one
+   expression, but MUST be adaptive (monte_carlo regresses 25% if EW_TS drops
+   globally).
+4. **RED_SEG thread-per-output for short segments** — 40% of nbody, and it
+   unblocks any row-wise reduction over short rows; needs a size-adaptive
+   selection so layernorm-shaped cases keep the tree.
+5. **Convolution** (cnn 0.26 ms at 28 GFLOP/s) — real headroom but a bigger job.
+6. **Peel MMA out of mixed phases** — prerequisite work, unclear payoff today.
+
+Nothing on this list makes batchnorm, embedding_softmax or fft win; see the
+UNWINNABLE paragraph.
+
+## 54. §50 follow-up: the Xe2 softmax_seg bug needs lsz==256 AND a ported input — three hypotheses eliminated (2026-07-22)
+
+Still NOT fixed, but the reproducer is now sharply bracketed
+(`tools/softmax_bug.py`, `tools/softmax_bug2.py`, `tools/softmax_shapes.sh`;
+64x10 f32, one process per trial).
+
+**Work-group size is the trigger. `PJRT_OCL_CPU_LSZ` sweep, 4 processes each:**
+
+| lsz | result |
+|---|---|
+| 16 | 4/4 CLEAN |
+| 32 | 4/4 CLEAN |
+| 64 | 4/4 CLEAN |
+| 128 | 4/4 CLEAN |
+| **256 (shipped)** | **3/4 WRONG** |
+
+**The source must be a program INPUT read through an I/O port.** Routing the
+same data through ONE elementwise op first — `softmax(x*1.0+0.0)`, so the fused
+kernel reads an ARENA buffer — is 6/6 CLEAN. Putting an EW op AFTER the softmax
+instead (`softmax(x)*1.0`) still fails 6/6. Adding a second output that echoes
+`x` also makes it clean. A plain EW read of the same ported input
+(`x*2.0+1.0`) is bit-exact, so the port DATA is fine.
+
+**Lane count is NOT involved:** `PJRT_OCL_VM_LANES` 8 / 16 / 32 all reproduce,
+with the same tail rows. So "64 rows over 32 lanes = 2 tiles per work-group"
+(§50's leading theory) is NOT the mechanism.
+
+**`LAYERNORM_SEG` — the same work-group-per-segment structure, same barriers —
+is CLEAN** at 16x64x256 (4/4, max abs error 5.7e-07 vs a float64 reference,
+`tools/norm_bug.py`). So whatever it is, it is specific to `vmo_softmax_seg`,
+or to `seg << lsz`.
+
+**Shape dependence is non-monotonic** (3 processes each): 64x10 3/3 wrong,
+63x10 2/3, 200x10 3/3, 96x10 1/3, 64x5 1/3 — but 64x11, 64x20, 128x10 all 0/3.
+Any correct theory must explain why seg=10 and seg=5 fail while seg=11 and
+seg=20 pass. The corrupted rows are always a contiguous run at the TAIL of the
+output (64x10 -> rows 57-62; 200x10 -> rows 185-199).
+
+**Also eliminated (re-derived, not just re-tested):** the `As` write-after-read
+across tiles CANNOT be the cause. With `seg <= lsz` every lane only ever touches
+`As[lid]` — it stages, max-reads, exp-writes and stores its OWN slot — so there
+is no cross-lane `As` access at all, which is exactly why §50's added barrier
+changed nothing. `Bs` is safe by inspection too: the next tile's `Bs[lid] = m`
+write is separated from the previous tile's `sm = Bs[0]` read by the next tile's
+staging barrier. And `MMA_BSZ` is 1024 floats (`MMA_BK*MMA_TN` = 16*64), so the
+`lid + s` tree indexing at lsz=256 is in bounds.
+
+**Next probes suggested** (cheapest first): (a) whether Intel's compiler picks a
+different SIMD width for `vm2_seg` at 256 work-items than at 128 — `sg_multiple`
+is 16 and `PJRT_OCL_INFO=1` prints it; (b) instrument the kernel to write `As[]`
+and `Bs[0]` for the failing tiles into a debug buffer; (c) the fact that a
+preceding EW op fixes it points at the pointer value itself (`iop[port]` vs
+`arena + off`) — check the alignment of the JAX-allocated input against the
+arena's.
+
+**Workaround available today** if a fix is not: force `seg_lsz_` to 128 for
+programs containing a `TOP_SOFTMAX_SEG` task. It must be per-program and cannot
+be global — `vmo_mma_tile` requires 256 work-items (a 16x16 thread grid,
+`MMA_TDIM`), which is why `safe_at_lsz1()` in `runtime.cc` excludes `kTopMma`.
