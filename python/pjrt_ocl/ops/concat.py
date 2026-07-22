@@ -134,8 +134,18 @@ def _try_index_gather(ctx, op) -> bool:
     if int(idx.min()) < 0 or int(idx.max()) >= src_n:
         return False                             # defensive: never clamp-fold
 
-    idx_buf = ctx.new_buffer(out_n, L.DT_I32)
-    ctx.consts.append((idx_buf, idx.tobytes()))
+    # Dedup identical index vectors: an unrolled scan emits the SAME roll every
+    # iteration, and each copy would otherwise cost out_n*4 const-pool bytes
+    # (heat2d: 4.4 MB of duplicates before this).
+    raw = idx.tobytes()
+    cache = getattr(ctx, "_concat_idx_cache", None)
+    if cache is None:
+        cache = ctx._concat_idx_cache = {}
+    idx_buf = cache.get(raw)
+    if idx_buf is None:
+        idx_buf = ctx.new_buffer(out_n, L.DT_I32)
+        ctx.consts.append((idx_buf, raw))
+        cache[raw] = idx_buf
     # gather_index aux (ops/gather_index.py): flat 1-D operand view —
     # out_rank=1, nidx=1, si_vec_stride=0, is64=0, idx_byteoff placeholder,
     # idx_bufid, out_dims=[out_n], op_stride=[0], si_stride=[1],

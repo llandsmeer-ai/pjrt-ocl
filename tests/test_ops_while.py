@@ -196,15 +196,48 @@ def test_fixed_trip_detection_lowers_op_for():
 
 
 def test_auto_unrolls_small_and_fors_large():
+    """`auto` unrolls a counted loop when EITHER the trip count is small OR the
+    whole unrolled body fits the op cap (§52 — a long scan of a couple of
+    elementwise ops is exactly what OP_FOR handles worst); a long loop with a
+    body too big for the cap stays OP_FOR."""
     os.environ["PJRT_OCL_WHILE"] = "auto"
     try:
         def small(x):
             return jax.lax.fori_loop(0, 4, lambda i, a: a + 1.0, x)
-        def large(x):
+
+        def long_tiny_body(x):           # 1000 trips x ~2 ops -> under the cap
             return jax.lax.fori_loop(0, 1000, lambda i, a: a + 1.0, x)
-        assert _op_counts(small, np.float32(0.0)) == (0, 0)   # unrolled
-        assert _op_counts(large, np.float32(0.0)) == (0, 1)   # OP_FOR
+
+        def long_big_body(x):            # 1000 trips x ~30 ops -> over the cap
+            def body(i, a):
+                for _ in range(15):
+                    a = a * 1.0001 + 0.5
+                return a
+            return jax.lax.fori_loop(0, 1000, body, x)
+
+        assert _op_counts(small, np.float32(0.0)) == (0, 0)            # unrolled
+        assert _op_counts(long_tiny_body, np.float32(0.0)) == (0, 0)   # unrolled
+        assert _op_counts(long_big_body, np.float32(0.0)) == (0, 1)    # OP_FOR
     finally:
+        os.environ.pop("PJRT_OCL_WHILE", None)
+
+
+def test_auto_op_cap_is_respected():
+    """PJRT_OCL_UNROLL_OPS=0 disables the §52 second gate: the same long
+    tiny-body loop falls back to OP_FOR, and is still correct either way."""
+    def f(x):
+        return jax.lax.fori_loop(0, 300, lambda i, a: a * 0.999 + 0.001, x)
+
+    os.environ["PJRT_OCL_WHILE"] = "auto"
+    try:
+        os.environ["PJRT_OCL_UNROLL_OPS"] = "0"
+        assert _op_counts(f, np.float32(0.0)) == (0, 1)        # OP_FOR
+        check(f, np.float32(0.0))
+        os.environ.pop("PJRT_OCL_UNROLL_OPS")
+        assert _op_counts(f, np.float32(0.0)) == (0, 0)        # unrolled
+        check(f, np.float32(0.0))
+    finally:
+        os.environ.pop("PJRT_OCL_UNROLL_OPS", None)
         os.environ.pop("PJRT_OCL_WHILE", None)
 
 

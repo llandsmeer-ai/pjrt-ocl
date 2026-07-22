@@ -802,6 +802,47 @@ def _unroll_trip_limit() -> int:
         return 64
 
 
+def _unroll_op_cap() -> int:
+    """§52 second unroll gate: `auto` also unrolls a loop whose trip count
+    EXCEEDS _unroll_trip_limit() when the whole unrolled body still fits this
+    many stablehlo ops. A short body is exactly the case where OP_FOR is worst
+    — a scan of tiny elementwise steps pays a barrier phase + a host FOR-frame
+    round trip per iteration (~8 us/iter on Xe2) for sub-microsecond of work,
+    while unrolled the SAME chain fuses into one lane-local phase. The cap
+    bounds python lowering/scheduling time and bytecode size, which both grow
+    linearly in trip x body size. PJRT_OCL_UNROLL_OPS=0 disables this gate."""
+    try:
+        return int(os.environ.get("PJRT_OCL_UNROLL_OPS", "2048"))
+    except ValueError:
+        return 2048
+
+
+def _unroll_ops_estimate(ctx: _Ctx, block, depth: int = 0) -> int:
+    """Number of stablehlo ops one unrolled iteration of this body contributes
+    (constants/returns excluded — they lower once or not at all), func.call
+    bodies counted inline. Mirrors _unroll_bytes_estimate's walk."""
+    from jaxlib.mlir import ir
+    if depth > 4:
+        return 0
+    total = 0
+    for inner in block.operations:
+        io = inner.operation
+        if io.name in ("stablehlo.return", "func.return", "stablehlo.constant"):
+            continue
+        if io.name == "func.call":
+            callee = ctx.funcs.get(
+                ir.FlatSymbolRefAttr(io.attributes["callee"]).value)
+            if callee is not None:
+                total += _unroll_ops_estimate(
+                    ctx, callee.regions[0].blocks[0], depth + 1)
+            continue
+        total += 1
+        for region in io.regions:            # nested control: count its body too
+            for blk in region.blocks:
+                total += _unroll_ops_estimate(ctx, blk, depth + 1)
+    return total
+
+
 def _unroll_arena_cap() -> int:
     """auto mode's byte budget for unrolled intermediates. The arena allocator
     is a bump allocator (no SSA liveness reuse yet), so unrolling allocates
@@ -918,12 +959,19 @@ def _lower_while(ctx: _Ctx, op):
     mode = _while_mode()
     if fixed is not None and mode != "while":
         trip, ck, init, step, counter_dt = fixed
-        # auto: unroll when the trip count is modest AND the unrolled
-        # intermediates fit the arena budget (bump allocator, no reuse —
-        # poc/12: a 512-trip 1M-element unroll wants ~4 GB and dies).
+        # auto: unroll when the trip count is modest OR the body is small
+        # enough that the whole unrolled program stays under the op cap (§52 —
+        # a long scan of a few elementwise ops is the case OP_FOR handles
+        # worst), AND the unrolled intermediates fit the arena budget (bump
+        # allocator, no reuse — poc/12: a 512-trip 1M-element unroll wants
+        # ~4 GB and dies).
+        body_block = op.regions[1].blocks[0]
+        op_cap = _unroll_op_cap()
+        small = trip <= _unroll_trip_limit() or (
+            op_cap > 0 and trip * _unroll_ops_estimate(ctx, body_block) <= op_cap)
         if mode == "unroll" or (
-                mode == "auto" and trip <= _unroll_trip_limit()
-                and trip * _unroll_bytes_estimate(ctx, op.regions[1].blocks[0])
+                mode == "auto" and small
+                and trip * _unroll_bytes_estimate(ctx, body_block)
                 <= _unroll_arena_cap()):
             _unroll_while(ctx, op, trip, ck, init, step, counter_dt)
             return
