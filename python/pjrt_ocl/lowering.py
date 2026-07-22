@@ -351,6 +351,12 @@ class _Ctx:
         self.buffers: list[Buffer] = []
         self.consts: list[tuple[int, bytes]] = []
         self.value_to_buf: dict = {}       # ir.Value -> buffer id
+        # complex64/128 SSA values are represented split into a (real, imag) pair
+        # of f32 buffers entirely in the lowering (the arena stays 4-byte-slotted
+        # f32; no complex arena dtype). ops/complex_fft.py populates this;
+        # buf_pair/_alias_value below propagate it across call/return like
+        # value_to_buf does for scalar values. See docs/decisions.md §43.
+        self.cbuf: dict = {}               # ir.Value (complex) -> (re_id, im_id)
         self.instrs: list[Instr] = []
         self.inputs: list[int] = []
         self.outputs: list[int] = []
@@ -627,14 +633,24 @@ def _inline_call(ctx: _Ctx, o) -> None:
         raise LoweringError(f"func.call to unknown function @{callee_name}")
     block = callee.regions[0].blocks[0]
     for arg, operand in zip(block.arguments, o.operands):
-        ctx.value_to_buf[arg] = ctx.buf_for(operand)
+        _alias_value(ctx, arg, operand)
     for inner in block.operations:
         io = inner.operation
         if io.name == "func.return":
             for ret_val, call_res in zip(io.operands, o.results):
-                ctx.value_to_buf[call_res] = ctx.buf_for(ret_val)
+                _alias_value(ctx, call_res, ret_val)
             return
         _lower_op(ctx, io)
+
+
+def _alias_value(ctx: _Ctx, dst, src) -> None:
+    """Alias SSA value `dst` to `src` across a call/return boundary, carrying
+    a split-complex (real, imag) pair when `src` is complex, else the scalar
+    buffer id."""
+    if src in ctx.cbuf:
+        ctx.cbuf[dst] = ctx.cbuf[src]
+    else:
+        ctx.value_to_buf[dst] = ctx.buf_for(src)
 
 
 @dataclasses.dataclass
