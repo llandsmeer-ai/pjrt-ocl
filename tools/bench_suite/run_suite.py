@@ -1,19 +1,34 @@
 """Driver for the diverse AI + scientific-computing workload testbench.
 
 Runs every workload in ``workloads.py`` against BOTH backends — our OpenCL VM
-(``JAX_PLATFORMS=opencl PJRT_OCL_DEVICE=NVIDIA``) and native JAX CUDA
-(``JAX_PLATFORMS=cuda``) — each in its own subprocess (the JAX backend is
+and a native-XLA reference — each in its own subprocess (the JAX backend is
 process-global). For each workload it records:
 
   * PASS/FAIL on our backend, and if FAIL the exact missing StableHLO op,
-  * correctness vs CUDA (max abs/rel error, allclose flag),
-  * median-of-rounds latency on each backend and the ours/CUDA gap.
+  * correctness vs the reference (max abs/rel error, allclose flag),
+  * median-of-rounds latency on each backend and the ours/reference gap.
+
+Three run modes (all use the same driver/worker structure; they only pick which
+two BACKENDS entries to run and which ``PJRT_OCL_DEVICE`` the "ours" side gets):
+
+  (default)     ours on an OpenCL GPU (``PJRT_OCL_DEVICE=NVIDIA``) vs native
+                JAX CUDA (``JAX_PLATFORMS=cuda``).
+  --cpu         ours on PoCL (``PJRT_OCL_DEVICE=Portable``) vs JAX CPU/XLA.
+  --gpu-vs-cpu  ours on an OpenCL GPU (default ``PJRT_OCL_DEVICE=Intel``) vs
+                the JAX CPU/XLA reference. For hosts with an OpenCL GPU but no
+                CUDA (e.g. Intel Lunar Lake / Arc 140V Xe2 iGPU).
+
+``--ocl-device SUBSTR`` overrides the OpenCL platform substring for the "ours"
+side in any mode, so nothing is hardcoded to one vendor.
 
 Usage:
     . ./env.sh
     .venv/bin/python tools/bench_suite/run_suite.py            # run everything
     .venv/bin/python tools/bench_suite/run_suite.py --only mlp attention
     .venv/bin/python tools/bench_suite/run_suite.py --md docs/workload-coverage.md
+    # Xe2 iGPU vs XLA-CPU on a CUDA-less host:
+    .venv/bin/python tools/bench_suite/run_suite.py --gpu-vs-cpu \
+        --ocl-device Intel --md docs/workload-coverage-xe2.md
 
 Internally re-invokes itself as a worker:
     ... run_suite.py --worker --name mlp --outdir /tmp/xx
@@ -68,8 +83,60 @@ def _extract_reason(msg: str):
     elif op:
         reason = f"missing {op}"
     else:
-        reason = msg.strip().splitlines()[0][:120]
+        lines = [l for l in msg.strip().splitlines() if l.strip()]
+        reason = lines[0][:120] if lines else "unknown"
     return reason, op
+
+
+# Lines JAX/absl/OpenCL runtimes emit on stderr that are NOT the error: the
+# experimental-platform warning is printed by xla_bridge on EVERY successful
+# opencl run, and JAX's traceback filter appends its own footer. Taking
+# stderr[0] or stderr[-1] blindly reports one of these as the failure reason.
+_NOISE_RES = [
+    re.compile(r"^Platform '.*' is experimental"),
+    re.compile(r"^For simplicity, JAX has removed its internal frames"),
+    re.compile(r"^-{5,}$"),
+    re.compile(r"^\s*(Traceback \(most recent call last\)|During handling of "
+               r"the above exception|The above exception was the direct cause)"),
+    re.compile(r"^\s*(File \"|\^{2,}|\.{3}$)"),
+    re.compile(r"^\s*(WARNING|INFO|W\d{4}|I\d{4}|E\d{4})[: ]"),
+    re.compile(r"^\s*warnings\.warn"),
+]
+
+
+def _denoise_stderr(stderr: str):
+    """Drop framework noise + traceback frames, keep candidate error lines."""
+    keep = []
+    for line in stderr.splitlines():
+        if not line.strip():
+            continue
+        if any(rx.search(line) for rx in _NOISE_RES):
+            continue
+        # traceback source lines are indented; exception lines are not
+        if line.startswith((" ", "\t")):
+            continue
+        keep.append(line.rstrip())
+    return keep
+
+
+def _crash_reason(stderr: str, returncode: int):
+    """Reason/op/message for a worker that died without emitting its JSON.
+
+    The last non-noise, non-indented stderr line is the actual exception
+    ("RuntimeError: Unable to initialize backend 'opencl': ..."); everything
+    else is warnings and traceback frames.
+    """
+    lines = _denoise_stderr(stderr)
+    msg = lines[-1] if lines else ""
+    if returncode is not None and returncode < 0:
+        sig = -returncode
+        return (f"worker killed by signal {sig}", f"signal-{sig}",
+                (msg or f"(no stderr) signal {sig}")[:400])
+    if not msg:
+        return ("worker died without output", None,
+                f"(no usable stderr) returncode={returncode}")
+    reason, op = _extract_reason("\n".join(lines))
+    return reason, op, msg[:400]
 
 
 # ------------------------------------------------------------------- worker ---
@@ -97,8 +164,20 @@ def _worker(name: str, outdir: str) -> int:
         print(SENTINEL + json.dumps(result))
         return 0
 
-    tree_j = jax.tree_util.tree_map(lambda a: jnp.asarray(a), tree)
-    fn_j = jax.jit(fn)
+    # Moving the inputs onto the device is what actually initializes the JAX
+    # backend, so a bad PJRT_OCL_DEVICE / missing plugin / missing CUDA raises
+    # HERE. Uncaught, it killed the worker before it printed its JSON line and
+    # the driver had to guess a reason from raw stderr (and picked JAX's
+    # "Platform 'opencl' is experimental" warning). Report it as data instead.
+    try:
+        tree_j = jax.tree_util.tree_map(lambda a: jnp.asarray(a), tree)
+        fn_j = jax.jit(fn)
+    except Exception as e:
+        reason, op = _extract_reason(f"{type(e).__name__}: {e}")
+        result.update(status="FAIL", stage="backend", error=str(e)[:500],
+                      reason=reason, missing_op=op)
+        print(SENTINEL + json.dumps(result))
+        return 0
 
     # 1) lower + run once
     try:
@@ -119,22 +198,29 @@ def _worker(name: str, outdir: str) -> int:
                   amin=float(out_np.min()), amax=float(out_np.max()))
 
     # 2) benchmark: adaptive iters, median of rounds
-    for _ in range(3):
+    try:
+        for _ in range(3):
+            jax.block_until_ready(fn_j(tree_j))
+        t0 = time.perf_counter()
         jax.block_until_ready(fn_j(tree_j))
-    t0 = time.perf_counter()
-    jax.block_until_ready(fn_j(tree_j))
-    one = time.perf_counter() - t0
-    iters = max(3, min(200, int(0.08 / max(one, 1e-6))))
-    ts = []
-    for _ in range(5):
-        t = time.perf_counter()
-        for _ in range(iters):
-            r = fn_j(tree_j)
-        jax.block_until_ready(r)
-        ts.append((time.perf_counter() - t) / iters)
-    ts.sort()
-    result["ms"] = float(ts[len(ts) // 2]) * 1e3
-    result["iters"] = iters
+        one = time.perf_counter() - t0
+        iters = max(3, min(200, int(0.08 / max(one, 1e-6))))
+        ts = []
+        for _ in range(5):
+            t = time.perf_counter()
+            for _ in range(iters):
+                r = fn_j(tree_j)
+            jax.block_until_ready(r)
+            ts.append((time.perf_counter() - t) / iters)
+        ts.sort()
+        result["ms"] = float(ts[len(ts) // 2]) * 1e3
+        result["iters"] = iters
+    except Exception as e:
+        # The run was correct; only timing blew up. Keep it a FAIL so it can't
+        # silently become a missing-number row, but say exactly what happened.
+        reason, op = _extract_reason(f"{type(e).__name__}: {e}")
+        result.update(status="FAIL", stage="bench", error=str(e)[:500],
+                      reason=f"benchmark loop: {reason}", missing_op=op)
     print(SENTINEL + json.dumps(result))
     return 0
 
@@ -142,26 +228,50 @@ def _worker(name: str, outdir: str) -> int:
 # ------------------------------------------------------------- orchestrator ---
 
 BACKENDS = {
-    "opencl": {"JAX_PLATFORMS": "opencl", "PJRT_OCL_DEVICE": "NVIDIA"},
+    # "ours": our OpenCL VM. PJRT_OCL_DEVICE is filled in from OCL_DEVICE at
+    # launch time (see _run_worker) so no vendor is hardcoded here.
+    "opencl": {"JAX_PLATFORMS": "opencl"},
+    # native-XLA references
     "cuda": {"JAX_PLATFORMS": "cuda"},
-    # CPU story (this round): ours-on-PoCL vs the reference JAX CPU/XLA backend,
-    # each in its own process. Selected by --cpu (rewrites "opencl"/ref below).
-    "opencl_cpu": {"JAX_PLATFORMS": "opencl", "PJRT_OCL_DEVICE": "Portable"},
     "cpu": {"JAX_PLATFORMS": "cpu"},
 }
 
-# The reference backend key (native XLA). Overridden to "cpu" by --cpu; the row
-# dicts still store it under the key "cuda" so the printers stay backend-generic.
+# Run modes: which backends to pit against each other, the default OpenCL
+# platform substring for the "ours" side, and how the printers label things.
+# --cpu / --gpu-vs-cpu just select a row here.
+MODES = {
+    "nvidia": {"ours": "opencl", "ref": "cuda", "device": "NVIDIA",
+               "ref_label": "CUDA"},
+    "cpu": {"ours": "opencl", "ref": "cpu", "device": "Portable",
+            "ref_label": "XLA-CPU"},
+    "gpu-vs-cpu": {"ours": "opencl", "ref": "cpu", "device": "Intel",
+                   "ref_label": "XLA-CPU"},
+}
+
+# The reference backend key (native XLA). Overridden by the mode; the row dicts
+# still store it under the key "cuda" so the printers stay backend-generic.
 REF_BACKEND = "cuda"
 OURS_BACKEND = "opencl"
-CPU_MODE = False
+MODE = "nvidia"
+CPU_MODE = False        # ours-on-PoCL vs XLA-CPU: tight tolerance + CPU prose
+OCL_DEVICE = "NVIDIA"   # PJRT_OCL_DEVICE substring handed to the "ours" runs
+REF_LABEL = "CUDA"
+TIMEOUT = 360
 
 
-def _run_worker(name: str, backend: str, outdir: str, timeout=360):
+def _run_worker(name: str, backend: str, outdir: str, timeout=None):
+    timeout = TIMEOUT if timeout is None else timeout
     env = dict(os.environ)
     env.update(BACKENDS[backend])
-    # keep caches off the full root overlay even if env.sh wasn't sourced
     root = os.path.dirname(TOOLS_DIR)
+    if env.get("JAX_PLATFORMS") == "opencl":
+        env["PJRT_OCL_DEVICE"] = OCL_DEVICE
+        # Only pin the plugin path if the dev-tree .so is actually there;
+        # otherwise let pjrt_ocl's own search (env -> wheel -> dev tree) run.
+        so = os.path.join(root, "pjrt_plugin/build/libpjrt_ocl.so")
+        if os.path.exists(so):
+            env.setdefault("PJRT_OCL_PLUGIN_PATH", so)
+    # keep caches off the full root overlay even if env.sh wasn't sourced
     env.setdefault("POCL_CACHE_DIR", os.path.join(root, "third_party/pocl-cache"))
     env.setdefault("CUDA_CACHE_PATH", os.path.join(root, "third_party/nv-cache"))
     env.setdefault("TMPDIR", os.path.join(root, "third_party/tmp"))
@@ -176,11 +286,10 @@ def _run_worker(name: str, backend: str, outdir: str, timeout=360):
     for line in p.stdout.splitlines():
         if line.startswith(SENTINEL):
             return json.loads(line[len(SENTINEL):])
-    # crashed without emitting JSON
-    tail = (p.stderr.strip().splitlines() or ["(no stderr)"])[-1]
-    reason, op = _extract_reason(p.stderr)
+    # crashed without emitting JSON (segfault, VM hang killed, os._exit, ...)
+    reason, op, msg = _crash_reason(p.stderr, p.returncode)
     return {"name": name, "status": "FAIL", "stage": "crash",
-            "reason": reason, "missing_op": op, "error": tail[:400],
+            "reason": reason, "missing_op": op, "error": msg,
             "returncode": p.returncode}
 
 
@@ -197,16 +306,73 @@ def _compare(name, outdir):
     max_abs = float(diff.max()) if a.size else 0.0
     max_rel = float((diff / (np.abs(b) + 1e-6)).max()) if a.size else 0.0
     # On PoCL/CPU there is no TF32: ours should be f32-exact vs XLA-CPU, so a
-    # tighter tolerance is warranted. Keep the loose one for the GPU/TF32 path.
+    # tighter tolerance is warranted. Keep the loose one for the GPU path
+    # (TF32 on NVIDIA; different reduction order / fma contraction on any GPU).
     atol, rtol = (2e-2, 2e-2)
     if CPU_MODE:
         atol, rtol = (1e-3, 1e-3)
     close = bool(np.allclose(a, b, atol=atol, rtol=rtol))
-    return {"close": close, "max_abs": max_abs, "max_rel": max_rel}
+    # Extra information, never used to decide PASS/FAIL: would it also clear
+    # the f32-tight bar? Reported so a GPU run's real accuracy is visible.
+    tight = bool(np.allclose(a, b, atol=1e-3, rtol=1e-3))
+    return {"close": close, "max_abs": max_abs, "max_rel": max_rel,
+            "tight": tight, "atol": atol, "rtol": rtol}
+
+
+def _selftest():
+    """Assertions for the failure-reporting path (no JAX, no device needed).
+
+    Regression guard for the bug where a worker that died before printing its
+    JSON was reported with JAX's "Platform 'opencl' is experimental" warning as
+    the failure reason.
+    """
+    warn = ("Platform 'opencl' is experimental and not all JAX functionality "
+            "may be correctly supported!")
+    err = "\n".join([
+        warn,
+        "Traceback (most recent call last):",
+        '  File "/x/xla_bridge.py", line 839, in backends',
+        "    backend = _init_backend(platform)",
+        "              ^^^^^^^^^^^^^^^^^^^^^^^",
+        "jax.errors.JaxRuntimeError: INTERNAL: pjrt-ocl: OclRuntime: no OpenCL device matched selection",
+        "",
+        "During handling of the above exception, another exception occurred:",
+        "",
+        "Traceback (most recent call last):",
+        '  File "/y/run_suite.py", line 100, in <lambda>',
+        "RuntimeError: Unable to initialize backend 'opencl': INTERNAL: no device matched",
+        "-" * 20,
+        "For simplicity, JAX has removed its internal frames from the traceback "
+        "of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.",
+    ])
+    reason, op, msg = _crash_reason(err, 1)
+    assert warn not in reason and warn not in msg, (reason, msg)
+    assert "no OpenCL device matched" in reason or "no device matched" in msg, (reason, msg)
+
+    # warning-only stderr + fatal signal must not become "experimental platform"
+    reason, op, msg = _crash_reason(warn + "\n", -11)
+    assert reason == "worker killed by signal 11" and op == "signal-11", (reason, op)
+
+    # a real lowering rejection is still classified by op
+    reason, op, _ = _crash_reason(
+        warn + "\nLoweringError: unsupported op: stablehlo.fft\n", 1)
+    assert op == "stablehlo.fft", (reason, op)
+
+    reason, op, msg = _crash_reason("", 3)
+    assert reason == "worker died without output", reason
+
+    # mode table wiring
+    for name, m in MODES.items():
+        assert m["ours"] in BACKENDS and m["ref"] in BACKENDS, name
+        assert "PJRT_OCL_DEVICE" not in BACKENDS[m["ours"]], "device must not be hardcoded"
+    print("selftest OK")
+    return 0
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true",
+                    help="check the failure-reporting/mode wiring; no device needed")
     ap.add_argument("--worker", action="store_true")
     ap.add_argument("--name")
     ap.add_argument("--outdir")
@@ -215,16 +381,36 @@ def main():
     ap.add_argument("--cpu", action="store_true",
                     help="CPU story: ours-on-PoCL (PJRT_OCL_DEVICE=Portable) vs "
                          "reference JAX CPU/XLA backend, in separate processes")
+    ap.add_argument("--gpu-vs-cpu", action="store_true",
+                    help="ours on an OpenCL GPU (default PJRT_OCL_DEVICE=Intel, "
+                         "override with --ocl-device) vs the reference JAX "
+                         "CPU/XLA backend — for hosts with no CUDA")
+    ap.add_argument("--ocl-device", metavar="SUBSTR",
+                    help="PJRT_OCL_DEVICE for the 'ours' runs: OpenCL platform-name "
+                         "substring, optional ':<device index>' "
+                         "(default: NVIDIA, or Portable with --cpu, Intel with "
+                         "--gpu-vs-cpu)")
+    ap.add_argument("--timeout", type=float, default=360,
+                    help="per-workload per-backend subprocess timeout, seconds")
     args = ap.parse_args()
 
+    if args.selftest:
+        return _selftest()
     if args.worker:
         return _worker(args.name, args.outdir)
 
-    global CPU_MODE, REF_BACKEND, OURS_BACKEND
-    if args.cpu:
-        CPU_MODE = True
-        OURS_BACKEND = "opencl_cpu"
-        REF_BACKEND = "cpu"
+    global CPU_MODE, REF_BACKEND, OURS_BACKEND, MODE, OCL_DEVICE, REF_LABEL, TIMEOUT
+    if args.cpu and args.gpu_vs_cpu:
+        ap.error("--cpu and --gpu-vs-cpu are mutually exclusive")
+    MODE = "cpu" if args.cpu else ("gpu-vs-cpu" if args.gpu_vs_cpu else "nvidia")
+    m = MODES[MODE]
+    OURS_BACKEND, REF_BACKEND = m["ours"], m["ref"]
+    OCL_DEVICE = args.ocl_device or m["device"]
+    REF_LABEL = m["ref_label"]
+    CPU_MODE = (MODE == "cpu")
+    TIMEOUT = args.timeout
+    print(f"mode={MODE}  ours=JAX_PLATFORMS=opencl PJRT_OCL_DEVICE={OCL_DEVICE}"
+          f"  ref=JAX_PLATFORMS={REF_BACKEND}", flush=True)
 
     from bench_suite import workloads
     names = args.only or workloads.WORKLOAD_NAMES
@@ -266,16 +452,20 @@ def _print_row(r):
     if st == "PASS":
         gap = (o["ms"] / c["ms"]) if c.get("status") == "PASS" and c.get("ms") else float("nan")
         cl = "-" if not cmp else ("close" if cmp["close"] else f"DIFF(rel={cmp.get('max_rel',0):.1e})")
-        print(f"    -> PASS ours={o['ms']:.3f}ms cuda={c.get('ms',float('nan')):.3f}ms "
+        if cmp and cmp["close"] and not cmp.get("tight", True):
+            cl += "(loose)"
+        print(f"    -> PASS ours={o['ms']:.3f}ms {REF_BACKEND}={c.get('ms',float('nan')):.3f}ms "
               f"gap={gap:.2f}x correct={cl} finite={o.get('finite')}")
     else:
         print(f"    -> FAIL [{o.get('stage')}] {o.get('reason')} "
-              f"(op={o.get('missing_op')}) cuda={c.get('status')}")
+              f"(op={o.get('missing_op')}) {REF_BACKEND}={c.get('status')} "
+              f"| {(o.get('error') or '')[:160]}")
 
 
 def _print_table(rows):
     print("\n================ COVERAGE / PERF TABLE ================")
-    hdr = f"{'workload':<18}{'cat':<6}{'ours':<8}{'ours ms':>10}{'cuda ms':>10}{'gap':>8}  missing/notes"
+    refms = f"{REF_BACKEND} ms"
+    hdr = f"{'workload':<18}{'cat':<6}{'ours':<8}{'ours ms':>10}{refms:>10}{'gap':>8}  missing/notes"
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
@@ -291,7 +481,7 @@ def _print_table(rows):
             cs = c.get("status", "?")
             cms = f"{c['ms']:.3f}" if cs == "PASS" and c.get("ms") else "-"
             print(f"{r['name']:<18}{cat:<6}{'FAIL':<8}{'-':>10}{cms:>10}"
-                  f"{'-':>8}  {miss}  (cuda:{cs})")
+                  f"{'-':>8}  {miss}  ({REF_BACKEND}:{cs})")
 
 
 def _rank_missing(rows):
@@ -311,14 +501,32 @@ def _rank_missing(rows):
 
 def _write_md(path, rows):
     from collections import defaultdict
-    ref = "XLA-CPU" if CPU_MODE else "CUDA"
-    refms = "cpu ms" if CPU_MODE else "cuda ms"
+    ref = REF_LABEL
+    refms = f"{REF_BACKEND} ms"
     npass = sum(1 for r in rows if r["ours"].get("status") == "PASS")
     n = len(rows)
+    gpu_vs_cpu = (MODE == "gpu-vs-cpu")
     lines = []
-    lines.append("# Workload coverage & perf scoreboard (CPU / PoCL)\n" if CPU_MODE
-                 else "# Workload coverage & perf scoreboard\n")
     if CPU_MODE:
+        lines.append("# Workload coverage & perf scoreboard (CPU / PoCL)\n")
+    elif gpu_vs_cpu:
+        lines.append(f"# Workload coverage & perf scoreboard "
+                     f"(OpenCL GPU `{OCL_DEVICE}` vs XLA-CPU)\n")
+    else:
+        lines.append("# Workload coverage & perf scoreboard\n")
+    if gpu_vs_cpu:
+        lines.append("Diverse AI + scientific-computing workloads run through our OpenCL VM "
+                     f"on the `{OCL_DEVICE}` OpenCL platform "
+                     f"(`JAX_PLATFORMS=opencl PJRT_OCL_DEVICE={OCL_DEVICE}`) vs the "
+                     "reference native JAX CPU/XLA backend (`JAX_PLATFORMS=cpu`) on the "
+                     "same host. Generated by `tools/bench_suite/run_suite.py "
+                     f"--gpu-vs-cpu --ocl-device {OCL_DEVICE}`. Each backend runs in its "
+                     "own subprocess; latency is median-of-5-rounds, adaptive iters, after "
+                     "warmup. `gap = ours_ms / cpu_ms` (lower is better; <1 means our GPU "
+                     "path beats XLA on this host's CPU). NOTE: this is a cross-device "
+                     "comparison (iGPU vs CPU cores), so the gap column is a "
+                     "*this-machine* number, not a like-for-like backend comparison.\n")
+    elif CPU_MODE:
         lines.append("Diverse AI + scientific-computing workloads run through our OpenCL VM "
                      "on PoCL (`JAX_PLATFORMS=opencl PJRT_OCL_DEVICE=Portable`, the "
                      "host-dispatch engine: no spin-barrier, clFinish/ring-drain per phase, "
@@ -351,6 +559,8 @@ def _write_md(path, rows):
             cms = f"{c.get('ms'):.3f}" if c.get("status") == "PASS" else "-"
             if cmp:
                 corr = f"{'close' if cmp['close'] else 'DIFF'} ({cmp.get('max_rel', 0):.1e})"
+                if cmp["close"] and not cmp.get("tight", True):
+                    corr += " *"      # clears 2e-2 but not the f32-tight 1e-3 bar
             else:
                 corr = "-"
             lines.append(f"| {r['name']} | {cat} | PASS | {o['ms']:.3f} | {cms} | "
@@ -393,12 +603,12 @@ def _write_md(path, rows):
                      f"{worst[1]:.2f}x ({worst[0]})**, median **{med:.2f}x**.")
         lines.append(f"- **At/under 1x {ref} (we win or tie): {nbeat}/{len(gaps)}**; "
                      f"within 1.5x: {nmatch}/{len(gaps)}.")
-        if CPU_MODE:
+        if CPU_MODE or gpu_vs_cpu:
             winners = ", ".join(f"{nm} ({g:.2f}x)" for nm, g in gs if g <= 1.0) or "none"
             laggards = ", ".join(f"{nm} ({g:.2f}x)" for nm, g in gs if g >= 3.0) or "none"
-            lines.append(f"- **Winners (≤1x XLA-CPU):** {winners}.")
-            lines.append(f"- **Laggards (≥3x XLA-CPU):** {laggards} — the loop-/small-op "
-                         "regime where per-phase enqueue + clFinish/ring-drain dominates.")
+            lines.append(f"- **Winners (≤1x {ref}):** {winners}.")
+            lines.append(f"- **Laggards (≥3x {ref}):** {laggards} — the loop-/small-op "
+                         "regime where per-phase enqueue + queue-drain dominates.")
     lines.append("\n### Notes on the correctness column\n")
     if CPU_MODE:
         lines.append("- `correct` uses `np.allclose(atol=1e-3, rtol=1e-3)` vs XLA-CPU (PoCL has "
@@ -406,11 +616,17 @@ def _write_md(path, rows):
                      "The parenthesised `max rel` can still look large where the reference has "
                      "near-zero elements (rel = |Δ|/(|ref|+1e-6)); the boolean is authoritative.")
     else:
-        lines.append("- `correct` uses `np.allclose(atol=2e-2, rtol=2e-2)` vs CUDA and that boolean is "
+        lines.append(f"- `correct` uses `np.allclose(atol=2e-2, rtol=2e-2)` vs {ref} and that boolean is "
                      "authoritative. The parenthesised `max rel` can look huge (e.g. transformer 5e1) "
                      "purely because the reference has near-zero elements (rel = |Δ|/(|ref|+1e-6)); "
-                     "every passer clears the abs+rel allclose. TF32 matmul on both sides also widens "
-                     "abs error on ~1-std signals.")
+                     "every passer clears the abs+rel allclose. TF32 matmul (and, on any GPU, a "
+                     "different reduction order / fma contraction) also widens abs error on "
+                     "~1-std signals.")
+        nloose = sum(1 for r in rows
+                     if r["cmp"] and r["cmp"]["close"] and not r["cmp"].get("tight", True))
+        lines.append(f"- Rows marked `*` clear the 2e-2 bar but not the f32-tight 1e-3 bar "
+                     f"({nloose} of the passers) — pure fp-associativity, reported rather than "
+                     "hidden so the accuracy story stays honest.")
     lines.append("- Chaotic integrators (rk4 Lorenz, logistic_map at r→4) are seeded identically "
                  "and match here, but would diverge over longer horizons on any two backends.")
     lines.append("")
