@@ -10,6 +10,13 @@ flat sibling OP_IFs) + stablehlo.if (OP_IF now emitted/scheduled), and
 non-canonical dot_general (transpose-canonicalized). §42: uint32 buffers report
 U32 → monte_carlo PASS. §39: OP_CONV → cnn PASS. Remaining fail: fft (complex
 dtype).)*
+**Coverage: 17/18 workloads run on our backend (94%).**  *(§43: complex64 as a
+split (real, imag) f32 pair + stablehlo.fft as a direct DFT-matmul → fft now PASS
+(gap 1.68×), the last non-brax gap closed. §42: uint32 buffers now report U32
+(not S32) at the host boundary → monte_carlo PASS, bit-exact vs CPU; brax
+reset+step LOWERS (past the ex-"JAX threefry ui32/i32" wall — it was OUR dtype
+bug). §39: direct N-D convolution — cnn now PASS via OP_CONV. Remaining fail:
+brax_step (blocked on the DEVICE-op gap `reduce(and)`, not lowering).)*
 *(History: §38 partial-axis reduce → batchnorm + nbody PASS; §38 general
 stablehlo.gather → embedding_softmax PASS.)*
 
@@ -33,7 +40,7 @@ stablehlo.gather → embedding_softmax PASS.)*
 | rk4_ode | SCI | PASS | 8.935 | 1.232 | 7.25x | close (0.0e+00) | RK4 Lorenz integrator (scan) |
 | logistic_map | SCI | PASS | 1.212 | 1.177 | 1.03x | close (0.0e+00) | logistic-map iteration (fori_loop/while) |
 | monte_carlo | SCI | PASS | 0.772 | 0.080 | 9.62x | close (bit-exact 3.1473389 vs CPU) | Monte-Carlo pi (threefry RNG) — §42 ui32→U32 host dtype fix (threefry key no longer mis-reported as i32) |
-| fft | SCI | **FAIL** | - | 0.047 | - | - | `complex-dtype` — complex dtype unsupported (cuda: PASS); 1D FFT magnitude (needs complex dtype + fft) |
+| fft | SCI | PASS | 0.080 | 0.048 | 1.68x | close | 1D FFT magnitude — §43 complex64 as split (real,imag) f32 pair + stablehlo.fft as direct DFT-matmul (const twiddles) |
 | spring_mass | PHYS | PASS | 3.513 | 1.110 | 3.16x | close (0.0e+00) | spring-mass chain (brax analogue, scan) |
 | hh_neuron | PHYS | PASS | 15.321 | 1.292 | 11.86x | close (1.3e-04) | Hodgkin-Huxley neuron (jaxley analogue, scan) |
 | brax_step | PHYS | **FAIL** | - | 0.309 | - | - | `reduce(and)` — §42: the ex-"jax-threefry-ui32-verifier" wall was OUR bug (ui32 buffers reported S32); with §42's U32 fix `jit(reset+step)` now LOWERS on NVIDIA+PoCL and reaches the physics compute. Next blocker is a DEVICE-op gap: `stablehlo.reduce` with a `stablehlo.and` reducer body (int/bool all()/any()), then data-dependent scatter + erf_inv (cuda: PASS) |
@@ -51,7 +58,7 @@ Each row: how many suite workloads that op/feature would unlock, and which.
 | 1 | `stablehlo.convolution` | 1 | cnn |
 | 2 | `stablehlo.gather` | 1 | embedding_softmax |
 | 3 | `stablehlo.shift_right_logical` | 1 | monte_carlo |
-| 4 | `complex-dtype` | 1 | fft |
+| ~~4~~ | ~~`complex-dtype`~~ | ~~1~~ | ~~fft~~ — SHIPPED §43 |
 | 5 | `platform-allowlist` | 1 | brax_step |
 | ~~1~~ | ~~`reduce(partial-axis)`~~ | ~~2~~ | **DONE (§38): batchnorm, nbody** |
 | ~~2~~ | ~~`stablehlo.convolution`~~ | ~~1~~ | ~~cnn~~ — SHIPPED §39 (OP_CONV direct N-D conv) |
@@ -59,6 +66,8 @@ Each row: how many suite workloads that op/feature would unlock, and which.
 | ~~4~~ | ~~`stablehlo.shift_right_logical`~~ + ~~ui32 host dtype~~ | ~~1~~ | ~~monte_carlo~~ — SHIPPED (§38 shift; §42 ui32→U32 host-boundary dtype) |
 | 5 | `complex-dtype` | 1 | fft |
 | ~~6~~ | ~~`stablehlo.case` + non-canonical dot_general~~ | ~~1~~ | ~~brax_step~~ — **SHIPPED §43** (case→sibling OP_IFs, if, transpose-canonicalized dot; reduce-and/scatter/ui32 already done §41/§42) |
+| ~~5~~ | ~~`complex-dtype`~~ | ~~1~~ | ~~fft~~ — SHIPPED §43 (complex64 split (real,imag) f32 pair + stablehlo.fft as DFT-matmul) |
+| 6 | `reduce(and)` int/bool all-any (§41 gap; ex-`platform-allowlist`+`sdy` §41 + `ui32/i32` §42 all SHIPPED — brax now LOWERS, blocked on this device op) | 1 | brax_step |
 
 *(§42: general `stablehlo.scatter` SHIPPED (OP_SCATTER_INDEX) — mirror of the
 §38 gather. Unlocks the index-update op class: `.at[idx].set/add/max/min`,

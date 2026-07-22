@@ -3662,3 +3662,52 @@ lax.cond), dot transpose cases, and 3 e2e (`_case_e2e_body` on mega + host,
 `_brax_e2e_body`). C++ `runtime_test` PASS. brax e2e confirmed on NVIDIA + PoCL
 vs CUDA golden. New op count unchanged (OP_IF already existed, now wired end to
 end).
+## 43. SHIPPED: complex64 as a split (real, imag) f32 pair + stablehlo.fft (DFT-matmul) — fft unlocked (2026-07-22)
+
+**Context.** `fft` was the last non-brax coverage gap (docs/workload-coverage.md
+16/18). Its blocker was the complex64 dtype: the arena is strictly 4-byte-slotted
+f32, and complex64 is an 8-byte (real, imag) pair. `jnp.abs(jnp.fft.fft(sig))`
+lowers to `convert(f32→complex) → stablehlo.fft → abs(complex→f32)`.
+
+**Options weighed.**
+- (a) Teach the arena an 8-byte complex dtype — a format break rippling through
+  the buffer table, executor, every tile op's element addressing, and both numpy
+  validators. Big, invasive, risky.
+- (b) **Split-complex in the lowering (chosen):** represent each complex-typed
+  SSA value as a PAIR of ordinary f32 buffers `(re_id, im_id)`, held in a new
+  `ctx.cbuf` side-map (mirroring `ctx.value_to_buf`), propagated across
+  func.call/return by `lowering._alias_value`. Every complex op decomposes into
+  the f32 ADD/SUB/MUL/SQRT/DOT the VM ALREADY runs — **zero new opcodes, zero new
+  tile ops, zero device/executor changes.** Both engines and both validators
+  cover it for free.
+
+**FFT = direct DFT via constant twiddle matmul.** X = x @ W with W[k,n] =
+exp(-2πi kn/N) precomputed at lowering time as two f32 N×N const matrices
+(Wr=cos, Wi=−sin; W symmetric so the batched form is `X(B,N)=x(B,N)@W`). Split
+algebra: `Xr = xr@Wr − xi@Wi`, `Xi = xr@Wi + xi@Wr` — four OP_DOTs + one add +
+one sub. This is O(N²), not Cooley-Tukey O(N log N), but correct for every N and
+cheap at the bench size (N=512 → two 1 MB const matrices). Verified:
+`max|·|` vs `np.fft.fft` is **5.7e-5 on PoCL** (tight; f32 DFT precision) and
+**0.039 on NVIDIA** (TF32 matmul, same widening as every other matmul; clears
+the suite's allclose because FFT magnitudes are large).
+
+**Landed complex coverage.** convert(real→complex / complex→complex),
+complex/real/imag, add/subtract/multiply/negate on complex (split algebra),
+abs (modulus = sqrt(re²+im²)), and 1-D forward fft. All in
+`python/pjrt_ocl/ops/complex_fft.py` by WRAPPING the existing f32 handlers
+(convert/abs/add/subtract/multiply/negate) — complex operands take the split
+path, everything else delegates unchanged.
+
+**Result.** `fft` **PASS** on our backend, **gap 1.68× vs CUDA** (0.080 vs
+0.048 ms) — the DFT is a plain matmul, exactly the shape our DOT handles well.
+Coverage 16/18 → **17/18** (only `brax_step` remains, blocked on the §42
+`reduce(and)` device-op gap, unrelated). pytest 383→394 (11 new
+tests/test_ops_fft.py, both validators). No regressions.
+
+**Honest scope / future work.** Forward 1-D FFT only. IFFT / RFFT / IRFFT and
+multi-axis FFT raise a clear LoweringError (not silently wrong). A large-N
+production FFT would swap the DFT matmul for a radix-2 butterfly network (still
+strictly-linear bytecode, still f32 split-pair) — recorded, not built. complex128
+is rejected (arena is f32). The top-level func may not RETURN a complex value
+(PJRT output buffers are single f32 arrays) — only real projections (abs/real/
+imag) cross the host boundary, which is all a magnitude-spectrum program needs.
