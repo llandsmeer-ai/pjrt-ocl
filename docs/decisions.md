@@ -4142,12 +4142,30 @@ standalone probe: a tiny back-to-back kernel costs **2.13 us**, and making the
 chain strictly DEPENDENT (each launch reads the previous one's output, as VM
 phases do) changes nothing — **2.15 us** at 256 elements, **2.37 us** at 9216.
 Grid size is irrelevant (1 workgroup vs 32 both ~2.15 us): it is pure launch
-latency. We pay 4.2-9.0 us. The gap is inside `vm2_seg`, whose prologue chases
-three DEPENDENT global loads before any arithmetic (`seg_tab[..]` -> `entries[..]`
--> `tasks[en.task]`) and which unconditionally declares 8 KB of `__local`
-(`MMA_ASZ`+`MMA_BSZ`), capping occupancy. Fast-path idea (not yet built): for
-the common single-entry phase, pass the task descriptor in as kernel ARGS and
-skip the pointer chase.
+latency. We pay 4.2-9.0 us.
+
+**Both obvious explanations for that gap are WRONG — measured, do not redo.**
+A standalone probe compared three kernels of identical arithmetic:
+
+| kernel | us/launch |
+|---|---|
+| plain | 1.69 |
+| + 8 KB `__local` (== `MMA_ASZ`+`MMA_BSZ`, as `vm2_seg` declares) | 1.72 |
+| + 3 DEPENDENT descriptor loads (`seg_tab`->`entries`->`tasks`) | 1.70 |
+
+So neither `vm2_seg`'s unconditional 8 KB of `__local` nor its three-deep
+pointer chase costs anything measurable. The "pass the task descriptor as kernel
+args to skip the chase" idea is therefore dead — it would buy ~0.
+
+**Remaining suspect: the size of the monolithic `vm2_seg` kernel itself.** It
+carries the ENTIRE op library behind one opcode switch, and a large kernel pays
+in register pressure and instruction fetch regardless of which arm runs. This is
+exactly the risk CLAUDE.md flags ("watch compile time / register pressure as the
+op library grows; mitigation is splitting into multiple VM kernels by op
+family") — and that split is the mitigation to try next. NOT yet measured;
+whoever picks it up should first confirm the cost is kernel-size-related, e.g.
+by timing a phase of a trivial op against a deliberately stripped-down VM kernel
+build, before doing the (substantial) split.
 
 **THE HARD FLOOR — state this before promising anyone "faster than CPU".**
 Our per-Execute dispatch floor is ~33 us with ~5-6 us per I/O buffer (§49).
