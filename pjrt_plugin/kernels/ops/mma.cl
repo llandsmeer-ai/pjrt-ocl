@@ -157,9 +157,100 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
     }
 }
 
-#else  /* portable scalar 4x4 microtile */
-
+#elif defined(VMO_CPU_TILES)
+/* fwd decl: the staging body is defined below the variant chain. */
+static void vmo_mma_tile_stage(__global uchar *arena, __global uchar **iop,
+                               __global const int *aux, const task_t t,
+                               uint tile, __local float *As, __local float *Bs);
+/* CPU mma tile (poc/09 [b3], decisions.md #11): the poc/09-b2 4x16 float8
+ * register microkernel embedded in the tile interface. WIs 0..63 each own a
+ * 4-row x 16-col block of the 64x64 output tile (idle WIs measured ~4%
+ * overhead); NO __local staging, NO barriers — both are pure loss on CPU
+ * OpenCL runtimes (b1 8.0 vs b3 35.4 GFLOP/s under identical load). Viewed
+ * (av/bv) operands and edge blocks fall back to a guarded scalar loop with
+ * identical semantics to the portable variant below. */
 static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global const int *aux,
+                     const task_t t, uint tile,
+                     __local float *As, __local float *Bs)
+{
+    (void)As; (void)Bs;
+    const uint M = t.p0, N = t.p1, K = t.p2;
+    const uint tiles_n = (N + MMA_TN - 1) / MMA_TN;
+    const uint tiles_m = (M + MMA_TM - 1) / MMA_TM;
+    const uint per = tiles_m * tiles_n;
+    const uint g = tile / per, loc = tile % per;
+    const uint tr = loc / tiles_n, tc = loc % tiles_n;
+    const uint row0 = tr * MMA_TM, col0 = tc * MMA_TN;
+    const uint lid = get_local_id(0);
+    const uint av = t.p4, bv = t.p5;
+    __global const float *ba = AP(const float, t.a);
+    __global const float *bb = AP(const float, t.b);
+    __global const float *ga = ba + (size_t)g * M * K;
+    __global const float *gb = bb + (size_t)g * K * N;
+    __global float *gd = AP(float, t.dst) + (size_t)g * M * N;
+    if (av || bv) {
+        /* Folded transpose/reshape operands: staging body (uniform per-tile
+         * condition — the whole workgroup takes this branch and reaches its
+         * barriers together). */
+        vmo_mma_tile_stage(arena, iop, aux, t, tile, As, Bs);
+    } else {
+    /* lid gate is an if-wrap, not a return: PoCL 5.0 region formation is
+     * fragile around returns in functions inlined next to barrier-bearing
+     * tile cases (decisions.md #18), even without a barrier here. */
+    if (lid < 64u) {
+    const uint r0 = row0 + (lid / 4u) * 4u;    /* this WI's 4-row block */
+    const uint c0 = col0 + (lid % 4u) * 16u;   /* this WI's 16-col strip */
+    if (r0 + 4u <= M && c0 + 16u <= N) {
+        float8 a0[4], a1[4];
+        for (int i = 0; i < 4; ++i) { a0[i] = (float8)(0.0f); a1[i] = (float8)(0.0f); }
+        for (uint k = 0; k < K; ++k) {
+            const float8 b0 = vload8(0, gb + k * N + c0);
+            const float8 b1 = vload8(0, gb + k * N + c0 + 8u);
+            for (int i = 0; i < 4; ++i) {
+                const float8 avv = (float8)(ga[(r0 + i) * K + k]);
+                a0[i] = mad(avv, b0, a0[i]);
+                a1[i] = mad(avv, b1, a1[i]);
+            }
+        }
+        for (int i = 0; i < 4; ++i) {
+            vstore8(a0[i], 0, gd + (r0 + i) * N + c0);
+            vstore8(a1[i], 0, gd + (r0 + i) * N + c0 + 8u);
+        }
+    } else {                                   /* edges / viewed operands */
+        for (uint i = 0; i < 4u; ++i) {
+            const uint gr = r0 + i;
+            if (gr >= M) continue;
+            for (uint j = 0; j < 16u; ++j) {
+                const uint gc = c0 + j;
+                if (gc >= N) continue;
+                float s = 0.0f;
+                for (uint k = 0; k < K; ++k) {
+                    const float x = av
+                        ? ba[vmo_view_idx(aux, av - 1u,
+                              (uint)((size_t)g * M * K + (size_t)gr * K + k))]
+                        : ga[gr * K + k];
+                    const float y = bv
+                        ? bb[vmo_view_idx(aux, bv - 1u,
+                              (uint)((size_t)g * K * N + (size_t)k * N + gc))]
+                        : gb[k * N + gc];
+                    s = mad(x, y, s);
+                }
+                gd[gr * N + gc] = s;
+            }
+        }
+    }
+    }
+    }
+}
+#endif  /* variant-specific vmo_mma_tile above */
+/* Portable staging matmul tile (4x4 register microtile over __local panels).
+ * Compiled on every device: non-NV, non-CPU builds alias it as THE mma tile
+ * (wrapper at end of file); the CPU build dispatches viewed-operand tiles
+ * here — staging amortizes vmo_view_idx across the workgroup once per
+ * K-block, where a scalar per-element fallback measured 25-35% slower
+ * end-to-end on the transformer. */
+
+static void vmo_mma_tile_stage(__global uchar *arena, __global uchar **iop, __global const int *aux,
                      const task_t t, uint tile,
                      __local float *As, __local float *Bs)
 {
@@ -231,4 +322,12 @@ static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global c
     }
 }
 
-#endif  /* VMO_NV_PTX */
+
+#if !defined(VMO_NV_PTX) && !defined(VMO_CPU_TILES)
+static void vmo_mma_tile(__global uchar *arena, __global uchar **iop, __global const int *aux,
+                     const task_t t, uint tile,
+                     __local float *As, __local float *Bs)
+{
+    vmo_mma_tile_stage(arena, iop, aux, t, tile, As, Bs);
+}
+#endif

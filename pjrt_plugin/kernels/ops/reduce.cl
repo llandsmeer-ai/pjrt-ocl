@@ -145,6 +145,39 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
      * barriers below makes PoCL's parallel-region analysis assert
      * (region_entry_barrier != NULL). All work-items in a workgroup share `tile`,
      * so the barriers are reached uniformly. */
+#ifdef VMO_CPU_TILES
+    /* CPU shape: every intra-WG barrier is a PoCL loop-split, and the log
+     * tree costs ~9 of them per segment — the transformer runs hundreds of
+     * segments per layer. Per-WI partials + ONE barrier + serial combine by
+     * lid 0 (256 lane-adds by one WI is noise next to a loop-split). f32
+     * only; i32 falls through to the tree (rare in segment position). No
+     * returns, no trailing barrier as last statement (#18). */
+    if (dt != DT_I32 && dt != DT_U32) {
+        __global const float *a = AP(const float, t.a);
+        const float init = kind == 0 ? 0.0f : kind == 1 ? -INFINITY
+                         : kind == 2 ? INFINITY : 1.0f;
+        float acc = init;
+        if (valid)
+            for (uint j = lid; j < seg; j += lsz) {
+                const float v = a[base + j];
+                acc = kind == 0 ? acc + v : kind == 1 ? fmax(acc, v)
+                    : kind == 2 ? fmin(acc, v) : acc * v;
+            }
+        As[lid] = acc;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid == 0 && valid) {
+            float r = init;
+            const uint nw = min(lsz, seg);   /* only WIs < seg contributed */
+            for (uint w = 0; w < nw; ++w)
+                r = kind == 0 ? r + As[w] : kind == 1 ? fmax(r, As[w])
+                  : kind == 2 ? fmin(r, As[w]) : r * As[w];
+            AP(float, t.dst)[o] = r;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);  /* As is re-written by the next tile's
+            partials; joins the dt dispatch below, so NOT the last statement
+            of the switch case (#18). */
+    } else {
+#endif
     if (dt == DT_I32 || dt == DT_U32) {
         __global const int *a = AP(const int, t.a);
         __local int *Ai = (__local int *)As;
@@ -193,6 +226,9 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
         }
         if (lid == 0 && valid) AP(float, t.dst)[o] = As[0];
     }
+#ifdef VMO_CPU_TILES
+    }
+#endif
 }
 
 static void vmo_reduce_comb_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint dt,

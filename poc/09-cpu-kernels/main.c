@@ -122,6 +122,26 @@ static const char *SRC =
 "                          vstore8(acc[i][1],0,C+(r0+i)*N+c0+8); }\n"
 "  }\n"
 "}\n"
+/* b3: b2's 4x16 microkernel EMBEDDED in the megakernel tile interface —
+ * 256-WI workgroup, one 64x64 output tile, WIs 0..63 each own a 4-row x
+ * 16-col block, WIs 64..255 idle. Measures whether idle WIs in the CPU
+ * work-item loop cost anything vs b2's 1-WI/WG shape. */
+"__kernel void b3(__global const float*A, __global const float*B, __global float*C, uint N){\n"
+"  uint tiles_n=N/64u, tile=get_group_id(0);\n"
+"  uint row0=(tile/tiles_n)*64u, col0=(tile%tiles_n)*64u;\n"
+"  uint lid=get_local_id(0);\n"
+"  if(lid<64u){\n"
+"    uint r0=row0+(lid/4u)*4u, c0=col0+(lid%4u)*16u;\n"
+"    float8 a0[4],a1[4];\n"
+"    for(int i=0;i<4;i++){a0[i]=(float8)(0.0f);a1[i]=(float8)(0.0f);}\n"
+"    for(uint k=0;k<N;k++){\n"
+"      float8 b0=vload8(0,B+k*N+c0), b1=vload8(0,B+k*N+c0+8u);\n"
+"      for(int i=0;i<4;i++){ float8 av=(float8)(A[(r0+i)*N+k]);\n"
+"        a0[i]=mad(av,b0,a0[i]); a1[i]=mad(av,b1,a1[i]); }\n"
+"    }\n"
+"    for(int i=0;i<4;i++){ vstore8(a0[i],0,C+(r0+i)*N+c0); vstore8(a1[i],0,C+(r0+i)*N+c0+8u); }\n"
+"  }\n"
+"}\n"
 /* c1: GEMV via the MMA-tile shape is approximated by b1 with N-col=1 padded\n"
  * tile — measured separately in the harness by calling b1 on Nx64 (wasteful\n"
  * width) is not representative; instead c1 = classic 1-row-per-WI scalar dot,\n"
@@ -250,6 +270,9 @@ int main(void){
     double ms=run(q,k,M/4,1,1);
     printf("[b2] CPU 4x16 f8     : %7.2f ms  %6.1f GFLOP/s\n\n",ms,GF/ms); clReleaseKernel(k); }
 
+  { cl_kernel k=K(p,"b3"); CK(clSetKernelArg(k,0,8,&A));CK(clSetKernelArg(k,1,8,&B));CK(clSetKernelArg(k,2,8,&D));CK(clSetKernelArg(k,3,4,&M));
+    double ms=run(q,k,(size_t)(M/64)*(M/64)*256,256,1);
+    printf("[b3] b2-in-tile-iface: %7.2f ms  %6.1f GFLOP/s\n\n",ms,GF/ms); clReleaseKernel(k); }
   /* [C] GEMV N=2048 */
   { const cl_uint G2=2048; const double GBv=(double)G2*G2*4/1e6;
     cl_kernel k=K(p,"c1"); CK(clSetKernelArg(k,0,8,&A));CK(clSetKernelArg(k,1,8,&B));CK(clSetKernelArg(k,2,8,&D));CK(clSetKernelArg(k,3,4,&G2));
