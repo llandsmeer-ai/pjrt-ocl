@@ -66,6 +66,9 @@ TILE_GATHER_INDEX = 16   # §38 general data-dependent gather (16: 15 = TILE_RED
 TILE_CONV = 17           # §39 direct N-D convolution (NHWC input / HWIO kernel):
                          # out[b,osp,oc]=sum_{win,ic} in[b,isp,ic]*w[win,ic,oc].
                          # a=input b=weights p0=aux word-offset p1=n_out; EW-style tiling
+TILE_SCATTER_INDEX = 18  # §42 general data-dependent scatter (18: 17 = TILE_CONV):
+                         # iterate UPDATE elems; each combines into operand result
+                         # via window coords + runtime scatter_indices (kind in aux)
 
 # EW subops (docs/vmprogram.md)
 EW_ADD = 0
@@ -118,6 +121,7 @@ _COST_KEYS = {
     TILE_REDUCE_PART: "reduce_tile_us",
     TILE_REDUCE_COMB: "reduce_tile_us",
     TILE_IOTA_DIM: "ew_tile_us",
+    TILE_SCATTER_INDEX: "gather_tile_us",
 }
 
 
@@ -174,7 +178,8 @@ class Task:
     def n_tiles(self) -> int:
         if self.tile_op in (TILE_EW, TILE_GATHER, TILE_IOTA_DIM, TILE_SCATTER,
                              TILE_DYN_GATHER, TILE_DYN_SCATTER, TILE_RED_WINDOW,
-                             TILE_MAP_REGION, TILE_GATHER_INDEX, TILE_CONV):
+                             TILE_MAP_REGION, TILE_GATHER_INDEX, TILE_CONV,
+                             TILE_SCATTER_INDEX):
             return max(1, math.ceil(self.p1 / TILE_SIZE))
         if self.tile_op == TILE_RED_STRIDED:
             return max(1, math.ceil(self.p0 / TILE_SIZE))   # p0 = n_out, EW-style

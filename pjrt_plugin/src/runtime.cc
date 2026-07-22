@@ -204,7 +204,8 @@ bool VmProgram::Parse(const uint8_t* data, size_t len, VmProgram* out,
       return fail("select pred id out of range");
     if ((base_op == kTopGather || base_op == kTopIotaDim ||
          base_op == kTopDynGather || base_op == kTopDynScatter ||
-         base_op == kTopRedWindow || base_op == kTopGatherIndex) &&
+         base_op == kTopRedWindow || base_op == kTopGatherIndex ||
+         base_op == kTopScatterIndex) &&
         t.p0 >= n_aux)
       return fail("task aux offset out of range");
     // MMA operand VIEW aux-offsets (+1; 0 = contiguous) index the aux pool.
@@ -837,6 +838,19 @@ std::unique_ptr<LoadedProgram> LoadedProgram::Load(OclRuntime* rt,
       const size_t x = t.p0;
       if (x + 6 > aux.size()) {
         *err = "LoadedProgram: gather-index aux block out of range";
+        return nullptr;
+      }
+      aux[x + 4] = static_cast<int32_t>(
+          elem_off(static_cast<uint32_t>(aux[x + 5])));
+      continue;
+    }
+    if (base_op == kTopScatterIndex) {
+      // §42 general scatter aux header: [out_rank, nidx, si_vec_stride, is64,
+      // idx_byteoff(placeholder), idx_bufid, kind, ...]. Same start_indices
+      // location patch as the gather (word 4 from the buffer id in word 5).
+      const size_t x = t.p0;
+      if (x + 7 > aux.size()) {
+        *err = "LoadedProgram: scatter-index aux block out of range";
         return nullptr;
       }
       aux[x + 4] = static_cast<int32_t>(
