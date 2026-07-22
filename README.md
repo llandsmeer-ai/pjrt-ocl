@@ -8,8 +8,7 @@ on the execution path.
 > ⚠️ **Experimental / work in progress.** A growing subset of StableHLO ops across the
 > full JAX dtype matrix (f32/f64/i32/u32/i64/bool/f16/bf16), not yet on PyPI. Validated
 > end-to-end on an NVIDIA RTX PRO 6000 (via NVIDIA's OpenCL), an Intel Arc 140V
-> **Xe2** iGPU, and on PoCL (CPU) — see the
-> [known Xe2 `softmax` bug](#intel-arc-140v-xe2-lunar-lake-igpu--vs-jax-cpu). Not
+> **Xe2** iGPU, and on PoCL (CPU). Not
 > affiliated with Google, OpenXLA, or the JAX project.
 >
 > **Workload coverage:** a diverse testbench of **18 AI + scientific + physics workloads**
@@ -136,7 +135,7 @@ Anything unsupported raises a clear `LoweringError` naming the op.
 ## Hardware tested & benchmarks
 
 Correctness comes first; performance is early. Every device below runs the full
-test suite (407 tests: op families x the dtype matrix + e2e); benchmarks are
+test suite (408 tests: op families x the dtype matrix + e2e); benchmarks are
 per-op wall-clock vs problem size N so you can judge whether the library is
 worth it for *your* sizes and hardware. New devices go through
 [`docs/hardware-bringup.md`](docs/hardware-bringup.md).
@@ -335,15 +334,18 @@ native JAX plugin exists for this iGPU,
 so the reference is JAX's XLA **CPU** backend on the same package (Core Ultra
 9 288V) — cross-device but honest: it's the alternative you'd actually use.
 
-> ⚠️ **Known correctness bug on Xe2: `softmax` can return wrong results.**
-> The fused softmax kernel is non-deterministic *across processes* — e.g.
-> `jax.nn.softmax` on a (64,10) f32 array is wrong in ~14 of 16 runs, corrupting
-> a run of tail rows. The error (~5e-3 on ~0.1 values) is small enough to slip
-> under the test suite's tolerance, which is why everything above still reports
-> green. PoCL is unaffected. Bisected to `TOP_SOFTMAX_SEG`; **not yet fixed** —
-> details and a reproducer in `docs/decisions.md` §50. Treat Xe2 softmax (and
-> anything built on it) as suspect until then. Flash-attention uses a separate
-> kernel and is not implicated.
+> ✅ **Fixed: an intra-work-group data race in the VM engine** (`docs/decisions.md`
+> §56). It surfaced as `jax.nn.softmax` returning wrong results in ~14 of 16
+> *processes* on Xe2, but it was neither a softmax bug nor Xe2-specific: the
+> scheduler chains dependent elementwise ops within one phase with no barrier,
+> on the invariant "work-item `lid` re-reads what it wrote". That holds *across*
+> work-groups but not *within* one — a tile is executed by the whole work-group,
+> and different tile bodies use different element→work-item mappings (scalar
+> stride-`lsz` vs `float4` vs contiguous chunks), so a producer's last
+> grid-stride trip could still be in flight when the consumer read it. Latent
+> under the megakernel; exposed by the host-dispatch default. Fixed by publishing
+> a work-group barrier between fused tile entries. Verified 0/24 processes wrong
+> (was 15/16), full suite green on Xe2-host, Xe2-mega and PoCL.
 
 ![ours (OpenCL/Xe2) vs JAX CPU, per-op N-vs-time](docs/bench_plot_xe2.png)
 
