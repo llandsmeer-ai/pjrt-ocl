@@ -3536,3 +3536,56 @@ RED_STRIDED, RED_WINDOW) for i32 / u32 / bool over sum/max/min/and/or(/xor).
 Unblocks any int/bool-reduce program: MJX's pervasive `jp.all`/`jp.allclose`,
 `jp.any` masks, integer bitwise folds, unsigned pooling. (Scatter / erf_inv from
 §41's MJX list remain the next gaps; not touched here.)
+## 42. SHIPPED: general data-dependent scatter (stablehlo.scatter → OP_SCATTER_INDEX) — the mirror of §38 gather (2026-07-22)
+
+**What/why.** The write-side twin of the §38 general gather. Before this the only
+scatters we had were `OP_SCATTER` (a compile-time-affine view used by
+concatenate/pad) and `OP_DYNAMIC_UPDATE_SLICE` (a single runtime base offset).
+Real index scatters — `jnp.zeros().at[idx].set/add/max/min(x)`, histogram /
+segment-sum, MJX physics `.at[].set` — lower to `stablehlo.scatter`, where every
+UPDATE element's operand target comes from a runtime `scatter_indices` tensor.
+New op `OP_SCATTER_INDEX` / `kTopScatterIndex` (tile op 18) covers it, general
+over stablehlo's scatter `dimension_numbers` + the common update-computations.
+
+**Design (mirror of §38).** Reuse the gather's flat affine form, transposed to
+the write side. Iterate over update elements (one per grid-stride step); each
+maps to `op_off(i) = Σ_e coord_e·op_stride[e] + Σ_k clamp(S_k)·idx_op_stride[k]`
+with `S_k = scatter_indices[Σ_e coord_e·si_stride[e] + k·si_vec_stride]`, then
+combine `updates[i]` into `operand_result[op_off]`. `op_stride≠0` only on WINDOW
+update dims (`update_window_dims` ↔ non-inserted operand dims), `si_stride≠0`
+only on SCATTER update dims (↔ scatter_indices batch dims); `idx_op_stride` /
+`clamp_max` from `scattered_dims_to_operand_dims` + per-operand-dim window sizes
+(inserted dims → 1). The operand is first copied into the output via an identity
+`OP_GATHER_STRIDED`; the WAW on the output buffer barriers the scatter after the
+copy so it sees the full operand. Loader-patch + `reads_hint` for the
+scatter_indices location exactly like §38 (arena reuse / I/O ports move it).
+
+**Update kinds + write-conflict semantics.** The update-computation region is
+classified to `set` (bare `return %update`), `add`, `max`, `min`. Duplicate
+target indices are the crux: **add/max/min run through GLOBAL ATOMICS**
+(`atomic_add`/`atomic_max`/`atomic_min` for i32/u32; an `atomic_cmpxchg`-retry
+loop on the uint bit pattern for f32 — OpenCL has no core float atomics), so any
+tiling of the parallel update stream lands the exact stablehlo result regardless
+of order (these combines are associative+commutative). `set` is a plain store
+(stablehlo leaves duplicate-index overwrite order unspecified; a 4-byte aligned
+store never tears). Ambiguous / unsupported cases are **rejected loudly**, not
+silently wrong: variadic scatter, operand/indices batching dims, a
+non-(set/add/max/min) update-computation, and add/max/min on non-4-byte dtypes
+(only f32/i32/u32 have core atomics — `set` still covers any width).
+
+**Verified.** New `tests/test_ops_scatter.py` (11 cases: 1-D set/add, duplicate-
+index add/max/min, the canonical `jnp.zeros().at[idx].add`, whole-row N-D window
+set/add, 2-component (row,col) scalar scatter batch, i64 indices under x64, i32
+scatter-add) — both numpy validators (tensor interp + schedule simulator) PASS.
+Full pytest **356 passed / 1 skipped** (was 345). C++ `runtime_test` PASS.
+E2e through the real plugin, all `np.allclose` vs native CUDA on **both NVIDIA
+and PoCL**: set / duplicate-index add / histogram / (row,col) batch-add / row-set
+/ dup-max all bit-exact (f32 add reassociation ≤7e-7); int32 scatter-add + max
+bit-exact too. The atomic accumulate path is confirmed correct across parallel
+tiles (duplicate indices spanning workgroups).
+
+**Unlocks.** The scatter/index-update op class: `.at[idx].set/add/max/min`,
+histogram / segment-sum / one-hot accumulation, and one of MJX/brax's step
+blockers (`brax_step` still also needs `case`, `atan`, and its JAX-side threefry
+fix per §41 — scatter alone does not flip it green). New op count: tile ops
+0..18, python opcodes ..65.

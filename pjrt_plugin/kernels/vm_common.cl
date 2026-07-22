@@ -107,7 +107,14 @@ enum { TOP_EW = 0, TOP_MMA = 1, TOP_GATHER = 2, TOP_RED_PART = 3,
         * out[b,osp,oc] = sum_{win,ic} in[b, osp*stride+win*dil-pad, ic] * w[win,ic,oc].
         * a=input b=weights p0=aux word-offset p1=n_out; EW-style output tiling.
         * Kernel: vmo_conv_tile (ops/conv.cl); loader: ops/conv.py. */
-       TOP_CONV = 17 };
+       TOP_CONV = 17,
+       /* §42 general data-dependent scatter (stablehlo.scatter): mirror of
+        * TOP_GATHER_INDEX. Iterate over UPDATE elements; each maps to an operand
+        * location via window coords + a runtime scatter_indices buffer, and its
+        * value is combined into the operand result (kind 0 set / 1 add / 2 max /
+        * 3 min; add/max/min via global atomics). Kernel: vmo_scatter_index_tile
+        * (ops/scatter.cl); loader: ops/scatter_index.py. (18: 17 = TOP_CONV) */
+       TOP_SCATTER_INDEX = 18 };
 enum { SUB_ADD = 0, SUB_MUL, SUB_SUB, SUB_DIV, SUB_MAX, SUB_MIN, SUB_POW,
        SUB_COPY, SUB_NEG, SUB_EXP, SUB_LOG, SUB_SQRT, SUB_RSQRT, SUB_TANH,
        SUB_ABS, SUB_FLOOR, SUB_CEIL, SUB_SIGN, SUB_FILL, SUB_IOTA_FLAT,

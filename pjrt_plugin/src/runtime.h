@@ -55,7 +55,8 @@ enum TileOp : uint32_t {
   kTopRedStrided = 15, // partial-axis reduce over interior/prefix axis block
   kTopGatherIndex = 16,  // §38 general data-dependent gather (stablehlo.gather)
   kTopConv = 17,       // §39 direct N-D convolution (NHWC input / HWIO kernel)
-  kMaxTileOp = kTopConv,
+  kTopScatterIndex = 18,  // §42 general data-dependent scatter (stablehlo.scatter)
+  kMaxTileOp = kTopScatterIndex,
 };
 // dtype packed in tile_op bits 8-15 (matches python DT_* / vm_common.cl).
 enum VmDtype : uint32_t {

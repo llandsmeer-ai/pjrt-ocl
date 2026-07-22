@@ -58,6 +58,12 @@ Each row: how many suite workloads that op/feature would unlock, and which.
 | 5 | `complex-dtype` | 1 | fft |
 | 6 | `reduce(and)` int/bool all-any (§41 gap; ex-`platform-allowlist`+`sdy` §41 + `ui32/i32` §42 all SHIPPED — brax now LOWERS, blocked on this device op) | 1 | brax_step |
 
+*(§42: general `stablehlo.scatter` SHIPPED (OP_SCATTER_INDEX) — mirror of the
+§38 gather. Unlocks the index-update op class: `.at[idx].set/add/max/min`,
+histogram / segment-sum, and one of brax/MJX-step's blockers. Verified set/add/
+max/min bit-exact vs CUDA on NVIDIA + PoCL, incl. duplicate-index atomic accum.
+brax_step still needs `case` + `atan` + the §41 threefry fix, so it stays FAIL.)*
+
 ## Bottom line (generalization read)
 
 - Passers' gap vs CUDA spans **0.81x (layernorm) to 18.70x (transformer)**, median **7.2x**.
