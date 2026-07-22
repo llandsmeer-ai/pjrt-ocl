@@ -4183,6 +4183,24 @@ the large-GRF result is a caution that spill may not be the dominant term at
 all. Validate before building: e.g. compile a deliberately stripped VM kernel
 (few op arms) and check whether its per-phase cost approaches the 2.2 us floor.
 
+**Supporting evidence that the split IS worth building — §46 already ran this
+experiment for one op.** The standalone `mm2` SGEMM and the in-VM `vmo_mma_tile`
+compute the same matmul, and mm2 is **2.5x faster** (1443 vs 574 GFLOP/s at
+2048). The kernel comment states the mechanism outright: being its own kernel
+"gives it an independent register budget, so an 8x8 register microtile stays in
+registers instead of spilling — inside the shared megakernel the same tile
+spills catastrophically". That is precisely the op-family-split thesis,
+already measured, for the one op that got its own kernel. The open question is
+only whether the same holds for the CHEAP ops (elementwise/reduce) that dominate
+the loop workloads, where the arithmetic is too small to hide any overhead.
+
+**Per-phase cost is NOT constant across workloads** (4.2 spring_mass, 4.6
+rk4_ode, 7.7 hh_neuron, 8.3 logistic_map, 9.0 heat2d) — a 2x spread on the same
+kernel. So a fixed per-launch penalty cannot be the whole story; part of the
+cost tracks what the phase actually does. Any theory must account for
+logistic_map (256 elements, ~zero arithmetic) costing 8.3 us while spring_mass
+(64 masses) costs 4.2 us.
+
 **Mitigation (evidence-backed now, not speculative): the size of the monolithic `vm2_seg` kernel itself.** It
 carries the ENTIRE op library behind one opcode switch, and a large kernel pays
 in register pressure and instruction fetch regardless of which arm runs. This is
