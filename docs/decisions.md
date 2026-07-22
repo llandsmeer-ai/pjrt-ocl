@@ -4522,3 +4522,37 @@ arena's.
 programs containing a `TOP_SOFTMAX_SEG` task. It must be per-program and cannot
 be global — `vmo_mma_tile` requires 256 work-items (a 16x16 thread grid,
 `MMA_TDIM`), which is why `safe_at_lsz1()` in `runtime.cc` excludes `kTopMma`.
+
+## 55. OPEN BUG (pre-existing, now MASKED not fixed): gru/lstm returned ALL-ZERO on PoCL (2026-07-22)
+
+**Found** by the §52 phase-reduction agent as a side observation, and
+**independently confirmed here** by running the PRE-merge lowering against the
+current plugin:
+
+```bash
+. ./env.sh
+git archive HEAD^1 python/pjrt_ocl | tar -x -C /tmp/oldpy --strip-components=1
+JAX_PLATFORMS=opencl PJRT_OCL_DEVICE=Portable PYTHONPATH=/tmp/oldpy \
+  .venv/bin/python -c "...build('gru'); print(abs(out).max())"
+# -> 0.000000   (correct answer is 0.333973)
+```
+
+`gru` and `lstm` both returned **absmax 0.0** — the output buffer was never
+written — on **PoCL only**; Intel/Xe2 was correct. `pytest tests/` does not
+cover these workloads, so the suite was green throughout. The bench suite did
+flag it (`DIFF rel=1.0e+00`), which is why the workload testbench earns its
+keep as a correctness net, not just a perf scoreboard.
+
+**Status: MASKED, NOT FIXED.** The §52 identity-gather aliasing change stops the
+lowering emitting the pattern that triggers it (24 materialized identity gathers
+— `reshape(dynamic_slice(x,i))` feeding a DOT, one per scan iteration), so both
+workloads are correct at HEAD on both devices. `PJRT_OCL_CONCAT_GATHER=0` does
+NOT bring it back — the concat change is not what fixed it. The underlying
+runtime defect is untouched and will resurface for any program that materializes
+that shape. Signature (output buffer never written, device-specific) points at
+output/alias binding in the host-dispatch output path, NOT at arithmetic.
+
+**Do not close this as fixed.** The reproducer above is the only known handle on
+it; it needs a real root-cause on the runtime side, and ideally a `tests/` case
+covering gru/lstm on both devices so the next occurrence is caught by pytest
+rather than by a scoreboard someone happens to read.
