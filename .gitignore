@@ -20,3 +20,6 @@ pjrt_plugin/build-dev/
 poc/17-nv-mma/bench17
 poc/17-nv-mma/bench17hp
 poc/17-nv-mma/probe
+poc/21-xe2-xmx/probe21
+poc/21-xe2-xmx/bench21
+poc/21-xe2-xmx/tf32bits
