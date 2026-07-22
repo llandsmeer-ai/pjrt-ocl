@@ -3959,3 +3959,49 @@ better kernel returns. Attention stays on the in-VM tile, by evidence.
 (2.4–2.7x JAX CPU at every size). The next real lever is not tiling or routing —
 it is the XMX matrix engine (bf16, vendor extension, needs the kernel-table
 override), evaluated separately in poc/21.
+
+## 49. The small-op floor is ~33 us of HOST overhead, not OpenCL — zero-copy I/O measured and REVERTED (2026-07-22)
+
+**Context.** Below ~1M elements Xe2 is 2–6x slower than XLA CPU. §47 showed the
+large-array side is at the bandwidth wall, so the small side is all dispatch.
+Quantified on Xe2, per `jax.jit` call:
+
+| program | us/call |
+|---|---|
+| `lambda x: x` (identity, zero instructions) | **32** |
+| `x + 1.0` on 1024 elems | 43 |
+| chain of 8 adds on 1024 elems | 43 (fused — see §47) |
+| identity, JAX **native CPU/XLA** backend | **3.7** |
+
+So compute is ~7 us and **our plugin adds ~29 us per Execute over what JAX's own
+dispatch costs**. It is NOT device-specific: PoCL floors at 35 us, essentially
+the same, so it is host-side C++/PJRT work, not GPU launch. (Raw OpenCL floor on
+Xe2 for reference: bare `clFinish` 0.6 us, null kernel launch + `clFinish`
+10 us.)
+
+**Hypothesis 1 — per-Execute `clCreateBuffer`/`clReleaseMemObject` for ported
+I/O buffers. WRONG.** Measured create+release at 0.24 us on Xe2 (0.14 on PoCL),
+size-independent — the driver allocates lazily. Not the cost.
+
+**Hypothesis 2 — H2D/D2H transfer cost; fix with zero-copy. WRONG end-to-end,
+and REVERTED.** On an integrated GPU host and device share DRAM, so I/O buffers
+can be `CL_MEM_ALLOC_HOST_PTR`. Microbenchmark supported it: a 4 KB
+`clEnqueueWriteBuffer`+`clFinish` drops **11.4 -> 7.1 us** (1.6x), and the
+obvious risk was disproved — large-buffer triad is **107.5 vs 107.8 GB/s**, no
+penalty (same DRAM either way; `clEnqueueMapBuffer` was *worse*, 14.4 us). It was
+implemented, gated strictly on `CL_DEVICE_HOST_UNIFIED_MEMORY` (Xe2/PoCL 1,
+NVIDIA 0 — inert there), and then **A/B measured as a WASH**: identity 33.8 (on)
+vs 33.1 (off) us on Xe2, 34.0 vs 33.9 on PoCL. Reverted rather than ship dead
+complexity.
+
+**Why the microbenchmark did not transfer:** our Execute already enqueues every
+input write and output read ASYNCHRONOUSLY (`CL_FALSE`) and pays exactly ONE
+`clFinish` at the end. The 1.6x measured above is per-transfer *synchronisation*
+cost, which we never pay. The transfer path was already efficient.
+
+**Where the ~29 us actually is: not yet localized.** It is host-side and
+device-independent, so the candidates are the PJRT C-API boundary, per-Execute
+program/entry/segment setup, and the host-dispatch phase walk — not OpenCL. A
+profiler run (perf on the plugin .so during a small-op loop) is the right next
+step; guessing has now cost two wrong hypotheses. Recorded so the next attempt
+starts from measurement, and so nobody re-tries zero-copy I/O expecting a win.
