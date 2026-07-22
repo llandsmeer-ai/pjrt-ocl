@@ -58,7 +58,10 @@ def check_typed(f, *args, rtol=1e-5, atol=1e-5):
         e = np.asarray(e)
         for tag, got in (("tensor validator", gt), ("schedule simulator", gs)):
             got = got.reshape(e.shape)
-            assert got.dtype == e.dtype, (
+            # bool is stored 1-byte (uint8 0/1) by design; jax reports bool.
+            # Treat that storage pair as equal, else require an exact match.
+            bool_pair = {got.dtype, e.dtype} == {np.dtype(bool), np.dtype("u1")}
+            assert got.dtype == e.dtype or bool_pair, (
                 f"{tag} dtype mismatch on output {i}: {got.dtype} vs {e.dtype}")
             if np.issubdtype(e.dtype, np.integer):
                 np.testing.assert_array_equal(

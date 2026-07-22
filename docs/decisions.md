@@ -3414,3 +3414,63 @@ untouched: pytest 344 passed / 1 skipped; NVIDIA tf32 default `--check` PASS.**
 Reproduce: `PJRT_OCL_MM_FP16=1 PJRT_OCL_MM_HYBRID=1` on
 `tools/bench_transformer.py --config {base,large}` and
 `tools/bench_suite/run_suite.py --only mlp attention`.
+
+## 42. Integer / bool reductions: dtype-dispatched reduce tile ops (2026-07-22)
+
+**Front:** §41 flagged our reduce as WRONG for INT/BOOL-stored values — the
+reduce tile ops assumed f32 slots, so reduce-and / reduce-or over bool (the MJX
+`jp.allclose` / `jp.all` idiom) and unsigned min/max over u32 produced garbage.
+This was a real correctness bug, not a perf item.
+
+### What was actually broken (measured)
+1. **bool reduce fully broken.** Bool is stored 1-byte (`uchar` 0/1). The reduce
+   kernels dispatched only `DT_I32 || DT_U32` to the integer path; DT_BOOL fell
+   to the FLOAT path, reading 1-byte bool through a `float*` (4-byte stride) —
+   garbage. And `stablehlo.and/or/xor` reducer bodies weren't even in
+   `_KIND_BY_REGION_OP`, so `jp.all` / `jp.any` raised LoweringError before
+   reaching a kernel.
+2. **u32 max/min used SIGNED compare.** `_elem_dtype` collapses signless/unsigned
+   i32 to `DT_I32` (unsigned is normally distinguished per-op, e.g. compare_type).
+   Reductions never recovered the signedness, so u32 max/min sign-flipped on
+   values > INT_MAX, and — worse — `jnp.max` over `ui32` didn't even LOWER: JAX
+   emits init=0 (the unsigned-max identity) but our identity check demanded
+   INT_MIN. Same in `reduce_window` (max/sum-pool over u32).
+
+### Fix (kernel + lowering, all reduce paths)
+- **Kernel** (`reduce.cl`): added `vmo_ired_ident` / `vmo_ired_comb` — an
+  integer/bool kind table extending f32's 0..3 (sum/max/min/prod) with 4 and /
+  5 or / 6 xor, plus an `is_uns` flag selecting UNSIGNED compare + correct
+  min/max identities (0 / UINT_MAX). Rewired RED_PART, RED_COMB, RED_SEG,
+  RED_STRIDED to dispatch `DT_I32 || DT_U32 || DT_BOOL` through it; bool rides
+  the int path (uchar load, result masked to 0/1 so the empty/`all`-identity
+  `~0` stores as `1`). `reduce_window.cl` got the unsigned max/min fix too.
+  Barrier discipline (§18) unchanged — no new early-returns before barriers.
+- **Lowering** (`ops/reduce.py`, `ops/reduce_window.py`): mapped
+  `stablehlo.and/or/xor` → AND/OR/XOR kinds; widened the REDUCE part/comb `imm`
+  kind field from 2→3 bits (`(phase<<3)|kind`); taught `_assert_identity` the
+  and/or/xor identities (all-ones = -1 signed / UINT_MAX unsigned; 0 for or/xor;
+  bool: and→True, or/xor→False) and to reject bitwise reducers on f32; and
+  recover unsignedness from the operand MLIR type (`IntegerType.is_unsigned`,
+  width 32 → DT_U32) so u32 reduce lowers AND runs unsigned. Numpy references
+  (`_reduce_np{,_axis,_axis1}`) grew and/or/xor via `np.bitwise_*.reduce` so
+  both validators stay bit-exact.
+
+### Verified (correctness is the deliverable; measured nothing perf)
+- **On-device e2e, BOTH engines and BOTH devices** (`tests/_reduce_int_e2e_body.py`,
+  wired as `test_e2e_reduce_int_bool_*`): every reduce PATH × dtype × reducer —
+  i32/u32 sum/max/min (full, suffix RED_SEG, strided RED_STRIDED), i32 and/or,
+  bool all/any (full/suffix/strided), the `jp.allclose` mask idiom, and i32
+  sum-pool / u32 max-pool windows — checked against numpy. **u32 cases use
+  values > INT_MAX** so a signed compare would pick the wrong element. PASS on
+  NVIDIA (megakernel spin-barrier) and PoCL, megakernel and host-dispatch.
+- **Dual-validator** (`tests/test_ops_reduce.py`): 26 new cases (u32 sum/max/min,
+  i32 and/or/xor full+axis, bool all/any full+axis, DT_BOOL output-buffer check).
+- Full suite **372 passed / 1 skipped** (was 345), no regressions. `check_typed`
+  loosened once: bool↔uint8 is our by-design 1-byte bool storage vs jax's `bool`.
+
+### Outcome
+int/bool reduce now correct on **all 5 tile paths** (RED_PART+COMB, RED_SEG,
+RED_STRIDED, RED_WINDOW) for i32 / u32 / bool over sum/max/min/and/or(/xor).
+Unblocks any int/bool-reduce program: MJX's pervasive `jp.all`/`jp.allclose`,
+`jp.any` masks, integer bitwise folds, unsigned pooling. (Scatter / erf_inv from
+§41's MJX list remain the next gaps; not touched here.)

@@ -32,7 +32,7 @@ and the scheduler drops a global BARRIER between them automatically — the
 part-phase completes on every lane before any lane starts the comb-phase.
 
 Both instructions share opcode OP_REDUCE (26); the phase + kind ride in
-``Instr.imm`` (``imm = (phase << 2) | kind``) so the phase-free scheduler
+``Instr.imm`` (``imm = (phase << 3) | kind``) so the phase-free scheduler
 mapper, the tensor interp and the tile simulators can all recover them from the
 instruction alone. ``chunk`` is NOT transported: it is a deterministic function
 of ``n`` (``_chunk_for``) recomputed identically by every consumer, so the
@@ -49,10 +49,13 @@ from ..scheduler import (Task, TILE_REDUCE_PART, TILE_REDUCE_COMB, TILE_RED_SEG,
                          TILE_RED_STRIDED, TILE_SOFTMAX_SEG, TILE_LAYERNORM_SEG,
                          TILE_SIZE)
 
-# reduction kinds (docs/vmprogram.md v2.1 REDUCE table)
-SUM, MAX, MIN, PROD = 0, 1, 2, 3
+# reduction kinds (docs/vmprogram.md v2.1 REDUCE table). Kinds 0..3 are the
+# f32-capable reducers; 4..6 are the bitwise reducers (int/bool only), from
+# stablehlo.and/or/xor (jp.all / jp.any). The kernel's vmo_ired_* table mirrors
+# these exactly.
+SUM, MAX, MIN, PROD, AND, OR, XOR = 0, 1, 2, 3, 4, 5, 6
 
-# imm phase tag (low 2 bits carry kind, bit 2 carries phase)
+# imm phase tag (low 3 bits carry kind 0..6, bit 3 carries phase)
 PHASE_PART = 0
 PHASE_COMB = 1
 
@@ -61,10 +64,17 @@ _KIND_BY_REGION_OP = {
     "stablehlo.maximum": MAX,
     "stablehlo.minimum": MIN,
     "stablehlo.multiply": PROD,
+    "stablehlo.and": AND,
+    "stablehlo.or": OR,
+    "stablehlo.xor": XOR,
 }
 
+# bitwise reducers are valid for integer/bool operands only (never f32).
+_BITWISE_KINDS = frozenset({AND, OR, XOR})
+
 # integer dtypes whose reduce uses integer accumulation + iinfo identities
-# (matches reduce.cl's i32/u32 path). bool/f-types use the float path.
+# (matches reduce.cl's i32/u32 path). bool is 1-byte-stored but rides the same
+# integer kernel path (uchar load, result masked to 0/1); f-types use float.
 _INT_DTYPES = frozenset({L.DT_I32, L.DT_U32, L.DT_I64})
 
 
@@ -82,11 +92,11 @@ def _n_parts(n: int) -> int:
 
 
 def _encode_imm(phase: int, kind: int) -> int:
-    return (phase << 2) | kind
+    return (phase << 3) | kind
 
 
 def _decode_imm(imm: int) -> tuple[int, int]:
-    return (imm >> 2) & 1, imm & 3
+    return (imm >> 3) & 1, imm & 7
 
 
 # --- stablehlo handler ------------------------------------------------------
@@ -103,7 +113,7 @@ def _read_scalar_const(value, dt: int):
             "reduce: init value is not a compile-time constant "
             "(cannot verify it is the reduction identity)")
     attr = op.attributes["value"]
-    if dt in _INT_DTYPES:
+    if dt in _INT_DTYPES or dt == L.DT_BOOL:
         vals = np.asarray(ir.DenseIntElementsAttr(attr)).reshape(-1)
     else:
         vals = np.asarray(ir.DenseFPElementsAttr(attr)).reshape(-1)
@@ -113,14 +123,32 @@ def _read_scalar_const(value, dt: int):
 
 
 def _assert_identity(kind: int, init, dt: int) -> None:
-    if dt in _INT_DTYPES:
+    if dt == L.DT_BOOL:
+        b = bool(init)
+        # and: identity True; or/xor: identity False. (max<->or, min<->and on
+        # 0/1, but jax only emits and/or/xor reducers over bool.)
+        ok = ((kind == AND and b is True) or
+              (kind == OR and b is False) or
+              (kind == XOR and b is False) or
+              (kind == MIN and b is True) or
+              (kind == MAX and b is False))
+    elif dt in _INT_DTYPES:
         import numpy as np
         info = np.iinfo(L.DTYPE_NUMPY[dt])
+        # and-identity is all-ones: -1 signed, info.max (UINT_MAX) unsigned.
+        allones = info.max if dt == L.DT_U32 else -1
         ok = ((kind == SUM and init == 0) or
               (kind == PROD and init == 1) or
               (kind == MAX and init == info.min) or
-              (kind == MIN and init == info.max))
+              (kind == MIN and init == info.max) or
+              (kind == AND and init == allones) or
+              (kind == OR and init == 0) or
+              (kind == XOR and init == 0))
     else:
+        if kind in _BITWISE_KINDS:
+            raise L.LoweringError(
+                f"reduce: bitwise reducer kind {kind} is not valid for a "
+                "floating-point operand")
         ok = ((kind == SUM and init == 0.0) or
               (kind == PROD and init == 1.0) or
               (kind == MAX and math.isinf(init) and init < 0) or
@@ -141,6 +169,13 @@ def _reduce(ctx, op):
 
     in_shape, n_in, in_dt = L.tensor_info(op.operands[0].type)
     in_rank = len(in_shape)
+    # `_elem_dtype` collapses signless/unsigned i32 to DT_I32 (unsigned is
+    # normally distinguished per-op, e.g. compare_type). Reductions need the
+    # signedness for max/min (UNSIGNED compare) and identities (max->0,
+    # min->UINT_MAX), so recover it from the operand type and route to DT_U32.
+    et = ir.ShapedType(op.operands[0].type).element_type
+    if isinstance(et, ir.IntegerType) and et.is_unsigned and et.width == 32:
+        in_dt = L.DT_U32
     dims = sorted(int(x) for x in ir.DenseI64ArrayAttr(op.attributes["dimensions"]))
 
     # classify the reduction kind from the single compute op in the region body
@@ -215,13 +250,20 @@ def _reduce(ctx, op):
 # --- numpy reference semantics ----------------------------------------------
 
 def _reduce_np(arr, kind):
+    import numpy as np
     if kind == SUM:
         return arr.sum()
     if kind == MAX:
         return arr.max()
     if kind == MIN:
         return arr.min()
-    return arr.prod()
+    if kind == PROD:
+        return arr.prod()
+    if kind == AND:
+        return np.bitwise_and.reduce(arr, axis=None)
+    if kind == OR:
+        return np.bitwise_or.reduce(arr, axis=None)
+    return np.bitwise_xor.reduce(arr, axis=None)
 
 
 def _reduce_interp(ins, rt):
@@ -311,13 +353,20 @@ def _redseg_interp(ins, rt) -> None:
 
 
 def _reduce_np_axis(arr, kind):
+    import numpy as np
     if kind == SUM:
         return arr.sum(-1)
     if kind == MAX:
         return arr.max(-1)
     if kind == MIN:
         return arr.min(-1)
-    return arr.prod(-1)
+    if kind == PROD:
+        return arr.prod(-1)
+    if kind == AND:
+        return np.bitwise_and.reduce(arr, axis=-1)
+    if kind == OR:
+        return np.bitwise_or.reduce(arr, axis=-1)
+    return np.bitwise_xor.reduce(arr, axis=-1)
 
 
 def _redseg_sim(task, entry, rt):
@@ -364,13 +413,20 @@ def _redstrided_interp(ins, rt) -> None:
 
 
 def _reduce_np_axis1(arr, kind):
+    import numpy as np
     if kind == SUM:
         return arr.sum(1)
     if kind == MAX:
         return arr.max(1)
     if kind == MIN:
         return arr.min(1)
-    return arr.prod(1)
+    if kind == PROD:
+        return arr.prod(1)
+    if kind == AND:
+        return np.bitwise_and.reduce(arr, axis=1)
+    if kind == OR:
+        return np.bitwise_or.reduce(arr, axis=1)
+    return np.bitwise_xor.reduce(arr, axis=1)
 
 
 def _redstrided_sim(task, entry, rt):

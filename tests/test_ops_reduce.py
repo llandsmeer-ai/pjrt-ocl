@@ -8,6 +8,7 @@ reassociation error); prod uses small arrays to stay well under 2^24.
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import lax
 
 from oputil import check, check_typed
 from pjrt_ocl import scheduler, vmreader
@@ -22,6 +23,14 @@ def arr(*shape, lo=0, hi=8):
 
 def iarr(*shape, lo=0, hi=8):
     return jnp.asarray(RNG.integers(lo, hi, shape).astype(np.int32))
+
+
+def uarr(*shape, lo=0, hi=8):
+    return jnp.asarray(RNG.integers(lo, hi, shape).astype(np.uint32))
+
+
+def barr(*shape):
+    return jnp.asarray(RNG.integers(0, 2, shape).astype(bool))
 
 
 # --- full reductions, 1D/2D/3D ---------------------------------------------
@@ -67,6 +76,89 @@ def test_min_full_i32(shape):
 @pytest.mark.parametrize("shape", [(5,), (3, 3)])
 def test_prod_full_i32(shape):
     check_typed(lambda x: jnp.prod(x), iarr(*shape, lo=1, hi=4))
+
+
+# --- unsigned (u32) full / suffix / strided reductions ----------------------
+# §41: unsigned max/min must NOT sign-flip; the operand's ui32 type is recovered
+# in lowering (signless i32 collapses otherwise) and routed to DT_U32 so the
+# kernel uses UNSIGNED compare + 0 / UINT_MAX identities. These validator tests
+# stay in the int32 range so the signed-view interpreter agrees; full-range u32
+# (values > INT_MAX) is proven on-device by tests/_reduce_int_e2e_body.py.
+@pytest.mark.parametrize("shape", [(6,), (3, 4)])
+def test_sum_full_u32(shape):
+    check_typed(lambda x: jnp.sum(x), uarr(*shape, lo=0, hi=20))
+
+
+@pytest.mark.parametrize("shape", [(6,), (3, 4)])
+def test_max_full_u32(shape):
+    check_typed(lambda x: jnp.max(x), uarr(*shape, lo=0, hi=1000))
+
+
+@pytest.mark.parametrize("shape,axis", [((3, 4), 1), ((3, 4), 0)])
+def test_u32_axis_max_min(shape, axis):
+    check_typed(lambda x: jnp.max(x, axis), uarr(*shape, lo=0, hi=1000))
+    check_typed(lambda x: jnp.min(x, axis), uarr(*shape, lo=0, hi=1000))
+
+
+# --- integer bitwise reducers (and / or / xor) over i32 ---------------------
+# From stablehlo.and/or/xor reducer bodies (jp.all / jp.any lower to these over
+# bool; explicit lax.reduce for ints). §41: these had NO kernel dispatch.
+def _band(x, axis):
+    return lax.reduce(x, np.array(-1, x.dtype), lax.bitwise_and, tuple(axis))
+
+
+def _bor(x, axis):
+    return lax.reduce(x, np.array(0, x.dtype), lax.bitwise_or, tuple(axis))
+
+
+def _bxor(x, axis):
+    return lax.reduce(x, np.array(0, x.dtype), lax.bitwise_xor, tuple(axis))
+
+
+@pytest.mark.parametrize("red", [_band, _bor, _bxor])
+def test_int_bitwise_reduce_full(red):
+    check_typed(lambda x: red(x, (0, 1)), iarr(3, 5, lo=0, hi=1 << 20))
+
+
+@pytest.mark.parametrize("red", [_band, _bor, _bxor])
+@pytest.mark.parametrize("axis", [1, 0])
+def test_int_bitwise_reduce_axis(red, axis):
+    # axis=1 -> suffix (RED_SEG); axis=0 -> strided (RED_STRIDED)
+    check_typed(lambda x: red(x, (axis,)), iarr(4, 6, lo=0, hi=1 << 20))
+
+
+# --- bool reductions: jp.all (and) / jp.any (or) ----------------------------
+# §41 core blocker: MJX's jp.allclose needs reduce-and over bool. Bool is stored
+# 1-byte (uchar 0/1); the reduce kernels used to read it as f32 -> garbage.
+@pytest.mark.parametrize("shape", [(6,), (3, 4), (2, 3, 4)])
+def test_bool_all_full(shape):
+    check_typed(lambda x: jnp.all(x), barr(*shape))
+
+
+@pytest.mark.parametrize("shape", [(6,), (3, 4), (2, 3, 4)])
+def test_bool_any_full(shape):
+    check_typed(lambda x: jnp.any(x), barr(*shape))
+
+
+@pytest.mark.parametrize("axis", [1, 0])
+def test_bool_all_any_axis(axis):
+    # axis=1 -> suffix RED_SEG; axis=0 -> strided RED_STRIDED
+    check_typed(lambda x: jnp.all(x, axis), barr(4, 5))
+    check_typed(lambda x: jnp.any(x, axis), barr(4, 5))
+
+
+def test_bool_allclose_idiom():
+    # the exact jp.allclose pattern MJX leans on: all(|a-b| < atol)
+    a = arr(8, hi=5)
+    b = a
+    check_typed(lambda x, y: jnp.all(jnp.abs(x - y) < 1e-3), a, b)
+
+
+def test_bool_reduce_uses_bool_buffer():
+    # the reduce output must carry DT_BOOL (3), not f32 — the kernel dispatch
+    # keys on the result dtype byte.
+    prog = check_typed(lambda x: jnp.all(x), barr(20))
+    assert prog.buffers[prog.outputs[0]].dtype == 3
 
 
 def test_sum_large_multichunk_i32():
