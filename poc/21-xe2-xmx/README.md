@@ -106,8 +106,10 @@ trip the f32 kernel does not pay. With the (unoptimised) packing pass included:
 | 2048 | 0.57 | 10750 (5.8×) | 10592 (5.7×) | 6164 (3.3×) |
 
 The packer is deliberately naive (one work-item per element, scattered writes):
-at 2048 it moves 48 MB in 0.56 ms = 86 GB/s against poc/20's measured **109 GB/s**
-achievable ceiling, so a tuned packer buys at most ~20%. The real fix is to fold
+at 2048 it moves 50 MB in 0.57 ms = ~90 GB/s against poc/20's measured **109 GB/s**
+achievable ceiling, so a tuned packer buys at most ~20%. (tf32's pack is
+consistently slower — 0.72 ms — because it writes f32, 67 MB moved, not 50.)
+The real fix is to fold
 the conversion into the GEMM's load path (SLM-staged tiles), which removes the
 pass entirely and puts the kernel-only column back in reach. **Not done here.**
 
