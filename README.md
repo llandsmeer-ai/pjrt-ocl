@@ -7,7 +7,9 @@ on the execution path.
 
 > ⚠️ **Experimental / work in progress.** A growing subset of StableHLO ops across the
 > full JAX dtype matrix (f32/f64/i32/u32/i64/bool/f16/bf16), not yet on PyPI. Validated
-> end-to-end on an NVIDIA RTX PRO 6000 (via NVIDIA's OpenCL) and on PoCL (CPU). Not
+> end-to-end on an NVIDIA RTX PRO 6000 (via NVIDIA's OpenCL), an Intel Arc 140V
+> **Xe2** iGPU, and on PoCL (CPU) — see the
+> [known Xe2 `softmax` bug](#intel-arc-140v-xe2-lunar-lake-igpu--vs-jax-cpu). Not
 > affiliated with Google, OpenXLA, or the JAX project.
 >
 > **Workload coverage:** a diverse testbench of **18 AI + scientific + physics workloads**
@@ -324,10 +326,21 @@ latency is future scan/control-flow fusion work.
 
 ### Intel Arc 140V (Xe2, Lunar Lake iGPU) — vs JAX CPU
 
-**Testbench: full suite green** (`intel-opencl-icd` 26.22). No native JAX
-plugin exists for this iGPU, so the reference is JAX's XLA **CPU** backend on
-the same package (Core Ultra 9 288V) — cross-device but honest: it's the
-alternative you'd actually use.
+**Testbench: full suite green** (407 tests; `intel-opencl-icd` 26.22) and the
+**18-workload application suite is 18/18 PASS with zero missing ops**
+(`docs/workload-coverage-xe2.md`). No native JAX plugin exists for this iGPU,
+so the reference is JAX's XLA **CPU** backend on the same package (Core Ultra
+9 288V) — cross-device but honest: it's the alternative you'd actually use.
+
+> ⚠️ **Known correctness bug on Xe2: `softmax` can return wrong results.**
+> The fused softmax kernel is non-deterministic *across processes* — e.g.
+> `jax.nn.softmax` on a (64,10) f32 array is wrong in ~14 of 16 runs, corrupting
+> a run of tail rows. The error (~5e-3 on ~0.1 values) is small enough to slip
+> under the test suite's tolerance, which is why everything above still reports
+> green. PoCL is unaffected. Bisected to `TOP_SOFTMAX_SEG`; **not yet fixed** —
+> details and a reproducer in `docs/decisions.md` §50. Treat Xe2 softmax (and
+> anything built on it) as suspect until then. Flash-attention uses a separate
+> kernel and is not implicated.
 
 ![ours (OpenCL/Xe2) vs JAX CPU, per-op N-vs-time](docs/bench_plot_xe2.png)
 
@@ -343,14 +356,15 @@ alternative you'd actually use.
   (NVIDIA: hundreds of lanes) keep the megakernel. `PJRT_OCL_ENGINE=mega`
   forces it back. See `docs/decisions.md` §44.
 - **Large arrays are where the iGPU pays off**: elementwise at 16M runs
-  **~2.2x faster** than XLA CPU. Both backends *fuse* the benchmark's
+  **~2.1–2.4x faster** than XLA CPU. Both backends *fuse* the benchmark's
   elementwise chain into ~one memory pass (ours costs 1.25x a single add for
   16 chained adds, not 16x), so this is an honest bandwidth-vs-bandwidth
   comparison: ~76 GB/s for us against the shared LPDDR5X's ~136 GB/s
   theoretical peak. Streaming ops sit at that same ~75 GB/s ceiling
   (`dynamic_slice` included) — headroom remains.
-- **`dot_general` is 2.4–2.7x faster than XLA CPU at every size ≥256**
-  (~1.47 TFLOP/s at 2048³). Two fixes got it there, both in
+- **`dot_general` is faster than XLA CPU at every measured size** — 1.2x at
+  128³, 1.5–1.9x through 768³, and **2.4–2.7x from 1024³ to 2048³**
+  (11.7 ms at 2048³ = **~1.47 TFLOP/s**). Two fixes got it there, both in
   `docs/decisions.md` §45–§46: the SGEMM's staged K-block was halved
   (`MM2_BK` 16→8 — an *occupancy* win, not a register one: it halves
   local-memory per workgroup so twice as many stay co-resident, poc/19), and —
@@ -379,23 +393,27 @@ same 8 cores. It answers "what does the OpenCL detour cost on a CPU?" —
 
 ![ours (OpenCL/PoCL) vs JAX native CPU, per-op N-vs-time](docs/bench_plot_pocl.png)
 
-- **PoCL streaming reaches ~120 GB/s (near LPDDR5X peak).** CPU OpenCL
-  runtimes only auto-vectorize the implicit work-item loop, which our in-kernel
-  tile loops defeated — every hot tile body now has an explicit-`float8` CPU
-  variant selected by a device-keyed build define (`poc/09-cpu-kernels`,
-  `docs/decisions.md` §11). Per **memory pass** we match native XLA CPU, but
-  on this host the chained bench reports us **~3.5x behind on streaming**: XLA
-  fuses an elementwise chain into a single pass while our bytecode VM executes
-  each op as a real read-modify-write, so we move ~16x the memory traffic on
-  this synthetic chain. On unfused real programs the gap closes (see the
-  workload suite).
-- **`dot_general` is ~1.2x behind native XLA CPU** at 2048³: the packed +
-  KC-blocked CPU SGEMM (`poc/10-cpu-sgemm`) reaches ~150 GFLOP/s vs Eigen's
-  ~180 here. `PJRT_OCL_MM_CPU=reg` selects the simpler register kernel for
-  hardware that prefers it. `gather` pays a per-slice host-dispatch launch
-  (~5x behind at 16M); below ~1M elements the PoCL launch floor keeps small
-  ops several x slower (host-dispatch phases are batched onto the in-order
-  queue; the remaining floor is one `clFinish` + PoCL's per-command cost).
+- **PoCL streaming runs at ~56 GB/s single-pass.** CPU OpenCL runtimes only
+  auto-vectorize the implicit work-item loop, which our in-kernel tile loops
+  defeated — every hot tile body now has an explicit-`float8` CPU variant
+  selected by a device-keyed build define (`poc/09-cpu-kernels`,
+  `docs/decisions.md` §11). On the chained bench we land **~3.7–4.0x behind
+  native XLA CPU** at 16M. Two things drive that, and only one is a kernel
+  issue: 56 GB/s is roughly half what the iGPU gets out of the same LPDDR5X,
+  *and* our elementwise chain-fusion is much weaker on the CPU path than on
+  the GPU one (16 chained adds cost **7.7x** a single add here, versus 1.25x
+  on Xe2), so we move more memory traffic than XLA's fully-fused loop.
+- **`dot_general` is ~at parity with native XLA CPU at 2048³** (37.0 vs
+  42.1 ms) and ~1.4x behind at ≤512³: the packed + KC-blocked CPU SGEMM
+  (`poc/10-cpu-sgemm`). Treat the large-matmul comparison as parity rather
+  than a win — the XLA CPU reference swung 30→42 ms between runs on this
+  host, which is larger than the gap. `PJRT_OCL_MM_CPU=reg` selects the
+  simpler register kernel for hardware that prefers it. `gather` pays a
+  per-slice host-dispatch launch (~2.9x behind at 16M), `while` is 1.45x
+  behind, and `matvec` is at parity; below ~1M elements the PoCL launch floor
+  keeps small ops several x slower (host-dispatch phases are batched onto the
+  in-order queue; the remaining floor is one `clFinish` + PoCL's per-command
+  cost).
 - If your machine has *any* supported GPU — including an iGPU — prefer it
   (see below). PoCL remains the bring-up/debug/CI backend: printf, host
   debuggers, and sanitizers all work there.
@@ -410,9 +428,10 @@ bytecode through this plugin
 ![ours Xe2 iGPU vs ours PoCL CPU, per-op N-vs-time](docs/bench_plot_lnl_xe2_vs_pocl.png)
 
 - Both run the identical bytecode on shared LPDDR5X, yet the iGPU wins
-  everywhere: **~8x** on elementwise at 16M (32 XVEs outpace 8 CPU cores on
-  the same memory), **~1.5x** on `gather` and the `while` loop, **2.6x** on
-  `matmul` at 768³ and **~3x** at 2048³ after the §45–§46 matmul work.
+  everywhere: **~8.5x** on elementwise at 16M (32 XVEs outpace 8 CPU cores on
+  the same memory), **1.5x** on `gather`, **1.4x** on the `while` loop, **1.1x**
+  on `matvec`, and **2.6x** on `matmul` at 768³ rising to **3.2x** at 2048³
+  after the §45–§46 matmul work.
 - Practical guidance: on any machine with a working GPU ICD, the default
   device selection (first GPU) is the right choice — it never loses, and wins
   big on compute-dense programs. Select PoCL explicitly
