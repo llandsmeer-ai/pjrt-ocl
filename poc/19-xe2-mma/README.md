@@ -64,11 +64,26 @@ End-to-end through the plugin on Xe2, single-call `a@b`: 2048³ 16.05→11.75 ms
 (1.37×), 1536³ 7.91→4.71 ms (1.68×), 1024³ 3.32→2.37 ms (1.40×). Full
 `pytest tests/` green on Xe2 (406 passed, 1 skip).
 
+## Size-adaptive geometry — MEASURED, and NOT worth it
+
+The obvious follow-up was to compile both 128×64 bk8 and 128×128 bk8 and pick at
+launch on M/N, since 128×128 leads by 1.23× on square 2048. Measured on the
+THREE matmul shapes a real transformer actually issues (`--config large_l1`),
+the win does not hold up:
+
+| shape (M×N×K) | 128×64 bk8 | 128×128 bk8 | |
+|---|---|---|---|
+| 2048×1024×1024 (QKV/out proj) | 1635 | 1785 | 1.09× |
+| 2048×4096×1024 (FFN up) | 1533 | 1732 | 1.13× |
+| 2048×1024×4096 (FFN down) | **1699** | 1599 | **0.94× — regresses** |
+
+Average ~1.05×, and one of the three shapes gets *worse*. Against that: it needs
+either a second full program build at init or a refactor of the kernel body to be
+macro-instantiable (blocked today by its nested `#define MM2_STAGE`). **Not
+shipped** — the cost and regression risk exceed a ~5% average.
+
 ## Not done (future)
 
-- **Size-adaptive geometry**: compile both 128×64 bk8 and 128×128 bk8 and pick
-  at launch on M/N — worth ~1.2× more at ≥2048, at the cost of a second kernel
-  and a routing rule.
 - **XMX / DPAS**: Arc 140V has Intel's matrix engine, reachable via
   `cl_intel_subgroup_matrix_multiply_accumulate`. It is bf16/f16/int8 only, so
   an f32 matmul would have to round operands the way the NVIDIA path already

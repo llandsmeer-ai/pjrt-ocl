@@ -3910,3 +3910,52 @@ NVIDIA-derived default is right for Xe2 too.
 **Outcome: no code change.** Recorded because the negative result is the useful
 part — it closes "optimize gather/elementwise on Xe2" as a dead end at the
 kernel level and prices the remaining VM-interpretation overhead at ~14%.
+
+## 48. Three Xe2 matmul follow-ups measured and REJECTED — the §45/§46 config is a local optimum (2026-07-22)
+
+All three obvious next steps after §46 were measured and none is worth shipping.
+Recorded so they are not re-opened.
+
+**(a) Size-adaptive tile geometry — rejected.** poc/19 showed 128×128 bk8 beats
+the shipped 128×64 bk8 by 1.23x on a SQUARE 2048 matmul, suggesting a
+launch-time tile choice on M/N. But on the three shapes a real transformer
+actually issues, the win evaporates: 2048×1024×1024 1.09x, 2048×4096×1024
+1.13x, and 2048×1024×4096 **0.94x — a regression**. ~1.05x average with one
+shape worse, against needing either a second full program build at init or a
+refactor of the kernel body to be macro-instantiable (its nested
+`#define MM2_STAGE` blocks simple macro-ization). Not worth it. Square-matrix
+microbenchmarks over-predicted the win — the real shapes are rectangular.
+
+**(b) Lowering the §46 volume gate — rejected, gate VALIDATED.** The `1<<30`
+gate was tuned before `mm2_epi` existed, so it might have been too conservative.
+Swept on the transformer (best-of-3 to beat the ±6% noise):
+
+| minvol | `base` ms | vs OFF (34.28) |
+|---|---|---|
+| OFF (no routing) | 34.28 | — |
+| 1<<27 (1.34e8) — routes proj+FFN | 36.45 | +6% worse |
+| 1<<28 (2.7e8) — routes FFN | 37.39 | +9% worse |
+| 1<<29 (5.4e8) — routes FFN | 37.46 | +9% worse |
+| **1<<30 (shipped)** — routes nothing here | 34.76 | parity (correct) |
+
+Three independent thresholds all regress `base` by 6–9% — a consistent signal,
+not noise. The gate is where it belongs. (Method note: `small`'s numbers spread
+12% across thresholds, but NONE of its matmuls (vol 3.4e7) route at any tested
+threshold, so those rows are identical by construction — that spread is a
+direct measurement of this host's noise floor, not an effect.)
+
+**(c) Batched/attention matmul routing — rejected on the evidence from (b).**
+The remaining unrouted matmuls are attention's QK^T (256×64×256, batch=128) and
+AV (256×256×64, batch=128). Two independent reasons not to pursue it: (1) both
+carry FOLDED VIEW operands (`p4/p5!=0` — the multi-head transpose), and mm2 reads
+contiguous memory; supporting views means a `vmo_view_idx` per element, which
+destroys the coalesced float4 fast path that makes mm2 fast in the first place.
+(2) Per-slice volume is 4.2e6 and even the whole batch is 5.4e8 — the SAME
+volume class as `base`'s FFN, which (b) just measured as a 9% REGRESSION when
+routed. So the work is squarely in the range where peeling costs more than the
+better kernel returns. Attention stays on the in-VM tile, by evidence.
+
+**Conclusion.** Xe2 f32 matmul is done for now at ~1.47 TFLOP/s in-program
+(2.4–2.7x JAX CPU at every size). The next real lever is not tiling or routing —
+it is the XMX matrix engine (bf16, vendor extension, needs the kernel-table
+override), evaluated separately in poc/21.

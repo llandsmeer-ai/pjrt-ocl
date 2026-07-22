@@ -28,7 +28,9 @@ struct cfg { int tm, tn, td, bk; };
 int main(int argc, char **argv) {
     int N = argc > 1 ? atoi(argv[1]) : 2048;
     const char *psub = argc > 2 ? argv[2] : "Intel";
+    /* optional rectangular form: ./bench19 <M> <plat> <N> <K> */
     int M = N, K = N;
+    if (argc > 4) { M = N; N = atoi(argv[3]); K = atoi(argv[4]); }
 
     cl_platform_id plats[8]; cl_uint np = 0;
     clGetPlatformIDs(8, plats, &np);
@@ -44,17 +46,21 @@ int main(int argc, char **argv) {
     clGetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof cu, &cu, 0);
     clGetDeviceInfo(dev, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof maxwg, &maxwg, 0);
     clGetDeviceInfo(dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof slm, &slm, 0);
-    printf("device: %s | CUs=%u maxWG=%zu SLM=%lluKB | N=%d\n",
-           dname, cu, maxwg, (unsigned long long)(slm / 1024), N);
+    printf("device: %s | CUs=%u maxWG=%zu SLM=%lluKB | %dx%dx%d\n",
+           dname, cu, maxwg, (unsigned long long)(slm / 1024), M, N, K);
 
     cl_int e;
     cl_context ctx = clCreateContext(0, 1, &dev, 0, 0, &e);
     cl_command_queue q = clCreateCommandQueue(ctx, dev, 0, &e);
 
-    size_t bytes = (size_t)N * N * 4;
+    /* one size covering A(MxK), B(KxN) and C(MxN) so rectangular shapes fit */
+    size_t emax = (size_t)M * K;
+    if ((size_t)K * N > emax) emax = (size_t)K * N;
+    if ((size_t)M * N > emax) emax = (size_t)M * N;
+    size_t bytes = emax * 4;
     float *hA = malloc(bytes), *hB = malloc(bytes), *hC = malloc(bytes);
     srand(1);
-    for (size_t i = 0; i < (size_t)N * N; i++) {
+    for (size_t i = 0; i < emax; i++) {
         hA[i] = (rand() % 17 - 8) * 0.1f; hB[i] = (rand() % 17 - 8) * 0.1f;
     }
     cl_mem dA = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, hA, &e);
@@ -90,7 +96,7 @@ int main(int argc, char **argv) {
         struct cfg g = cfgs[c];
         int nt = g.td * g.td, rm = g.tm / g.td, rn = g.tn / g.td;
         if (nt > (int)maxwg) { printf("  skip %dx%d td%d (WG %d>max)\n", g.tm,g.tn,g.td,nt); continue; }
-        if (N % g.tm || N % g.tn) { continue; }
+        if (M % g.tm || N % g.tn) { continue; }
         char opts[256];
         snprintf(opts, sizeof opts,
                  "-cl-fast-relaxed-math -DTM=%d -DTN=%d -DTD=%d -DBK=%d",
@@ -108,7 +114,7 @@ int main(int argc, char **argv) {
         clSetKernelArg(k, 0, sizeof dA, &dA); clSetKernelArg(k, 1, sizeof dB, &dB);
         clSetKernelArg(k, 2, sizeof dC, &dC); clSetKernelArg(k, 3, sizeof um, &um);
         clSetKernelArg(k, 4, sizeof un, &un); clSetKernelArg(k, 5, sizeof uk, &uk);
-        size_t tiles = (size_t)(N / g.tm) * (N / g.tn);
+        size_t tiles = (size_t)(M / g.tm) * (N / g.tn);
         size_t gws = tiles * nt, lws = nt;
 
         for (int w = 0; w < 3; w++) clEnqueueNDRangeKernel(q, k, 1, 0, &gws, &lws, 0,0,0);
@@ -126,7 +132,7 @@ int main(int argc, char **argv) {
             float got = hC[(size_t)cr[t] * N + cc[t]];
             float er = fabsf(got - cref[t]); if (er > maxerr) maxerr = er;
         }
-        double gf = 2.0 * N * N * N / (best * 1e-3) / 1e9;
+        double gf = 2.0 * (double)M * N * K / (best * 1e-3) / 1e9;
         char tag[48]; snprintf(tag, sizeof tag, "%dx%d td%d bk%d (%dx%d)", g.tm,g.tn,g.td,g.bk,rm,rn);
         printf("  %-22s %8.3f %8.1f  %s(%.1e)\n", tag, best, gf,
                maxerr < 1e-2 ? "ok" : "BAD", maxerr);
