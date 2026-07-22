@@ -259,6 +259,11 @@ class Instr:
     # loader-patched). NOT serialized: the scheduler reads it in-memory to build
     # the task + its dependency read-set; the tensor validator reads it too.
     region_inputs: tuple = ()
+    # §52: nonzero group id shared by instructions that write PROVABLY DISJOINT
+    # element ranges of the same dst (concatenate/pad's scatters). The scheduler
+    # drops the WAW barrier between same-group members, so a whole concatenate
+    # is ONE phase instead of one phase per operand. NOT serialized.
+    disjoint: int = 0
 
 
 def _pad8(out: bytearray) -> None:
@@ -687,6 +692,9 @@ def _defining_op(value):
     owner = getattr(value, "owner", None)
     owner = getattr(owner, "operation", owner)
     return owner if getattr(owner, "name", None) else None
+
+
+defining_op = _defining_op        # public: pjrt_ocl.ops.* peephole matchers
 
 
 def _const_scalar_int_of(value) -> int | None:

@@ -283,6 +283,14 @@ def _depends(instrs, j: int, i: int) -> bool:
     a, b = instrs[i], instrs[j]
     aw = _writes(a)
     bw = _writes(b)
+    # §52: two members of the same DISJOINT group (concatenate/pad's scatters)
+    # write non-overlapping element ranges of the shared dst by construction, so
+    # their WAW edge is not a real dependency and needs no barrier. They still
+    # take RAW/WAR edges against everything else (including each other's reads,
+    # which never touch the shared dst).
+    if a.disjoint and a.disjoint == b.disjoint:
+        aw = aw - bw
+        bw = bw - _writes(a)
     return bool((_reads(b) & aw) or (bw & aw) or (_reads(a) & bw))
 
 
