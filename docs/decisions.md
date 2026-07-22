@@ -4042,3 +4042,64 @@ port binding — that is the thing to find. Fix directions to evaluate: raise
 burn time re-trying it — the scaling experiment above is the substitute, and it
 is enough to aim the next attempt. Recorded also so nobody re-tries zero-copy
 I/O expecting a win.
+
+## 50. OPEN BUG: fused softmax_seg returns WRONG results on Xe2, non-deterministically across processes (2026-07-22)
+
+**This is a silent-wrong-answer bug, not a perf issue. It is NOT fixed.** Found
+by the reworked workload suite (§51) via an accuracy marker, not by the test
+suite — the error is small enough (~5e-3 on ~0.1 values) to pass the 2e-2
+GPU tolerance, so `pytest` is green and the suite reports "close" while the
+numbers are wrong.
+
+**Minimal reproducer.** `jax.nn.softmax(x, axis=-1)` on a plain f32 array:
+
+```bash
+. ./env.sh
+# 64 rows x 10 cols: wrong in ~14 of 16 PROCESSES on Xe2
+JAX_PLATFORMS=opencl PJRT_OCL_DEVICE=Intel .venv/bin/python -c "
+import numpy as np, jax, jax.numpy as jnp
+x=(np.random.default_rng(1).standard_normal((64,10))*0.05).astype(np.float32)
+z=x-x.max(-1,keepdims=True); e=np.exp(z); ref=e/e.sum(-1,keepdims=True)
+got=np.asarray(jax.jit(lambda a: jax.nn.softmax(a,axis=-1))(jnp.asarray(x)))
+d=np.abs(got-ref); print(d.max(), sorted(set(np.argwhere(d>1e-6)[:,0].tolist())))"
+```
+
+**Signature.**
+- **Deterministic WITHIN a process** (12 consecutive calls bitwise identical),
+  **varies ACROSS processes** — the classic signature of reading memory whose
+  contents differ per process, not of a plain data race.
+- Corrupts a contiguous run of TAIL rows (25–30 of 32; 3-row groups).
+- Corrupted rows are *plausible*: they still sum to 1. Some come back as exactly
+  `0.1` in every class — i.e. that row's logits were all-equal/zero, so the
+  staged row was lost or replaced.
+- **Xe2 only.** PoCL is clean (0/6 wrong, bitwise identical). So it is a device
+  path, not the lowering.
+
+**Bisected to the fused op.** With the same data: standalone `max(-1)` clean
+(6/6), standalone `sum(-1)` clean (6/6), `gather` clean (8/8), `gather @ dot`
+clean (6/6) — only the FUSED softmax (`TOP_SOFTMAX_SEG` / `vmo_softmax_seg` in
+`kernels/ops/reduce.cl`) is wrong. Shape sweep: `64x10` fails ~85% of processes,
+`32x10` intermittently, and `32x16`, `32x64`, `16x10`, `128x10` were clean in
+8 processes each. 64 rows over the 32 discovered lanes = exactly **2 tiles per
+workgroup**, i.e. the case where a workgroup REUSES its `__local As/Bs` for a
+second segment.
+
+**Hypothesis tested and REJECTED — do not redo it.** The tile body's final store
+loop READS `As[j]` with no barrier before the next tile's staging WRITES it (the
+comment at the store loop argues the next tile "re-barriers before any shared
+read", which only orders read-after-write, not this write-after-read). That WAR
+hazard is real on paper, but adding the trailing `barrier(CLK_LOCAL_MEM_FENCE)`
+**does not fix the bug**: clean A/B on the 64x10 reproducer measured **14/16
+wrong without it vs 13/16 with it**. The barrier was therefore NOT landed
+(unproven mechanism + a per-tile barrier cost). Something else is wrong.
+
+**Still to check:** whether `lsz` passed to the tile equals the actual
+`get_local_size(0)` for this launch (the max/sum trees assume a power-of-two
+`lsz` and that every one of `lsz` lanes wrote `Bs[lid]`); whether `As`/`Bs`
+sizing (`MMA_ASZ`/`MMA_BSZ`) is right for the seg path; and what makes `128x10`
+pass while `64x10` fails, which any correct theory must explain.
+
+**Impact.** Any program using softmax on Xe2 — the workload suite's
+`embedding_softmax` is where it surfaced, and attention has its own fused kernel
+(`attention.cl`, not this path) so flash-attention is not implicated. Treat Xe2
+softmax results as suspect until fixed.
