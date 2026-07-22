@@ -9,6 +9,12 @@ on the execution path.
 > full JAX dtype matrix (f32/f64/i32/u32/i64/bool/f16/bf16), not yet on PyPI. Validated
 > end-to-end on an NVIDIA RTX PRO 6000 (via NVIDIA's OpenCL) and on PoCL (CPU). Not
 > affiliated with Google, OpenXLA, or the JAX project.
+>
+> **Workload coverage:** a diverse testbench of **18 AI + scientific + physics workloads**
+> (`tools/bench_suite/`) — MLP, CNN, LSTM/GRU, transformer, attention, batch/layer-norm,
+> embeddings; heat-PDE, N-body, RK4, Monte-Carlo (`jax.random`), FFT; spring-mass,
+> Hodgkin-Huxley, and a real **MuJoCo/brax** physics rollout — **all 18 run correct vs native
+> CUDA.** See [`docs/workload-coverage.md`](docs/workload-coverage.md).
 
 ## How it works
 
@@ -128,7 +134,7 @@ Anything unsupported raises a clear `LoweringError` naming the op.
 ## Hardware tested & benchmarks
 
 Correctness comes first; performance is early. Every device below runs the full
-test suite (275 tests: op families x the dtype matrix + e2e); benchmarks are
+test suite (407 tests: op families x the dtype matrix + e2e); benchmarks are
 per-op wall-clock vs problem size N so you can judge whether the library is
 worth it for *your* sizes and hardware. New devices go through
 [`docs/hardware-bringup.md`](docs/hardware-bringup.md).
