@@ -8,24 +8,24 @@ Diverse AI + scientific-computing workloads run through our OpenCL VM on the `In
 
 | workload | cat | status | ours ms | cpu ms | gap | correct (max rel vs XLA-CPU) | missing op / note |
 |---|---|---|---|---|---|---|---|
-| mlp | AI | PASS | 0.373 | 0.262 | 1.42x | close (0.0e+00) | 3-layer MLP + relu |
-| cnn | AI | PASS | 0.394 | 0.183 | 2.15x | close (9.3e-07) | conv2d+relu+pool (flax nn.Conv equiv) |
-| lstm | AI | PASS | 2.431 | 0.280 | 8.70x | close (7.7e-05) | hand-rolled LSTM over lax.scan (sigmoid+tanh) |
-| gru | AI | PASS | 1.992 | 0.188 | 10.62x | close (1.3e-04) | hand-rolled GRU over lax.scan (sigmoid+tanh) |
-| transformer | AI | PASS | 4.049 | 4.425 | 0.92x | close (6.3e-03) | GPT-style transformer block (small) |
-| attention | AI | PASS | 0.837 | 1.786 | 0.47x | close (7.4e-04) | multi-head self-attention layer |
-| layernorm | AI | PASS | 0.256 | 0.105 | 2.44x | close (2.4e-03) | layernorm (reduce over last axis) |
-| batchnorm | AI | PASS | 0.184 | 0.017 | 11.07x | close (1.3e-04) | batchnorm (reduce over axis 0) |
-| embedding_softmax | AI | PASS | 0.116 | 0.012 | 9.94x | close (5.4e-02) * | embedding lookup + softmax classifier |
-| heat2d | SCI | PASS | 3.544 | 0.113 | 31.37x | close (3.2e-04) | 2D heat-equation stencil (roll+EW, scan) |
-| nbody | SCI | PASS | 0.452 | 0.042 | 10.80x | close (3.4e-06) | N-body gravity step (pairwise + reduce) |
-| rk4_ode | SCI | PASS | 12.703 | 0.031 | 409.07x | close (1.8e-06) | RK4 Lorenz integrator (scan) |
-| logistic_map | SCI | PASS | 1.653 | 0.007 | 233.41x | close (0.0e+00) | logistic-map iteration (fori_loop/while) |
-| monte_carlo | SCI | PASS | 5.080 | 1.753 | 2.90x | close (0.0e+00) | Monte-Carlo pi (threefry RNG) |
-| fft | SCI | PASS | 0.186 | 0.010 | 19.50x | close (4.1e-06) | 1D FFT magnitude (needs complex dtype + fft) |
-| spring_mass | PHYS | PASS | 3.550 | 0.008 | 448.92x | close (4.5e-07) | spring-mass chain (brax analogue, scan) |
-| hh_neuron | PHYS | PASS | 6.109 | 0.046 | 133.55x | close (1.8e-04) | Hodgkin-Huxley neuron (jaxley analogue, scan) |
-| brax_step | PHYS | PASS | 21.406 | 0.178 | 120.07x | close (1.7e-01) * | brax inverted_pendulum reset+step (real env). Layer-1 device allowlist bypassed; sdy dialect fixed; ui32 dtype reporting fixed (§42); OP_CONV/scatter/reduce-and (§39/§42) — runs end-to-end vs CUDA |
+| mlp | AI | PASS | 0.374 | 0.266 | 1.40x | close (0.0e+00) | 3-layer MLP + relu |
+| cnn | AI | PASS | 0.393 | 0.184 | 2.13x | close (9.3e-07) | conv2d+relu+pool (flax nn.Conv equiv) |
+| lstm | AI | PASS | 2.434 | 0.271 | 8.98x | close (7.7e-05) | hand-rolled LSTM over lax.scan (sigmoid+tanh) |
+| gru | AI | PASS | 2.004 | 0.228 | 8.78x | close (1.3e-04) | hand-rolled GRU over lax.scan (sigmoid+tanh) |
+| transformer | AI | PASS | 3.894 | 4.455 | 0.87x | close (6.3e-03) | GPT-style transformer block (small) |
+| attention | AI | PASS | 0.812 | 1.799 | 0.45x | close (7.4e-04) | multi-head self-attention layer |
+| layernorm | AI | PASS | 0.265 | 0.115 | 2.30x | close (2.4e-03) | layernorm (reduce over last axis) |
+| batchnorm | AI | PASS | 0.180 | 0.021 | 8.72x | close (1.3e-04) | batchnorm (reduce over axis 0) |
+| embedding_softmax | AI | PASS | 0.103 | 0.012 | 8.39x | close (2.3e-07) | embedding lookup + softmax classifier |
+| heat2d | SCI | PASS | 1.636 | 0.075 | 21.76x | close (3.2e-04) | 2D heat-equation stencil (roll+EW, scan) |
+| nbody | SCI | PASS | 0.367 | 0.073 | 5.04x | close (3.4e-06) | N-body gravity step (pairwise + reduce) |
+| rk4_ode | SCI | PASS | 8.330 | 0.027 | 303.49x | close (1.8e-06) | RK4 Lorenz integrator (scan) |
+| logistic_map | SCI | PASS | 0.231 | 0.011 | 21.49x | close (0.0e+00) | logistic-map iteration (fori_loop/while) |
+| monte_carlo | SCI | PASS | 5.150 | 1.639 | 3.14x | close (0.0e+00) | Monte-Carlo pi (threefry RNG) |
+| fft | SCI | PASS | 0.181 | 0.009 | 20.12x | close (4.1e-06) | 1D FFT magnitude (needs complex dtype + fft) |
+| spring_mass | PHYS | PASS | 1.967 | 0.008 | 255.76x | close (4.5e-07) | spring-mass chain (brax analogue, scan) |
+| hh_neuron | PHYS | PASS | 6.113 | 0.058 | 104.53x | close (1.8e-04) | Hodgkin-Huxley neuron (jaxley analogue, scan) |
+| brax_step | PHYS | PASS | 14.998 | 0.186 | 80.64x | close (2.2e-05) | brax inverted_pendulum reset+step (real env). Layer-1 device allowlist bypassed; sdy dialect fixed; ui32 dtype reporting fixed (§42); OP_CONV/scatter/reduce-and (§39/§42) — runs end-to-end vs CUDA |
 
 ## Ranked missing-op priority (M3 test-driven order)
 
@@ -36,14 +36,14 @@ Each row: how many suite workloads that op/feature would unlock, and which.
 
 ## Bottom line (generalization read)
 
-- Passers' gap vs XLA-CPU spans **0.47x (attention) to 448.92x (spring_mass)**, median **10.80x**.
+- Passers' gap vs XLA-CPU spans **0.45x (attention) to 303.49x (rk4_ode)**, median **8.78x**.
 - **At/under 1x XLA-CPU (we win or tie): 2/18**; within 1.5x: 3/18.
-- **Winners (≤1x XLA-CPU):** attention (0.47x), transformer (0.92x).
-- **Laggards (≥3x XLA-CPU):** lstm (8.70x), embedding_softmax (9.94x), gru (10.62x), nbody (10.80x), batchnorm (11.07x), fft (19.50x), heat2d (31.37x), brax_step (120.07x), hh_neuron (133.55x), logistic_map (233.41x), rk4_ode (409.07x), spring_mass (448.92x) — the loop-/small-op regime where per-phase enqueue + queue-drain dominates.
+- **Winners (≤1x XLA-CPU):** attention (0.45x), transformer (0.87x).
+- **Laggards (≥3x XLA-CPU):** monte_carlo (3.14x), nbody (5.04x), embedding_softmax (8.39x), batchnorm (8.72x), gru (8.78x), lstm (8.98x), fft (20.12x), logistic_map (21.49x), heat2d (21.76x), brax_step (80.64x), hh_neuron (104.53x), spring_mass (255.76x), rk4_ode (303.49x) — the loop-/small-op regime where per-phase enqueue + queue-drain dominates.
 
 ### Notes on the correctness column
 
 - `correct` uses `np.allclose(atol=2e-2, rtol=2e-2)` vs XLA-CPU and that boolean is authoritative. The parenthesised `max rel` can look huge (e.g. transformer 5e1) purely because the reference has near-zero elements (rel = |Δ|/(|ref|+1e-6)); every passer clears the abs+rel allclose. TF32 matmul (and, on any GPU, a different reduction order / fma contraction) also widens abs error on ~1-std signals.
-- Rows marked `*` clear the 2e-2 bar but not the f32-tight 1e-3 bar (2 of the passers) — pure fp-associativity, reported rather than hidden so the accuracy story stays honest.
+- Rows marked `*` clear the 2e-2 bar but not the f32-tight 1e-3 bar (0 of the passers) — pure fp-associativity, reported rather than hidden so the accuracy story stays honest.
 - Chaotic integrators (rk4 Lorenz, logistic_map at r→4) are seeded identically and match here, but would diverge over longer horizons on any two backends.
 

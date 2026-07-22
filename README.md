@@ -326,9 +326,12 @@ latency is future scan/control-flow fusion work.
 
 ### Intel Arc 140V (Xe2, Lunar Lake iGPU) — vs JAX CPU
 
-**Testbench: full suite green** (407 tests; `intel-opencl-icd` 26.22) and the
+**Testbench: full suite green** (408 tests; `intel-opencl-icd` 26.22) and the
 **18-workload application suite is 18/18 PASS with zero missing ops**
-(`docs/workload-coverage-xe2.md`). No native JAX plugin exists for this iGPU,
+(`docs/workload-coverage-xe2.md`). On that suite we beat XLA-CPU on
+`attention` (0.45x) and `transformer` (0.87x); most of the rest are
+**structurally dispatch-bound rather than slow** — see the note below. No
+native JAX plugin exists for this iGPU,
 so the reference is JAX's XLA **CPU** backend on the same package (Core Ultra
 9 288V) — cross-device but honest: it's the alternative you'd actually use.
 
@@ -381,6 +384,18 @@ so the reference is JAX's XLA **CPU** backend on the same package (Core Ultra
   bandwidth-bound, not algorithmically bad.
 - **Small ops are dispatch-bound** (~10–70 µs wall-clock vs XLA CPU's
   ~1–30 µs): expect 2–6x slower below ~1M elements; batch or fuse small work.
+- **Sequential loops over tiny state cannot be won on a GPU, and we measured the
+  bound** (`docs/decisions.md` §51–§52). Scan/`fori_loop` workloads pay a
+  synchronisation per step (~2.2 µs measured floor for a dependent kernel
+  launch) that a CPU does not, so a 200-step loop costs ≥440 µs before any
+  arithmetic while XLA-CPU finishes the whole workload in ~7 µs. Deleting *all*
+  tile-op compute still leaves `spring_mass` 515x slower than CPU — so no kernel
+  tuning can close it; only fewer dispatches can. Cutting phases per iteration
+  (concat-of-slices → one gather, disjoint-scatter co-scheduling, identity-gather
+  aliasing, wider unrolling) bought **7.1x on `logistic_map`, 2.2x on `heat2d`,
+  1.8x on `spring_mass`, 1.4x on `brax_step`** — real gains, but `spring_mass`
+  and `logistic_map` remain structurally unwinnable. They are reported as
+  dispatch-bound, not as unfixed regressions.
 - Bring-up found and fixed a real portability bug: lane count is now *measured*
   at init (occupancy discovery, `docs/decisions.md` §9) instead of derived from
   the vendor-ambiguous `CL_DEVICE_MAX_COMPUTE_UNITS`.
