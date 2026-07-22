@@ -3414,3 +3414,66 @@ untouched: pytest 344 passed / 1 skipped; NVIDIA tf32 default `--check` PASS.**
 Reproduce: `PJRT_OCL_MM_FP16=1 PJRT_OCL_MM_HYBRID=1` on
 `tools/bench_transformer.py --config {base,large}` and
 `tools/bench_suite/run_suite.py --only mlp attention`.
+
+## 42. The brax "JAX threefry ui32/i32 wall" was OURS: uint32 buffers reported as S32 (2026-07-22)
+
+**Correction to §41's conclusion.** §41 catalogued brax's combined `jit(reset+
+step)` failing at JAX's own MLIR verifier —
+`'func.call' op operand type mismatch: expected 'tensor<2xui32>', but provided
+'tensor<2xi32>' for operand number 0 … @_threefry_split` — and attributed it to
+a *JAX-internal* opencl-platform lowering bug ("Not our code"). That was wrong.
+**The root cause is in our plugin**, and the fix is a one-line lowering change.
+
+### Root cause (measured)
+The failing call is `func.call @_threefry_split(%c) : (tensor<2xi32>) -> …` where
+`%c = stablehlo.constant dense<0> : tensor<2xi32>`. `%c` is the **closed-over
+`jax.random.PRNGKey(0)`** — a *device* uint32[2] array that JAX materialises as a
+constant when tracing `fn`. To get its value JAX calls `np.asarray(key)`, which
+D2H-copies through PJRT and takes the buffer's element type from
+`PJRT_Buffer_ElementType`. Our lowering's `_elem_dtype` mapped **every** 32-bit
+integer to `DT_I32` ("stablehlo ints are signless"), so a `ui32` buffer reported
+`S32` ⇒ `np.asarray(key).dtype == int32` ⇒ the constant is emitted `tensor<2xi32>`
+⇒ it mismatches the ui32 signature of the (separately-traced-from-the-uint32-aval)
+`@_threefry_split` outline ⇒ verifier error, *before* the graph ever reaches us.
+Minimal repro (no brax): on our backend `np.asarray(jnp.arange(4,'uint32')).dtype`
+was `int32` (should be `uint32`); on JAX-CPU it is `uint32`. Confirmed the wall is
+platform-specific only because the *reporting* was — the identical brax
+positional inverted_pendulum reset+step lowers+runs on CPU/CUDA.
+
+### Fix (SHIPPED, `python/pjrt_ocl/lowering.py`)
+StableHLO signless `i32` stays `DT_I32`; genuinely-unsigned `ui32`
+(`element_type.is_unsigned`, a distinct MLIR type — verified) now maps to the
+already-existing Tier-1 `DT_U32`. `DT_U32` is a 4-byte slot; every elementwise/
+bitwise/shift op is bit-identical to `DT_I32` (the threefry/uniform path is only
+shl/shr_l/xor/add/iota + bitcast — no unsigned compare/convert), so the *compute*
+is unchanged; only the host-boundary dtype is corrected. No C++ change
+(`VmDtypeToPjrt` already had `kDtU32→U32`, it was simply never produced).
+
+**Honest scope — a pre-existing unsigned gap this change makes visible but does
+NOT introduce.** The *device* `convert` (u32→f32) and integer `compare` still run
+the **signed** path (u32→f32 of a high-bit-set value returns a negative float;
+unsigned `>=` compares as signed). That was already wrong before §42 (those
+operands were `DT_I32`, i.e. signed), so §42 leaves such programs bit-for-bit
+unchanged — the returned bits equal the old signed reinterpretation, measured. It
+is not hit by RNG/monte_carlo/brax (uniform builds floats via `shr_l | exponent
+bits` then **bitcast**, never `convert`; the key path is shl/xor/add only), all
+verified bit-exact vs JAX-CPU. Full correct unsigned convert/compare needs
+unsigned device kernels — filed alongside `reduce(and)` as device-op work.
+
+### Result
+- **monte_carlo now PASSES on NVIDIA and PoCL, bit-exact vs JAX-CPU golden**
+  (`pi=3.1473389` both engines; was FAIL on the NVIDIA scoreboard).
+- **brax positional inverted_pendulum `jit(reset+step)` now LOWERS** on opencl
+  (NVIDIA + PoCL) — the ui32/i32 wall is gone. It then reaches the physics
+  compute and hits the **next real op gap, exactly as §41 predicted**:
+  `stablehlo.reduce` with a `stablehlo.and` reducer body (integer/bool
+  all()/any() — our REDUCE kinds are f32 SUM/MAX/MIN/PROD only; a bool/int
+  min-max reduce path on both engines is the genuine next M3 kernel work, then
+  data-dependent `stablehlo.scatter` and `chlo.erf_inv`). brax coverage stays
+  FAIL, but one full layer deeper and for a *device-op* reason, not a JAX one.
+- Regression guard: `tests/_random_e2e_body.py` now asserts the *reported* dtype
+  is `uint32` (device bits AND round-tripped `PRNGKey`), not just bit-value
+  equality (the old `.astype(uint32)` masked exactly this bug). Full pytest
+  **345 passed / 1 skipped**, both engines; every RNG program bit-exact vs CPU.
+- Reproduce: `JAX_PLATFORMS=opencl PJRT_OCL_DEVICE=NVIDIA python -c "import
+  jax,numpy as np; print(np.asarray(jax.random.PRNGKey(0)).dtype)"` → `uint32`.

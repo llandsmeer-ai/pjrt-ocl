@@ -407,9 +407,24 @@ def _elem_dtype(element_type) -> int:
         if w == 1:
             return DT_BOOL                 # i1 predicate/mask
         if w == 32:
-            # stablehlo integers are signless; treat as i32 (jax uses i32 for
-            # indices/counters). unsigned is distinguished by the op, not type.
-            return DT_I32
+            # StableHLO integers are signless (i32) EXCEPT genuinely unsigned
+            # values, which carry the `ui32` type (element_type.is_unsigned).
+            # Reporting the correct signedness matters at the host boundary:
+            # PJRT_Buffer_ElementType is derived from this dtype, so a ui32
+            # device array (e.g. a threefry RNG key) must round-trip to numpy
+            # as uint32 — otherwise np.asarray(key) yields int32 and JAX
+            # materialises the key constant as tensor<2xi32>, mismatching its
+            # own ui32 @_threefry_split signature (verifier error; blocks any
+            # closed-over-key jit on this platform, e.g. brax reset+step).
+            # U32 is a 4-byte Tier-1 slot; elementwise/bitwise/shift/bitcast ops
+            # are bit-identical to I32 (the threefry/uniform RNG path uses only
+            # shl/shr_l/xor/add/iota + bitcast_convert, all bit-exact — verified
+            # vs JAX-CPU golden). KNOWN GAP (pre-existing, orthogonal): the
+            # DEVICE convert (u32->f32) and integer compare still run the SIGNED
+            # path, so u32 values with the high bit set convert/compare wrong vs
+            # JAX-CPU. Not hit by RNG/brax; fixing needs unsigned device kernels
+            # (tracked with reduce(and) as the next brax op gap, §42).
+            return DT_U32 if element_type.is_unsigned else DT_I32
         if w == 64:
             return DT_I64                  # Tier 2
         raise LoweringError(

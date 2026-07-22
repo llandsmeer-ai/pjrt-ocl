@@ -25,6 +25,18 @@ bits = np.asarray(jax.jit(
 np.testing.assert_array_equal(bits.astype(np.uint32), GOLDEN)
 print("threefry bits bit-exact vs CPU golden: ok")
 
+# ui32 host round-trip: a device uint32 buffer must report U32 (not S32) at the
+# PJRT boundary, so np.asarray keeps uint32. Regression guard for the dtype bug
+# that made np.asarray(key) yield int32 → materialised the closed-over threefry
+# key as tensor<2xi32>, tripping JAX's own ui32 @_threefry_split verifier
+# (blocked brax reset+step). Assert the *reported* dtype directly (no astype).
+assert bits.dtype == np.uint32, ("device uint32 buffer reported as "
+                                 f"{bits.dtype}, expected uint32")
+key_host = np.asarray(jax.random.PRNGKey(0))
+assert key_host.dtype == np.uint32, (
+    f"PRNGKey round-tripped as {key_host.dtype}, expected uint32")
+print("ui32 host round-trip dtype ok")
+
 # uniform in [0, 1)
 uni = np.asarray(jax.jit(
     lambda: jax.random.uniform(jax.random.PRNGKey(0), (1 << 14, 2)))())
