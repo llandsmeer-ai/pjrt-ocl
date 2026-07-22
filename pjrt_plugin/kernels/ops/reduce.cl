@@ -2,62 +2,96 @@
  * TOP_RED_PART: one partial per tile (task.p0=n, p1=chunk, p2=kind) via a
  *   workgroup local-memory tree reduce; writes arena[t.dst + tile].
  * TOP_RED_COMB: fold n_parts partials -> final (p0=n_parts, p1=kind).
- * kind: 0 sum, 1 max, 2 min, 3 prod.
+ * kind: 0 sum, 1 max, 2 min, 3 prod, 4 and, 5 or, 6 xor.
  */
 
-/* Integer (i32/u32) partial reduce: integer accumulation; max/min via
- * max()/min(); identities INT_MIN/INT_MAX. The local tree buffer `As` (float)
- * is aliased as int — same 4-byte storage, no numeric use. */
+/* Integer/bool reduction kind table. f32 covers kinds 0..3 (sum/max/min/prod);
+ * i32/u32/bool additionally cover the bitwise reducers 4 and / 5 or / 6 xor
+ * (from stablehlo.and/or/xor — jp.all / jp.any over int or bool). `is_uns`
+ * selects UNSIGNED compare + identities for u32 (signed max()/min() and the
+ * INT_MIN/INT_MAX identities are WRONG for u32); the all-ones AND identity is
+ * -1 signed / UINT_MAX unsigned (same bit pattern, so vmo_ired_ident returns
+ * ~0 for both — the bits are what matter). bool (0/1, stored 1-byte) rides this
+ * same int path; its caller loads uchar and masks the stored result to 0/1. */
+static inline int vmo_ired_ident(uint kind, int is_uns)
+{
+    switch (kind) {
+    case 0:  return 0;                                  /* sum */
+    case 1:  return is_uns ? 0 : INT_MIN;               /* max */
+    case 2:  return is_uns ? (int)UINT_MAX : INT_MAX;   /* min */
+    case 3:  return 1;                                  /* prod */
+    case 4:  return ~0;                                 /* and  (all ones) */
+    case 5:  return 0;                                  /* or  */
+    default: return 0;                                  /* xor */
+    }
+}
+
+static inline int vmo_ired_comb(int a, int b, uint kind, int is_uns)
+{
+    switch (kind) {
+    case 0:  return a + b;
+    case 1:  return is_uns ? (int)max((uint)a, (uint)b) : max(a, b);
+    case 2:  return is_uns ? (int)min((uint)a, (uint)b) : min(a, b);
+    case 3:  return a * b;
+    case 4:  return a & b;
+    case 5:  return a | b;
+    default: return a ^ b;
+    }
+}
+
+/* Integer/bool partial reduce: integer accumulation via the kind table above.
+ * The local tree buffer `As` (float) is aliased as int — same 4-byte storage,
+ * no numeric use. dt selects unsigned (u32) and bool (1-byte load/store). */
 static void vmo_reduce_part_tile_i32(__global uchar *arena, __global uchar **iop, const task_t t,
                                  uint tile, __local float *As, uint lid,
-                                 uint lsz)
+                                 uint lsz, uint dt)
 {
     const uint n = t.p0, chunk = t.p1, kind = t.p2;
     const uint lo = tile * chunk, hi = min(lo + chunk, n);
+    const int is_uns = (dt == DT_U32), is_bool = (dt == DT_BOOL);
     __global const int *a = AP(const int, t.a);
+    __global const uchar *ab = AP(const uchar, t.a);
     __local int *Ai = (__local int *)As;
-    int acc = kind == 0 ? 0 : kind == 1 ? INT_MIN : kind == 2 ? INT_MAX : 1;
+    int acc = vmo_ired_ident(kind, is_uns);
     for (uint i = lo + lid; i < hi; i += lsz) {
-        const int v = a[i];
-        acc = kind == 0 ? acc + v
-            : kind == 1 ? max(acc, v)
-            : kind == 2 ? min(acc, v) : acc * v;
+        const int v = is_bool ? (int)ab[i] : a[i];
+        acc = vmo_ired_comb(acc, v, kind, is_uns);
     }
     Ai[lid] = acc;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint s = lsz / 2; s > 0; s >>= 1) {
-        if (lid < s) {
-            const int x = Ai[lid], y = Ai[lid + s];
-            Ai[lid] = kind == 0 ? x + y
-                    : kind == 1 ? max(x, y)
-                    : kind == 2 ? min(x, y) : x * y;
-        }
+        if (lid < s)
+            Ai[lid] = vmo_ired_comb(Ai[lid], Ai[lid + s], kind, is_uns);
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (lid == 0) AP(int, t.dst)[tile] = Ai[0];
+    if (lid == 0) {
+        if (is_bool) AP(uchar, t.dst)[tile] = (uchar)(Ai[0] & 1);
+        else AP(int, t.dst)[tile] = Ai[0];
+    }
 }
 
 static void vmo_reduce_comb_tile_i32(__global uchar *arena, __global uchar **iop, const task_t t,
-                                 uint lid)
+                                 uint lid, uint dt)
 {
     if (lid != 0) return;
     const uint n = t.p0, kind = t.p1;
+    const int is_uns = (dt == DT_U32), is_bool = (dt == DT_BOOL);
     __global const int *a = AP(const int, t.a);
-    int acc = kind == 0 ? 0 : kind == 1 ? INT_MIN : kind == 2 ? INT_MAX : 1;
+    __global const uchar *ab = AP(const uchar, t.a);
+    int acc = vmo_ired_ident(kind, is_uns);
     for (uint i = 0; i < n; ++i) {
-        const int v = a[i];
-        acc = kind == 0 ? acc + v
-            : kind == 1 ? max(acc, v)
-            : kind == 2 ? min(acc, v) : acc * v;
+        const int v = is_bool ? (int)ab[i] : a[i];
+        acc = vmo_ired_comb(acc, v, kind, is_uns);
     }
-    AP(int, t.dst)[0] = acc;
+    if (is_bool) AP(uchar, t.dst)[0] = (uchar)(acc & 1);
+    else AP(int, t.dst)[0] = acc;
 }
 
 static void vmo_reduce_part_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint tile,
                              __local float *As, uint dt, uint lid, uint lsz)
 {
-    if (dt == DT_I32 || dt == DT_U32) {
-        vmo_reduce_part_tile_i32(arena, iop, t, tile, As, lid, lsz);
+    if (dt == DT_I32 || dt == DT_U32 || dt == DT_BOOL) {
+        vmo_reduce_part_tile_i32(arena, iop, t, tile, As, lid, lsz, dt);
     } else {
     /* no return above: a return preceding the barriers below breaks
      * PoCL 5.0 parallel-region formation (see vmo_redseg_tile note). */
@@ -145,24 +179,22 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
      * barriers below makes PoCL's parallel-region analysis assert
      * (region_entry_barrier != NULL). All work-items in a workgroup share `tile`,
      * so the barriers are reached uniformly. */
-    if (dt == DT_I32 || dt == DT_U32) {
+    if (dt == DT_I32 || dt == DT_U32 || dt == DT_BOOL) {
+        const int is_uns = (dt == DT_U32), is_bool = (dt == DT_BOOL);
         __global const int *a = AP(const int, t.a);
+        __global const uchar *ab = AP(const uchar, t.a);
         __local int *Ai = (__local int *)As;
-        int acc = kind == 0 ? 0 : kind == 1 ? INT_MIN : kind == 2 ? INT_MAX : 1;
+        int acc = vmo_ired_ident(kind, is_uns);
         if (valid)
             for (uint j = lid; j < seg; j += lsz) {
-                const int v = a[base + j];
-                acc = kind == 0 ? acc + v : kind == 1 ? max(acc, v)
-                    : kind == 2 ? min(acc, v) : acc * v;
+                const int v = is_bool ? (int)ab[base + j] : a[base + j];
+                acc = vmo_ired_comb(acc, v, kind, is_uns);
             }
         Ai[lid] = acc;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint s = lsz / 2; s > 0; s >>= 1) {
-            if (lid < s) {
-                const int x = Ai[lid], y = Ai[lid + s];
-                Ai[lid] = kind == 0 ? x + y : kind == 1 ? max(x, y)
-                        : kind == 2 ? min(x, y) : x * y;
-            }
+            if (lid < s)
+                Ai[lid] = vmo_ired_comb(Ai[lid], Ai[lid + s], kind, is_uns);
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         /* No trailing barrier: after the tree's final barrier only lid 0
@@ -170,7 +202,10 @@ static void vmo_redseg_tile(__global uchar *arena, __global uchar **iop, const t
          * post-barrier read. (Also: a barrier as the last statement of this
          * switch case — right before vmo_exec_tiles' loop backedge — is what
          * crashed PoCL 5.0 region formation.) */
-        if (lid == 0 && valid) AP(int, t.dst)[o] = Ai[0];
+        if (lid == 0 && valid) {
+            if (is_bool) AP(uchar, t.dst)[o] = (uchar)(Ai[0] & 1);
+            else AP(int, t.dst)[o] = Ai[0];
+        }
     } else {
         __global const float *a = AP(const float, t.a);
         /* p3 = dot mode (GEMV routing, ops/dot.py): the segment is a matrix
@@ -455,19 +490,23 @@ static void vmo_redstrided_tile(__global uchar *arena, __global uchar **iop, con
 {
     const uint n_out = t.p0, red = t.p1, inner = t.p2, kind = t.p3;
     const uint lo = tile * EW_TS, hi = min(lo + EW_TS, n_out);
-    if (dt == DT_I32 || dt == DT_U32) {
+    if (dt == DT_I32 || dt == DT_U32 || dt == DT_BOOL) {
+        const int is_uns = (dt == DT_U32), is_bool = (dt == DT_BOOL);
         __global const int *a = AP(const int, t.a);
+        __global const uchar *ab = AP(const uchar, t.a);
         __global int *d = AP(int, t.dst);
+        __global uchar *db = AP(uchar, t.dst);
         for (uint g = lo + lid; g < hi; g += lsz) {
             const uint o = g / inner, i = g % inner;
             const uint base = o * red * inner + i;
-            int acc = kind == 0 ? 0 : kind == 1 ? INT_MIN : kind == 2 ? INT_MAX : 1;
+            int acc = vmo_ired_ident(kind, is_uns);
             for (uint r = 0; r < red; ++r) {
-                const int v = a[base + r * inner];
-                acc = kind == 0 ? acc + v : kind == 1 ? max(acc, v)
-                    : kind == 2 ? min(acc, v) : acc * v;
+                const int v = is_bool ? (int)ab[base + r * inner]
+                                      : a[base + r * inner];
+                acc = vmo_ired_comb(acc, v, kind, is_uns);
             }
-            d[g] = acc;
+            if (is_bool) db[g] = (uchar)(acc & 1);
+            else d[g] = acc;
         }
     } else {
         __global const float *a = AP(const float, t.a);
@@ -490,8 +529,8 @@ static void vmo_redstrided_tile(__global uchar *arena, __global uchar **iop, con
 static void vmo_reduce_comb_tile(__global uchar *arena, __global uchar **iop, const task_t t, uint dt,
                              uint lid)
 {
-    if (dt == DT_I32 || dt == DT_U32) {
-        vmo_reduce_comb_tile_i32(arena, iop, t, lid);
+    if (dt == DT_I32 || dt == DT_U32 || dt == DT_BOOL) {
+        vmo_reduce_comb_tile_i32(arena, iop, t, lid, dt);
         return;
     }
     if (lid != 0) return;

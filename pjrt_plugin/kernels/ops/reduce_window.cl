@@ -33,10 +33,14 @@ static void vmo_redwin_tile(__global uchar *arena, __global uchar **iop, __globa
     int wcount = 1;
     for (int d = 0; d < rank; ++d) wcount *= wdims[d];
     const int isint = (dt == DT_I32 || dt == DT_U32);
+    const int is_uns = (dt == DT_U32);   /* unsigned max/min + identities */
 
     for (uint i = lo + lid; i < hi; i += lsz) {
         float facc = kind == 0 ? 0.0f : kind == 1 ? -INFINITY : INFINITY;
-        int iacc = kind == 0 ? 0 : kind == 1 ? INT_MIN : INT_MAX;
+        /* max identity: 0 (u32) / INT_MIN (i32); min identity: UINT_MAX / INT_MAX */
+        int iacc = kind == 0 ? 0
+                 : kind == 1 ? (is_uns ? 0 : INT_MIN)
+                             : (is_uns ? (int)UINT_MAX : INT_MAX);
         for (int w = 0; w < wcount; ++w) {
             int rem_i = (int)i, rem_w = w, off = 0, inb = 1;
             for (int d = rank - 1; d >= 0; --d) {
@@ -50,7 +54,10 @@ static void vmo_redwin_tile(__global uchar *arena, __global uchar **iop, __globa
             if (isint) {
                 const int v = AP(const int, t.a)[off];
                 iacc = kind == 0 ? iacc + v
-                     : kind == 1 ? max(iacc, v) : min(iacc, v);
+                     : kind == 1 ? (is_uns ? (int)max((uint)iacc, (uint)v)
+                                           : max(iacc, v))
+                                 : (is_uns ? (int)min((uint)iacc, (uint)v)
+                                           : min(iacc, v));
             } else {
                 const float v = AP(const float, t.a)[off];
                 facc = kind == 0 ? facc + v

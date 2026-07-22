@@ -21,6 +21,7 @@ MATMUL_HYBRID_BODY = pathlib.Path(__file__).parent / "_matmul_hybrid_e2e_body.py
 DYNSLICE_BODY = pathlib.Path(__file__).parent / "_dynslice_e2e_body.py"
 RANDOM_BODY = pathlib.Path(__file__).parent / "_random_e2e_body.py"
 SDY_BODY = pathlib.Path(__file__).parent / "_sdy_e2e_body.py"
+REDUCE_INT_BODY = pathlib.Path(__file__).parent / "_reduce_int_e2e_body.py"
 
 
 def _run_body(body: pathlib.Path, marker: str, extra_env: dict | None = None
@@ -63,6 +64,24 @@ def test_e2e_sdy_sharding_subprocess():
     lowering must treat the sharding hints as identity on our single device.
     General infra: this is what unblocks any sharded program (brax/MJX)."""
     _run_body(SDY_BODY, "SDY E2E PASS")
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_reduce_int_bool_subprocess():
+    """INTEGER and BOOL reductions end-to-end (§41 correctness fix). The reduce
+    kernels assumed f32 slots, so reduce-and / reduce-or over bool and unsigned
+    min/max over u32 were WRONG. Drives every reduce PATH (full two-phase,
+    suffix RED_SEG, strided RED_STRIDED, windowed RED_WINDOW) for i32/u32/bool
+    over sum/max/min/and/or against numpy; u32 uses values > INT_MAX so a signed
+    compare would pick the wrong element."""
+    _run_body(REDUCE_INT_BODY, "REDUCE INT/BOOL E2E PASS")
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_reduce_int_bool_host_dispatch():
+    """Same, under the portable host-dispatch engine (clFinish-per-phase)."""
+    _run_body(REDUCE_INT_BODY, "REDUCE INT/BOOL E2E PASS",
+              {"PJRT_OCL_ENGINE": "host"})
 
 
 @pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
