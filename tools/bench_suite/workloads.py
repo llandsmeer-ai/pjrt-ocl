@@ -459,10 +459,9 @@ def build(name):
         #     general data-dependent stablehlo.scatter, and chlo.erf_inv.
         return fn, tree, {"cat": "PHYS",
                           "note": "brax inverted_pendulum reset+step (real env). "
-                                  "Layer-1 device allowlist bypassed; sdy dialect fixed. "
-                                  "Blocked on JAX opencl-platform threefry ui32/i32 "
-                                  "verifier bug (combined reset+step)",
-                          "expect": "FAIL(jax-threefry-ui32-verifier; mjx also needs "
-                                    "reduce-and/scatter/erf_inv)"}
+                                  "Layer-1 device allowlist bypassed; sdy dialect fixed; "
+                                  "ui32 dtype reporting fixed (§42); OP_CONV/scatter/"
+                                  "reduce-and (§39/§42) — runs end-to-end vs CUDA",
+                          "expect": "PASS"}
 
     raise KeyError(f"unknown workload: {name}")

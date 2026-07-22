@@ -173,27 +173,29 @@ apples-to-apples GPU-vs-GPU comparison of the VM against a production compiler.
 Takeaways (higher = slower; both axes log; ratios are per-op device work,
 dispatch-free — see methodology above):
 
-- **Elementwise (add / mul): at CUDA parity (0.9–1.2x) from 4K to 1M
-  elements; 2.2–2.7x at 2M–16M.** An earlier flat ~15 µs/op for ANY mid-range
+- **Elementwise (add / mul): at or below CUDA across the whole range** —
+  0.8–1.0x from 4K to 1M elements, 1.3–1.4x at 2M–8M, and **back to ~0.8x
+  (faster than CUDA) at 16M**. An earlier flat ~15 µs/op for ANY mid-range
   N turned out to be the TILE, not the boundary: one 16K-element tile was one
   workgroup's scalar stride-256 loop — 64 dependent memory round trips per
   thread — and the fixed tile size capped an op's parallelism at N/16K lanes.
   The float4+unroll fast path plus a device-tuned tile size (EW_TS 4096 on
   GPUs, decisions.md §22) removed that floor; per-instruction overhead itself
-  is ~3 µs, at CUDA's in-graph launch floor. At 16M we sustain ~1.7 TB/s —
-  HW bandwidth — and the residual 2.5x is CUDA's chain staying L2-resident
-  where our arena traffic does not; the fusion front (§19) attacks that.
-- **`gather` (`dynamic_slice`)** ~2.3–3.8x (was 2.6–7.8x): the contiguous
+  is ~2.5 µs, at CUDA's in-graph launch floor. The small residual bump at
+  2M–8M is CUDA's chain staying L2-resident where our arena traffic does not,
+  and it closes again once both sides go to HBM at 16M — where our tile is
+  bandwidth-bound and edges CUDA out.
+- **`gather` (`dynamic_slice`)** ~2.3–2.9x (was 2.6–7.8x): the contiguous
   rank-1 fast path replaced a per-element div/mod chain (§22). The remaining
   flat ~12 µs/op is the chain's scalar offset arithmetic — several one-element
   instructions + barrier phases per link — i.e. small-op fusion territory
   (§19), not the copy itself.
-- **`matrix × vector`** ~1.4–3.5x (was 4.3–46x, the worst table entry): GEMV
+- **`matrix × vector`** ~1.4–3.0x (was 4.3–46x, the worst table entry): GEMV
   no longer runs through the 64×64 matmul tile (63/64 of every tile wasted at
   N=1, serial K loop). `dot_general` with a vector rhs now lowers to the
   segmented-reduce tile in **dot mode** — one matrix row per tile, the whole
   workgroup doing a coalesced float4 dot + local tree, M-way parallel
-  (§22.4). 1024²: 101 → 8.2 µs (cuBLAS: 3.7, L2-resident).
+  (§22.4). 1024²: 101 → 8.0 µs (cuBLAS: 3.3, L2-resident).
 - **`dot_general`.** Large matmul runs a **standalone kernel launched outside
   the megakernel** (so a big register tile isn't capped by the persistent
   barrier's co-residency). On NVIDIA that's `mm_tc`, a tuned **inline-PTX TF32
@@ -203,23 +205,27 @@ dispatch-free — see methodology above):
   `PJRT_OCL_MM_HYBRID` mode routes a real program's big matmuls to it:
   **`large` transformer 27.7 → 18.8 ms (1.48×, gap vs cuBLAS 7.5× → 5.2×)** on
   compute-bound configs (small ones regress — their matmuls don't fill the SMs).
-  - **The residual ~2.3× under cuBLAS (134 TFLOP/s) is a root-caused *portable*
-    ceiling, not an effort ceiling.** The tile is **register-file-capped at 2
-    workgroups/SM** (a 128×128 f32 accumulator is 16384 registers; it can't grow),
-    and the one mechanism that hides the resulting memory latency — **`cp.async`**
-    (Ampere+ async global→shared copy) — **is not wired up by NVIDIA's OpenCL
-    runtime**: the driver emits correct PTX but the async unit never delivers
-    data (verified at the PTX level; CUDA-only). So cuBLAS-class matmul is
+  - **fp16 WMMA closes it further.** `PJRT_OCL_MM_FP16=1` swaps the TF32 WMMA
+    for `mma.sync.m16n8k16` + `ldmatrix` at 2× tensor rate and
+    tf32-equivalent (10-bit) mantissa — **92 → 107 TFLOP/s, ~1.25× under
+    cuBLAS** (§38a). That is as close as portable OpenCL reaches.
+  - **The residual under cuBLAS is a root-caused *portable* ceiling, not an
+    effort ceiling.** The tile is **register-file-capped at 2 workgroups/SM**
+    (a 128×128 f32 accumulator is 16384 registers; it can't grow), and the one
+    mechanism that hides the resulting memory latency — **`cp.async`** (Ampere+
+    async global→shared copy) — **is not wired up by NVIDIA's OpenCL runtime**:
+    the driver emits correct PTX but the async unit never delivers data
+    (verified at the PTX level; CUDA-only). So cuBLAS-class matmul is
     *fundamentally unreachable* from portable OpenCL — the honest matmul ceiling
-    of a no-vendor-SDK design. Full analysis in `docs/decisions.md §31–§36`.
-- **`while` loops: faster than CUDA up to ~1M elements (~100x below 256K,
-  0.7–0.8x at 512K–1M), 1.1–1.4x above.** The counted-loop pipeline (`OP_FOR`
+    of a no-vendor-SDK design. Full analysis in `docs/decisions.md §31–§38a`.
+- **`while` loops: faster than CUDA up to ~1M elements (~115x below 256K,
+  0.65–0.8x at 512K–1M), ~1.0–1.2x above.** The counted-loop pipeline (`OP_FOR`
   + bytecode unroll, §15) plus affine-chain composition folds the 32-step
-  `x*1.5+1` body into a handful of instructions at compile time (~2 µs/op),
-  while XLA GPU runs a real device-synchronized loop (~175 µs/op regardless
+  `x*1.5+1` body into a handful of instructions at compile time (~1.6 µs/op),
+  while XLA GPU runs a real device-synchronized loop (~184 µs/op regardless
   of N). Past the unroll arena gate (~512K) we run the loop for real — 32
-  in-kernel iterations of a vectorized affine tile + barrier now cost 122 µs
-  vs CUDA's 180 µs of launch-bound iterations (was 466 µs before §22's tile
+  in-kernel iterations of a vectorized affine tile + barrier now cost 121 µs
+  vs CUDA's 187 µs of launch-bound iterations (was 466 µs before §22's tile
   fixes; the megakernel's in-kernel loop is a genuine structural win here).
 - **`lax.scan` (stacked outputs) ties XLA CPU at 1M elements.** The
   dynamic_update_slice that stacks each step's output used to re-copy the
@@ -247,9 +253,9 @@ NVIDIA (TF32 tensor cores on), vs native JAX CUDA on the same GPU
 
 | config (D, ff, layers) | ours | native CUDA | gap | ours throughput |
 |------------------------|------|-------------|-----|-----------------|
-| base (512, 2048, 6)    | 5.3 ms | 0.44 ms | 12.1× | 3.9 TFLOP/s |
-| large_l1 (1024, 4096, 1) | 4.4 ms | 0.56 ms | 7.8× | 12.8 TFLOP/s |
-| large (1024, 4096, 6)  | 26.9 ms | 3.7 ms | **7.2×** | **12.5 TFLOP/s** |
+| base (512, 2048, 6)    | 5.4 ms | 0.43 ms | 12.5× | 3.9 TFLOP/s |
+| large_l1 (1024, 4096, 1) | 4.5 ms | 0.56 ms | 7.9× | 12.5 TFLOP/s |
+| large (1024, 4096, 6)  | 27.3 ms | 3.8 ms | **7.3×** | **12.3 TFLOP/s** |
 
 The gap **shrinks as the model gets compute-bound** (and holds at full depth):
 `base`'s 12× is small-op/overhead-bound, not a matmul deficit — on compute-heavy
@@ -277,6 +283,44 @@ vendor SDK. The `PJRT_OCL_MM_HYBRID` standalone-matmul path claws the *compute-b
 end back (`large` gap **7.5× → 5.2×**); the small-model overhead-bound end is a
 known, documented hard case. This is an honest, measured ceiling for a
 portable-OpenCL design, not a to-do.
+
+#### Application-workload suite (`tools/bench_suite/`)
+
+Beyond single ops and one transformer, an **18-workload testbench** spanning AI,
+scientific computing, and physics — each a small but complete `jax.jit` program,
+run end-to-end through the plugin and checked against native CUDA on the same GPU
+(`tools/bench_suite/run_suite.py`; per-workload notes and correctness in
+[`docs/workload-coverage.md`](docs/workload-coverage.md)). **All 18 run correct
+vs CUDA.** Same measurement as everywhere else — each backend in its own
+subprocess, median-of-rounds, `gap = ours_ms / cuda_ms`:
+
+![application-workload suite: ours (OpenCL) vs native CUDA](docs/bench_workloads.png)
+
+| workload | cat | gap | | workload | cat | gap |
+|---|---|---|---|---|---|---|
+| embedding_softmax | AI | **0.99×** | | mlp | AI | 4.47× |
+| logistic_map | SCI | 1.08× | | rk4_ode | SCI | 7.43× |
+| layernorm | AI | 1.37× | | gru | AI | 7.49× |
+| fft | SCI | 1.78× | | heat2d | SCI | 8.36× |
+| batchnorm | AI | 1.94× | | lstm | AI | 8.55× |
+| nbody | SCI | 2.62× | | monte_carlo | SCI | 9.79× |
+| spring_mass | PHYS | 2.78× | | transformer | AI | 18.80× |
+| cnn | AI | 3.10× | | brax_step | PHYS | 55.87× |
+| attention | AI | 3.64× | | | | |
+| hh_neuron | PHYS | 3.83× | | **median** | | **3.83×** |
+
+The spread maps cleanly onto the [root causes](#hardware-tested--benchmarks)
+above. **Memory-bound / fusion-friendly workloads sit at parity** — a fused
+`embedding_softmax` ties CUDA, `layernorm`/`logistic_map`/`fft`/`batchnorm` land
+within ~2×, because there's no matmul ceiling to hit and our single-megakernel
+fusion competes with XLA's multi-kernel dispatch. **Matmul-heavy** work
+(`transformer`, `mlp`, `cnn`) carries the `cp.async` matmul gap (§35); **long
+sequential `scan`** workloads (`lstm`/`gru`/`rk4`/`heat2d`/`monte_carlo`) pay a
+per-step barrier-phase tax XLA amortizes into fused kernels. `brax_step` is the
+outlier — a real MuJoCo/brax `reset+step` is hundreds of tiny data-dependent
+control-flow ops, the exact host-dispatch-bound regime; that it runs *correct*
+end-to-end (past the ui32 dtype fix, §42) is the milestone, and closing its
+latency is future scan/control-flow fusion work.
 
 ### Intel Arc 140V (Xe2, Lunar Lake iGPU) — vs JAX CPU
 
