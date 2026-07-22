@@ -1107,6 +1107,157 @@ def _lower_while_regions(ctx: _Ctx, job: _WhileJob) -> None:
                                           n=body_start, imm=body_len)
 
 
+# --- stablehlo.if / stablehlo.case : N-way region control (OP_IF) ------------
+
+_CMP_EQ = 0   # OP_CMP_F32 predicate for ==  (mirrors ops.elementwise pred table)
+
+
+@dataclasses.dataclass
+class _IfJob:
+    """A deferred region-lowering job for one OP_IF instruction (used for both
+    stablehlo.if and each arm of a lowered stablehlo.case). `if_idx` is the
+    index of the OP_IF placeholder in ctx.instrs; `cond_buf` is the f32 0/1
+    branch flag the device reads atomically; `results` is the shared list of
+    (buf, n_elems, dtype) carries every taken branch writes into (the if/case
+    results alias these). `else_block` is None for a case arm (empty else)."""
+    if_idx: int
+    then_block: object
+    else_block: object
+    cond_buf: int
+    results: list
+
+
+def _lower_branch_into(ctx: _Ctx, block, results: list) -> None:
+    """Lower a region block (no block arguments; captures enclosing SSA values)
+    and commit its returns into the shared result carries via COPY. Emits into
+    ctx.instrs at the current position (a region sub-list)."""
+    ret = None
+    for inner in block.operations:
+        io = inner.operation
+        if io.name in ("stablehlo.return", "func.return"):
+            ret = [ctx.buf_for(v) for v in io.operands]
+        else:
+            _lower_op(ctx, io)
+    if ret is None or len(ret) != len(results):
+        raise LoweringError("case/if branch return arity mismatch")
+    for (rbuf, n_elems, _dt), rb in zip(results, ret):
+        ctx.emit(Instr(OP_COPY_F32, dst=rbuf, a=rb, n=n_elems))
+
+
+def _lower_if_regions(ctx: _Ctx, job: _IfJob) -> None:
+    """Lower a queued OP_IF's then/else sub-lists (appended after the root, at
+    indices >= main_len — root_len rule) and patch the placeholder. Nested
+    regions inside a branch enqueue further jobs (drained in turn)."""
+    then_start = len(ctx.instrs)
+    _lower_branch_into(ctx, job.then_block, job.results)
+    then_len = len(ctx.instrs) - then_start
+    else_start = len(ctx.instrs)
+    if job.else_block is not None:
+        _lower_branch_into(ctx, job.else_block, job.results)
+    else_len = len(ctx.instrs) - else_start
+    ctx.instrs[job.if_idx] = Instr(OP_IF, dst=job.cond_buf,
+                                   a=then_start, b=then_len,
+                                   n=else_start, imm=else_len)
+
+
+def _alloc_results(ctx: _Ctx, op) -> list:
+    """Allocate one result carry buffer per op result and alias the results to
+    them. Returns [(buf, n_elems, dtype), ...]."""
+    results = []
+    for res in op.results:
+        _, n_elems, dtype = _tensor_info(res.type)
+        rbuf = ctx.new_buffer(n_elems, dtype)
+        results.append((rbuf, n_elems, dtype))
+        ctx.value_to_buf[res] = rbuf
+    return results
+
+
+@_handles("stablehlo.if")
+def _lower_if(ctx: _Ctx, op):
+    """stablehlo.if(pred) -> OP_IF over then/else region sub-lists. pred is an
+    i1 scalar; convert to an f32 0/1 flag the device reads atomically (same as
+    the while cond)."""
+    cond = ctx.buf_for(op.operands[0])
+    cond_f32 = ctx.new_buffer(1, DT_F32)
+    ctx.emit(Instr(OP_CONVERT, dst=cond_f32, a=cond, n=1))
+    results = _alloc_results(ctx, op)
+    if_idx = len(ctx.instrs)
+    ctx.emit(Instr(OP_IF))                 # placeholder; patched once regions lower
+    ctx.region_queue.append(_IfJob(if_idx, op.regions[0].blocks[0],
+                                   op.regions[1].blocks[0], cond_f32, results))
+
+
+@_handles("stablehlo.case")
+def _lower_case(ctx: _Ctx, op):
+    """stablehlo.case(index) -> an N-branch region op. StableHLO selects branch
+    `index`, clamping index<0 or index>=N to the LAST branch. We express the
+    N-way switch as N flat sibling OP_IFs sharing one set of result carries:
+    branch k runs iff its selection flag sel_k is 1. For k<N-1, sel_k =
+    (index==k) (exact); the default (out-of-range OR ==N-1) is sel_{N-1} =
+    1 - Σ_{k<N-1} sel_k (at most one earlier flag is set, so this is 0/1).
+    Guarding EVERY branch (incl. the last) keeps branches that never run — a
+    nested while, an expensive cone — from executing, unlike a select-all
+    lowering; frame depth stays 1 (siblings, not nested)."""
+    n_branches = len(op.regions)
+    if n_branches == 0:
+        raise LoweringError("stablehlo.case with no branches")
+
+    # N==1: index is irrelevant (always clamps to branch 0). Inline the single
+    # branch with no control, aliasing the case results to its returns.
+    if n_branches == 1:
+        block = op.regions[0].blocks[0]
+        ret = None
+        for inner in block.operations:
+            io = inner.operation
+            if io.name in ("stablehlo.return", "func.return"):
+                ret = [ctx.buf_for(v) for v in io.operands]
+            else:
+                _lower_op(ctx, io)
+        if ret is None or len(ret) != len(op.results):
+            raise LoweringError("stablehlo.case branch return arity mismatch")
+        for res, rb in zip(op.results, ret):
+            ctx.value_to_buf[res] = rb
+        return
+
+    results = _alloc_results(ctx, op)
+
+    # index -> f32 (exact for small branch indices) for scalar == compares.
+    _, idx_n, idx_dt = _tensor_info(op.operands[0].type)
+    idx_f32 = ctx.buf_for(op.operands[0])
+    if idx_dt != DT_F32:
+        idx_f32 = ctx.new_buffer(idx_n, DT_F32)
+        ctx.emit(Instr(OP_CONVERT, dst=idx_f32, a=ctx.buf_for(op.operands[0]),
+                       n=idx_n))
+
+    sels = []                              # f32 0/1 flags for branches 0..N-2
+    for k in range(n_branches - 1):
+        kconst = ctx.new_buffer(1, DT_F32)
+        ctx.emit(Instr(OP_FILL_F32, dst=kconst, imm=_f32_bits(float(k)), n=1))
+        cmpb = ctx.new_buffer(1, DT_BOOL)
+        ctx.emit(Instr(OP_CMP_F32, dst=cmpb, a=idx_f32, b=kconst, n=1,
+                       imm=_CMP_EQ))
+        selk = ctx.new_buffer(1, DT_F32)
+        ctx.emit(Instr(OP_CONVERT, dst=selk, a=cmpb, n=1))
+        sels.append(selk)
+    # sel_last = 1 - Σ sel_k  (n_branches >= 2 here, so `sels` is non-empty)
+    acc = sels[0]
+    for s in sels[1:]:
+        nacc = ctx.new_buffer(1, DT_F32)
+        ctx.emit(Instr(OP_ADD_F32, dst=nacc, a=acc, b=s, n=1))
+        acc = nacc
+    one = ctx.new_buffer(1, DT_F32)
+    ctx.emit(Instr(OP_FILL_F32, dst=one, imm=_f32_bits(1.0), n=1))
+    sel_last = ctx.new_buffer(1, DT_F32)
+    ctx.emit(Instr(OP_SUB_F32, dst=sel_last, a=one, b=acc, n=1))
+    all_sels = sels + [sel_last]
+
+    for k in range(n_branches):
+        if_idx = len(ctx.instrs)
+        ctx.emit(Instr(OP_IF))             # placeholder; patched once regions lower
+        ctx.region_queue.append(_IfJob(if_idx, op.regions[k].blocks[0], None,
+                                       all_sels[k], results))
+
+
 def _lower_op(ctx: _Ctx, o) -> None:
     if o.name == "func.call":
         _inline_call(ctx, o)
@@ -1136,6 +1287,20 @@ def _reads_of(ins: Instr) -> set[int]:
     if op == OP_SELECT_F32:
         base |= {ins.imm}                # select predicate rides in imm
     return base
+
+
+def _reader_index(instrs: list) -> dict:
+    """buf_id -> list of live instr indices that read it. Built once per fusion
+    round so the view-fold passes look up a gather's readers in O(readers)
+    instead of rescanning the whole stream per gather (O(n²)→O(n) per round;
+    matters on large graphs like the brax step, ~19k instrs)."""
+    idx: dict[int, list[int]] = {}
+    for j, ins in enumerate(instrs):
+        if ins.op == OP_NOP:
+            continue
+        for b in _reads_of(ins):
+            idx.setdefault(b, []).append(j)
+    return idx
 
 
 def _compose_affines(ctx: _Ctx) -> None:
@@ -1263,6 +1428,7 @@ def _fuse_views(ctx: _Ctx) -> None:
         for idx, ins in enumerate(instrs):
             if ins.op != OP_NOP:
                 writer_idxs.setdefault(ins.dst, []).append(idx)
+        rmap = _reader_index(instrs)
         for gi, g in enumerate(instrs):
             if g.op != OP_GATHER_STRIDED or g.dst in outs:
                 continue
@@ -1279,8 +1445,10 @@ def _fuse_views(ctx: _Ctx) -> None:
             if any(w > gi for w in writer_idxs.get(g.a, ())):
                 continue
             gbuf = g.dst
-            readers = [(j, ins) for j, ins in enumerate(instrs)
-                       if ins.op != OP_NOP and gbuf in _reads_of(ins)]
+            # rmap is built once per round; re-filter live (an earlier fold this
+            # round may have NOP'd/retargeted a listed reader).
+            readers = [(j, instrs[j]) for j in rmap.get(gbuf, ())
+                       if instrs[j].op != OP_NOP and gbuf in _reads_of(instrs[j])]
             if not readers:
                 continue
             def foldable(r):
@@ -2168,14 +2336,17 @@ def _fuse_matmul_views(ctx: _Ctx) -> None:
     changed = True
     while changed:
         changed = False
+        rmap = _reader_index(instrs)
         for gi, g in enumerate(instrs):
             if g.op != OP_GATHER_STRIDED or g.dst in outs:
                 continue
             if ctx.buffers[g.dst].dtype != DT_F32:
                 continue
             gbuf = g.dst
-            readers = [(j, ins) for j, ins in enumerate(instrs)
-                       if ins.op != OP_NOP and gbuf in _reads_of(ins)]
+            # rmap is built once per round; re-filter live (an earlier fold this
+            # round may have NOP'd/retargeted a listed reader).
+            readers = [(j, instrs[j]) for j in rmap.get(gbuf, ())
+                       if instrs[j].op != OP_NOP and gbuf in _reads_of(instrs[j])]
             if not readers:
                 continue
 
@@ -2637,9 +2808,9 @@ def _reuse_arena(ctx: _Ctx, main_len: int) -> None:
             region_ops.append((payload, ph))
 
     def _subranges(ins: Instr) -> list[int]:
-        if ins.op == OP_WHILE:
-            return (list(range(ins.a, ins.a + ins.b))       # cond sub-list
-                    + list(range(ins.n, ins.n + ins.imm)))  # body sub-list
+        if ins.op in (OP_WHILE, OP_IF):
+            return (list(range(ins.a, ins.a + ins.b))       # cond / then sub-list
+                    + list(range(ins.n, ins.n + ins.imm)))  # body / else sub-list
         if ins.op == OP_FOR:
             return list(range(ins.n, ins.n + ins.imm))      # body sub-list
         return []
@@ -2756,15 +2927,36 @@ def lower_module(module) -> VMProgram:
         ctx.inputs.append(buf)
         ctx.input_shapes.append(shape)
 
+    _TP = os.environ.get("PJRT_OCL_TIME_PASSES")
+    if _TP:
+        import sys as _sys, time as _time
+        _t = [_time.time()]
+
+        def _tick(name):
+            now = _time.time()
+            print(f"[time] {name}: {now - _t[0]:.2f}s "
+                  f"(instrs={len(ctx.instrs)} bufs={len(ctx.buffers)})",
+                  file=_sys.stderr, flush=True)
+            _t[0] = now
+    else:
+        def _tick(name):
+            pass
+
     for op in entry_block.operations:
         _lower_op(ctx, op.operation)
+    _tick("root-lower")
 
     # The root list is exactly the entry-block lowering; region sub-lists
     # (cond/body of every while, nested included) are appended after it so the
     # root walk [0, main_len) never enters a sub-range (docs/vmprogram.md).
     main_len = len(ctx.instrs)
     while ctx.region_queue:
-        _lower_while_regions(ctx, ctx.region_queue.pop(0))
+        job = ctx.region_queue.pop(0)
+        if isinstance(job, _IfJob):
+            _lower_if_regions(ctx, job)
+        else:
+            _lower_while_regions(ctx, job)
+    _tick("region-lower")
 
     # perf peepholes (index-stable, NOP-substituting): collapse scale/bias chains
     # into one in-place affine pass, fold shape ops (broadcast/transpose/slice)
@@ -2773,21 +2965,28 @@ def lower_module(module) -> VMProgram:
     # EITHER a dot or EW readers (disjoint by _fuse_views' viewable-EW gate), so
     # order only matters for a gather read by both — those don't fold either way.
     _compose_affines(ctx)
+    _tick("compose_affines")
     _fuse_matmul_views(ctx)
+    _tick("fuse_matmul_views")
     _fuse_views(ctx)
+    _tick("fuse_views")
     _dce_nops(ctx)
+    _tick("dce_nops")
 
     # Recognize softmax/layernorm reduce→broadcast idioms and collapse each into
     # one fused local-memory op (§19), then DCE the now-dead intermediates. Runs
     # on the cleaned stream (after view-fold/affine-compose/DCE) so the idiom is
     # in its canonical form; before _reuse_arena so liveness sees the fused op.
     _fuse_norm(ctx)
+    _tick("fuse_norm")
     _fuse_gelu(ctx)
+    _tick("fuse_gelu")
     # General register-resident map-region fusion (§23/§27/§28): collapse the
     # remaining pure-map EW chains (bounded by the dedicated fused ops above and
     # all cross-lane ops) into one OP_MAP_REGION each — K phases → 1. Runs last
     # so softmax/layernorm/gelu are already single ops (= region boundaries).
     _fuse_region(ctx, main_len)
+    _tick("fuse_region")
     # DCE first so the dead gelu/norm backbones (_fuse_gelu leaves them for later
     # DCE) are gone — the epilogue recognizer's single-consumer test must see the
     # matmul output's ONLY live reader (the fused GELU/affine/residual op).
@@ -2797,6 +2996,7 @@ def lower_module(module) -> VMProgram:
     # EW/norm/gelu fusions so those are single ops = epilogue candidates, and
     # before _reuse_arena so liveness sees the retargeted DOT + residual read.
     _fuse_mma_epilogue(ctx, main_len)
+    _tick("fuse_mma_epilogue")
     _dce_nops(ctx)
     # §34 flash-attention: collapse DOT(QKᵀ)·scale → softmax → DOT(AV) into ONE
     # online-softmax op (no materialized score matrix). Runs after the epilogue
@@ -2804,16 +3004,19 @@ def lower_module(module) -> VMProgram:
     # and before _finalize_matmul_views/_reuse_arena. Reads Q/K/V through the
     # DOTs' own folded views, so it must see aview/bview BEFORE they are consumed.
     _fuse_attention(ctx, main_len)
+    _tick("fuse_attention")
     _dce_nops(ctx)
     # Mirror DOT views + epilogue into the serialized aux header now that both
     # are settled, so the reparsed tensor validator can recover them.
     _finalize_matmul_views(ctx)
+    _tick("finalize_matmul_views")
 
     # Liveness-reuse: rewrite arena offsets so the arena is bounded by peak
     # concurrent liveness, not the sum of every intermediate (§16). Runs AFTER
     # fusion/DCE (they NOP out buffers) and BEFORE the cap check (the backstop).
     _bump_arena = ctx._arena
     _reuse_arena(ctx, main_len)
+    _tick("reuse_arena")
     if os.environ.get("PJRT_OCL_ARENA_DEBUG"):
         import sys
         print(f"[pjrt_ocl arena] bump={_bump_arena} "

@@ -1499,7 +1499,8 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
     return p.entries[p.lane_tab[L].off + pc];
   };
 
-  enum Ev { EV_BARRIER, EV_COND_DONE, EV_BODY_DONE, EV_FOR_DONE, EV_DONE };
+  enum Ev { EV_BARRIER, EV_COND_DONE, EV_BODY_DONE, EV_FOR_DONE, EV_IF,
+            EV_DONE };
   // Advance lane L to its next barrier/transition, collecting its contiguous
   // tile-entry run into seg[2L..2L+1]. Direct mirror of vm2's interpreter.
   auto advance = [&](uint32_t L) -> Ev {
@@ -1521,6 +1522,7 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
       }
       const VmEntry& en = lane_entry(L, f.pc);
       if (en.task == kEntBarrier) return EV_BARRIER;
+      if (en.task == kEntIf) return EV_IF;  // resolve cond at the driver level
       if (en.task == kEntWhile) {
         if (static_cast<int>(st[L].size()) >= MAX_DEPTH) return EV_DONE;
         st[L].push_back({en.tile_lo, en.tile_lo + en.tile_hi, f.pc, 0});
@@ -1830,6 +1832,43 @@ bool LoadedProgram::LaunchHostDispatch(cl_command_queue q, std::string* err) {
           st[L].pop_back();
           st[L].back().pc++;
         }
+      }
+    } else if (ev == EV_IF) {
+      // N-way case / if arm. Read the shared branch flag (all lanes' IF entries
+      // name the same buffer; the flag producer ran in a prior phase), then
+      // push the selected branch's frame per lane. Empty selected branch: skip
+      // the IF. The branch pops back to the parent (advance's kEntIf case) with
+      // no closing barrier — the parent's level-separator barrier syncs it.
+      const VmEntry& w0 = lane_entry(0, st[0].back().pc);
+      uint32_t cbits = 0;
+      const uint64_t off = p.buffers[w0.signal_flag].arena_byte_offset;
+      if (!flush_group(false)) {  // enqueue pending phases before the read
+        release_tevs();
+        return false;
+      }
+      if (clEnqueueReadBuffer(q, arena_, CL_TRUE, off, 4, &cbits, 0, nullptr,
+                              nullptr) != CL_SUCCESS) {
+        *err = "host-dispatch: IF cond read failed";
+        release_tevs();
+        return false;
+      }
+      n_drain++;  // the blocking read is itself a drain
+      ring = 0;
+      for (uint32_t L = 0; L < n; ++L) {
+        Frame& f = st[L].back();
+        const VmEntry& w = lane_entry(L, f.pc);  // the IF entry
+        const uint32_t start = cbits != 0 ? w.tile_lo : w.wait_flag;
+        const uint32_t length = cbits != 0 ? w.tile_hi : w.wait_count;
+        if (length == 0) {  // empty selected branch: step past the IF
+          f.pc++;
+          continue;
+        }
+        if (static_cast<int>(st[L].size()) >= MAX_DEPTH) {
+          *err = "host-dispatch: IF nesting exceeds MAX_DEPTH";
+          release_tevs();
+          return false;
+        }
+        st[L].push_back({start, start + length, f.pc, 2});
       }
     } else if (ev == EV_FOR_DONE) {
       // Fixed-trip iteration done: decrement and loop or pop. NO cond read,

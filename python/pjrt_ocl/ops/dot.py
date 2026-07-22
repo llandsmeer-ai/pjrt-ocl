@@ -57,6 +57,40 @@ def _decode(ins):
     return ins.n, ins.imm >> 16, ins.imm & 0xFFFF, max(1, ins.imm2)
 
 
+def _row_major_strides(shape):
+    strides = [0] * len(shape)
+    acc = 1
+    for i in range(len(shape) - 1, -1, -1):
+        strides[i] = acc
+        acc *= shape[i]
+    return strides
+
+
+def _canonicalize(ctx, buf, shape, batch, contract, contract_first):
+    """Transpose an operand so its axes are batch(in given order) + contract +
+    free (contract_first) or batch + free + contract (otherwise) — the layout
+    the plain-matmul path wants. Returns (buf, canonical_shape). No-op (no
+    transpose emitted) when the operand is already in that order. A
+    non-canonical dot_general (e.g. `A @ Bᵀ`, contracting_dims=[1]x[2]) then
+    lowers to a materializing transpose GATHER + the canonical matmul."""
+    rank = len(shape)
+    free = [d for d in range(rank) if d not in batch and d != contract]
+    perm = (list(batch) + [contract] + free if contract_first
+            else list(batch) + free + [contract])
+    if perm == list(range(rank)):
+        return buf, shape
+    in_strides = _row_major_strides(shape)
+    out_shape = tuple(shape[perm[j]] for j in range(rank))
+    out_strides = [in_strides[perm[j]] for j in range(rank)]
+    n = 1
+    for d in out_shape:
+        n *= d
+    aux_off = ctx.add_aux([rank] + list(out_shape) + list(out_strides) + [0])
+    dst = ctx.new_buffer(n)
+    ctx.emit(L.Instr(L.OP_GATHER_STRIDED, dst=dst, a=buf, n=n, aux=aux_off))
+    return dst, out_shape
+
+
 @L.handles("stablehlo.dot_general")
 def _dot_general(ctx, op):
     """General dot_general reduced to a (batched) row-major matmul
@@ -86,23 +120,27 @@ def _dot_general(ctx, op):
         raise L.LoweringError(
             f"dot_general: only a single contracting dim (got lhs {lc}, rhs {rc})")
     nb = len(lb)
-    if lb != list(range(nb)) or rb != list(range(nb)):
-        raise L.LoweringError(
-            f"dot_general: batch dims must be the leading axes on both sides "
-            f"(got lhs_batching={lb}, rhs_batching={rb})")
+    if len(rb) != nb:
+        raise L.LoweringError("dot_general: batch-dim count mismatch lhs/rhs")
+
+    # Canonicalize to lhs=[batch…, free…, K], rhs=[batch…, K, free…] via a
+    # transpose GATHER on any operand not already in that order (batch dims may
+    # be interior, lhs contract not last, rhs contract not first-after-batch —
+    # all the layouts jax emits for `A @ Bᵀ`, permuted einsums, etc.).
+    lhs_buf, lhs_shape = _canonicalize(
+        ctx, ctx.buf_for(op.operands[0]), lhs_shape, lb, lc[0],
+        contract_first=False)
+    rhs_buf, rhs_shape = _canonicalize(
+        ctx, ctx.buf_for(op.operands[1]), rhs_shape, rb, rc[0],
+        contract_first=True)
+    lr, rr = len(lhs_shape), len(rhs_shape)
+    lc, rc = [lr - 1], [nb]     # contract axes after canonicalization
+
     G = 1
     for d in range(nb):
         if lhs_shape[d] != rhs_shape[d]:
             raise L.LoweringError("dot_general: batch dim size mismatch")
         G *= lhs_shape[d]
-    if lc[0] != lr - 1:
-        raise L.LoweringError(
-            f"dot_general: lhs contract dim must be last (got {lc[0]} of rank "
-            f"{lr}); a non-canonical layout needs a transpose first")
-    if rc[0] != nb:
-        raise L.LoweringError(
-            f"dot_general: rhs contract dim must be first after the batch dims "
-            f"(got {rc[0]}); a non-canonical layout needs a transpose first")
 
     K = lhs_shape[lc[0]]
     if rhs_shape[rc[0]] != K:
@@ -118,9 +156,7 @@ def _dot_general(ctx, op):
             f"dot_general: N={N}, K={K} exceed the 16-bit packing limit")
 
     dst = ctx.new_buffer(G * M * N)
-    ctx.emit(L.Instr(L.OP_DOT, dst=dst,
-                     a=ctx.buf_for(op.operands[0]),
-                     b=ctx.buf_for(op.operands[1]),
+    ctx.emit(L.Instr(L.OP_DOT, dst=dst, a=lhs_buf, b=rhs_buf,
                      n=M, imm=(N << 16) | K, imm2=G))
     ctx.value_to_buf[op.results[0]] = dst
 

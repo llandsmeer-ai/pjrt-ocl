@@ -22,10 +22,12 @@ DYNSLICE_BODY = pathlib.Path(__file__).parent / "_dynslice_e2e_body.py"
 RANDOM_BODY = pathlib.Path(__file__).parent / "_random_e2e_body.py"
 SDY_BODY = pathlib.Path(__file__).parent / "_sdy_e2e_body.py"
 REDUCE_INT_BODY = pathlib.Path(__file__).parent / "_reduce_int_e2e_body.py"
+CASE_BODY = pathlib.Path(__file__).parent / "_case_e2e_body.py"
+BRAX_BODY = pathlib.Path(__file__).parent / "_brax_e2e_body.py"
 
 
-def _run_body(body: pathlib.Path, marker: str, extra_env: dict | None = None
-              ) -> None:
+def _run_body(body: pathlib.Path, marker: str, extra_env: dict | None = None,
+              timeout: int = 120) -> None:
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "opencl"
     # Keep OpenCL compiler caches off the (full) root overlay on the dev box.
@@ -33,7 +35,7 @@ def _run_body(body: pathlib.Path, marker: str, extra_env: dict | None = None
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run([sys.executable, str(body)], capture_output=True,
-                          text=True, env=env, timeout=120)
+                          text=True, env=env, timeout=timeout)
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     assert marker in proc.stdout
 
@@ -117,6 +119,34 @@ def test_e2e_matmul_hybrid_host_dispatch():
     default; forcing host engine makes it run on any device."""
     _run_body(MATMUL_HYBRID_BODY, "MATMUL HYBRID E2E PASS",
               {"PJRT_OCL_ENGINE": "host"})
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_case_switch_subprocess():
+    """stablehlo.case (N-way switch) + stablehlo.if end-to-end. The N-way
+    switch lowers to flat sibling OP_IFs sharing result carries; the device
+    reads each branch flag between barrier phases and runs only the selected
+    arm (megakernel path). Covers valid + out-of-range (clamp-to-last) indices
+    and a runtime-computed index."""
+    _run_body(CASE_BODY, "CASE E2E PASS")
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_case_switch_host_dispatch():
+    """Same, under the host-dispatch engine — exercises the C++ host frame
+    walker's IF branch-flag read (clEnqueueReadBuffer between phases) + push."""
+    _run_body(CASE_BODY, "CASE E2E PASS", {"PJRT_OCL_ENGINE": "host"})
+
+
+@pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")
+def test_e2e_brax_step_subprocess():
+    """A real brax env (inverted_pendulum, positional) reset + one physics step,
+    jitted as ONE program, end-to-end. Exercises the full brax-step op set:
+    stablehlo.case, non-canonical dot_general (transpose-canonicalized), gather/
+    scatter, reduce-and/or, threefry RNG, sdy hints. Asserts obs + reward finite
+    (correctness vs CUDA is checked out-of-band in the workload suite). Compile
+    is ~20 s on this 19k-instr program, so a larger timeout."""
+    _run_body(BRAX_BODY, "BRAX_RESULT", timeout=300)
 
 
 @pytest.mark.skipif(not PLUGIN.exists(), reason="libpjrt_ocl.so not built")

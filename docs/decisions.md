@@ -3589,3 +3589,76 @@ histogram / segment-sum / one-hot accumulation, and one of MJX/brax's step
 blockers (`brax_step` still also needs `case`, `atan`, and its JAX-side threefry
 fix per §41 — scatter alone does not flip it green). New op count: tile ops
 0..18, python opcodes ..65.
+
+## 43. brax_step FAIL→PASS (17/18): stablehlo.case (N-way switch), stablehlo.if, and non-canonical dot_general (2026-07-22)
+
+**Outcome.** The real brax `inverted_pendulum` (positional backend) reset + one
+physics step, jitted as ONE program, now runs end-to-end on BOTH engines —
+NVIDIA (megakernel) and PoCL (host-dispatch). obs finite, `np.allclose` vs
+native CUDA (max_abs 1.2e-3, max_rel 0.17 on a ~0.007 element; reward 1.0
+exact). Our two backends agree bit-for-bit with each other (PoCL matches CUDA
+exactly on the two f32-exact obs components; both differ from CUDA only on the
+tf32-matmul-sensitive ones). Coverage 16/18 → **17/18** (only fft, complex
+dtype, remains). The three ex-blockers catalogued in §41 (reduce-and, general
+scatter, ui32 host dtype) were already SHIPPED (§41/§42); the actual walls this
+session were `stablehlo.case`, then a non-canonical `dot_general` layout. No
+`chlo.erf_inv` in the positional backend (the §41 prediction was for MJX).
+
+### stablehlo.case → flat sibling OP_IFs (and stablehlo.if → OP_IF)
+`OP_IF` existed in the opcode table, the megakernel (`vm_main.cl` ENT_IF), and
+the loader/validators, but **nothing ever emitted it** — no `stablehlo.if`/`case`
+handler, and the scheduler's `_REGION_OPS` excluded it. Implemented case the
+"same way" as while (nested instruction lists, cond read on device between
+sub-list runs), generalized N-way:
+  - **Lowering** (`lowering._lower_case`): allocate one result carry per case
+    result; for an N-branch case emit N *flat sibling* `OP_IF`s sharing those
+    carries. Branch k runs iff `sel_k` is 1: for k<N-1, `sel_k = (index==k)`
+    (exact int compare via CMP+CONVERT to an f32 0/1 flag the device reads with
+    a 4-byte atomic); the default arm (out-of-range OR ==N-1, StableHLO clamps
+    to the last branch) is `sel_{N-1} = 1 - Σ_{k<N-1} sel_k` (≤1 earlier flag is
+    set, so 0/1). Each branch commits its returns into the shared carries via
+    COPY. **Flat siblings, not a nested cascade**, so frame depth stays 1 (≤8
+    budget) for any N, and — unlike a select-all lowering — a branch that never
+    runs never executes (safe for a branch with a nested while / expensive
+    cone). N==1 inlines with no control (index clamps to branch 0). Branch
+    regions have no block args and capture enclosing SSA values (already bound).
+    `stablehlo.if` is the 2-branch case with a real else (bonus coverage).
+  - **Scheduler**: `OP_IF` added to `_REGION_OPS`; `_emit_while`/`schedule_region`
+    emit ENT_IF (signal_flag = branch-flag buffer) and patch then=[tile_lo,
+    tile_hi]/else=[wait_flag,wait_count] per lane. A branch pops back with no
+    closing barrier — the parent's level-separator barrier syncs it.
+  - **Validators + host engine** were scaffolded-but-unfinished for IF and are
+    now completed: `vmreader.execute` (tensor interp), `vmreader._run_control`
+    (schedule sim — read branch flag, push frame), and **`runtime.cc`
+    LaunchHostDispatch** (new `EV_IF`: flush+drain pending phases, blocking
+    `clEnqueueReadBuffer` of the flag, push the selected arm per lane — the
+    host-dispatch advance() previously fell through kEntIf as a tile, i.e. the
+    path had never run). The megakernel ENT_IF push already worked.
+
+### Non-canonical dot_general → transpose-canonicalize
+The brax step's mass-matrix / inertia math emits `dot_general` layouts our
+plain-matmul path rejected (e.g. `contracting_dims=[1]x[2]`, batched `A @ Bᵀ`).
+`ops/dot._canonicalize` now transposes any operand not already in
+lhs=[batch…,free…,K] / rhs=[batch…,K,free…] order via a materializing
+`OP_GATHER_STRIDED` (permuted strides), then runs the existing canonical matmul.
+Covers interior batch dims, lhs-contract-not-last, rhs-contract-not-first. The
+ex-"rejected" test flipped to a correctness test; added batched-Bᵀ and lhs-
+transposed cases (all on both validators).
+
+### Compile-time fix (necessary side effect): view-fold passes were O(n²)
+The brax step is a ~19k-instr program — the first non-trivial graph to reach
+`_fuse_matmul_views` / `_fuse_views` at scale, and they were **O(n²) per
+`while changed` round** (each gather rescanned the whole stream for its
+readers). Lowering took ~700 s. Added `_reader_index` (buf→reader-idx map built
+once per round; readers re-filtered live) → **445 s→0.10 s and 252 s→0.12 s**,
+total lowering ~19 s, byte-identical output (same 19043 instrs, all view/fusion/
+attention/matmul tests green). Env-gated `PJRT_OCL_TIME_PASSES` prints per-pass
+timing (kept — MJX programs will be larger still).
+
+### Verified
+Full pytest **395 passed / 1 skipped** (was ~390). New: `test_ops_case.py`
+(7 cases, both validators, incl. runtime index + clamp + multi-result + N-D +
+lax.cond), dot transpose cases, and 3 e2e (`_case_e2e_body` on mega + host,
+`_brax_e2e_body`). C++ `runtime_test` PASS. brax e2e confirmed on NVIDIA + PoCL
+vs CUDA golden. New op count unchanged (OP_IF already existed, now wired end to
+end).

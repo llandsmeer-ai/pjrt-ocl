@@ -30,8 +30,8 @@ import numpy as np
 from .lowering import (
     ARENA_ALIGN, BUFENT_STRUCT, CONSTHDR_STRUCT, DT_F32, DTYPE_NUMPY,
     HEADER_STRUCT, INSTR_STRUCT, MAGIC, OP_ADD_F32, OP_AFFINE_F32, OP_DOT,
-    OP_FILL_F32, OP_FOR, OP_IOTA_F32, OP_LTS_F32, OP_MUL_F32, OP_NAMES, OP_NOP,
-    OP_SUB_F32, OP_WHILE, SECTION_ALIGN, VERSION,
+    OP_FILL_F32, OP_FOR, OP_IF, OP_IOTA_F32, OP_LTS_F32, OP_MUL_F32, OP_NAMES,
+    OP_NOP, OP_SUB_F32, OP_WHILE, SECTION_ALIGN, VERSION,
 )
 from . import scheduler as S
 from . import opsem
@@ -278,15 +278,17 @@ def parse(data: bytes) -> Program:
         # the 8th word is a general second immediate: OP_AFFINE_F32's t bits,
         # OP_DOT's batch count, or an elementwise op's operand-b view aux-offset.
         # (Control/nop never use it.)
-        if imm2 != 0 and op in (OP_NOP, OP_WHILE, OP_FOR):
+        if imm2 != 0 and op in (OP_NOP, OP_WHILE, OP_FOR, OP_IF):
             raise FormatError(f"instr[{i}] nonzero padding")
         if aux_off > n_aux:
             raise FormatError(f"instr[{i}] aux offset {aux_off} > n_aux {n_aux}")
-        if op == OP_WHILE:
+        if op in (OP_WHILE, OP_IF):
+            # WHILE: cond=[a,a+b), body=[n,n+imm). IF: then=[a,a+b), else=
+            # [n,n+imm). Both read the cond/branch scalar from buffer `dst`.
             if a + b > n_instrs or n + imm > n_instrs:
-                raise FormatError(f"instr[{i}] WHILE sub-list out of range")
+                raise FormatError(f"instr[{i}] region sub-list out of range")
             if dst >= n_buffers:
-                raise FormatError(f"instr[{i}] WHILE cond buffer out of range")
+                raise FormatError(f"instr[{i}] region cond buffer out of range")
         elif op == OP_FOR:
             # body = [n, n+imm), b = trip count; dst/a unused (no cond).
             if n + imm > n_instrs:
@@ -450,6 +452,12 @@ def execute(prog: Program, args: list[np.ndarray]) -> list[np.ndarray]:
             elif op == OP_FOR:
                 # body = [n, n+imm) run b times (fixed trip; no cond list)
                 for _ in range(ins.b):
+                    run_range(ins.n, ins.imm, depth + 1)
+            elif op == OP_IF:
+                # then = [a, a+b), else = [n, n+imm); branch on dst != 0
+                if view(ins.dst, 1)[0] != np.float32(0.0):
+                    run_range(ins.a, ins.b, depth + 1)
+                else:
                     run_range(ins.n, ins.imm, depth + 1)
             elif op in opsem.INTERP:
                 opsem.INTERP[op](ins, _InterpRT(prog, view))
@@ -695,7 +703,22 @@ def _run_control(sched: ParsedSchedule, arena: np.ndarray, view,
                                      e.wait_flag])
                 continue
             if e.task == S.TASK_IF:
-                raise NotImplementedError("schedule simulator: IF entries")
+                # Read the branch flag (its producer ran before the barrier that
+                # precedes every IF level), pick then/else, push the frame. An
+                # empty selected branch just steps past the IF. The pop on
+                # branch exhaustion (task==TASK_IF above) advances the parent.
+                cbits = view(e.signal_flag)[0]
+                if cbits != 0:
+                    start, length = e.tile_lo, e.tile_hi
+                else:
+                    start, length = e.wait_flag, e.wait_count
+                if length == 0:
+                    f[0] += 1
+                    continue
+                if len(stacks[lane]) > MAX_WHILE_DEPTH:
+                    raise FormatError(f"IF nesting exceeds {MAX_WHILE_DEPTH}")
+                stacks[lane].append([start, start + length, f[0], 2])
+                continue
             if e.task != S.TASK_NOP:
                 batch.append((lane, e))
             f[0] += 1
