@@ -3772,3 +3772,102 @@ would be more principled but adds init cost — deferred. Remaining Xe2 perf gap
 the large matmul (2048³) is only ~par with an 8-core CPU at ~1.15 TFLOP/s,
 far below Xe2's f32 peak — the host-dispatch SGEMM microkernel is the next
 optimization target (§45+).
+
+## 45. Xe2 SGEMM tile: MM2_BK 16 → 8 (occupancy, not registers) — 1.3x (2026-07-22)
+
+**Context.** After §44 put Xe2 on host-dispatch, the standalone `mm2` SGEMM ran
+at ~1.17 TFLOP/s at 2048³ — about a quarter of the part's f32 peak, and only
+par with an 8-core CPU. Hypothesis going in: the 128×64 tile's 8×4 = 32
+accumulators over-pressure Intel's GRF and spill.
+
+**PoC (poc/19-xe2-mma).** The shipped kernel with `TM/TN/TD/BK` lifted to build
+`-D` options, swept at N=512/1024/2048 (full table in the poc README).
+
+**The hypothesis was WRONG — it is occupancy, not registers.** The 8×8
+(64-accumulator) 128×128 tile is the *fastest* config at 2048 (1866 GFLOP/s),
+so register pressure was not the limit. What mattered was `BK`: double-buffered
+staging allocates `2*BK*(TM+TN)` floats, so bk16 = 24 KB/workgroup vs bk8 =
+12 KB. Halving it doubles co-resident workgroups on the 128 KB SLM and lets the
+driver latency-hide global loads. `bk32` (48 KB) is catastrophic (−60%),
+confirming the occupancy story.
+
+| config | 512 | 1024 | 2048 |
+|---|---|---|---|
+| 128×64 bk16 (shipped) | 675 | 1079 | 1171 |
+| **128×64 bk8 (chosen)** | **795** | **1564** | 1522 |
+| 128×128 bk8 | 428 | 1608 | **1866** |
+
+**Chosen: 128×64 bk8** — a one-constant change. 128×128 bk8 is 1.23x better at
+2048 but *collapses* at 512 (428 vs 795: only 16 output tiles, far too few to
+fill 64 CUs), and ONE fixed geometry serves every host-dispatch matmul. Size-
+adaptive geometry (compile both, pick on M/N) is recorded as future work.
+
+**Result.** End-to-end single-call `a@b` on Xe2: 2048³ 16.05→11.75 ms (1.37x),
+1536³ 7.91→4.71 ms (1.68x), 1024³ 3.32→2.37 ms (1.40x). `MM2_BK` is NOT touched
+for `VMO_NV_PTX` (TF32 `TC_LDS = MMA_BK+4` and the k16 wmma fragments depend on
+it) or `VMO_CPU_TILES` — the constant changed is the GPU `mm2`'s own, so NVIDIA
+and CPU are unaffected and need no re-validation.
+
+## 46. The real Xe2 matmul win: route EMBEDDED matmuls to mm2 (+ an epilogue-fused mm2_epi) — 2.5x (2026-07-22)
+
+**The trap.** §45 sped up the single-matmul fast path but the chained benchmark
+barely moved. Cause: the fast path requires `tasks.size() == 1`, so it only ever
+fires for a program that is *exactly one matmul*. Every matmul EMBEDDED in a
+real program (transformer projections, MLP layers) fell back to the in-VM
+`vmo_mma_tile` — a 64×64 / 4×4 / single-buffered tile constrained by the
+megakernel's shared `__local` and register budget. Measured directly
+(`PJRT_OCL_MM_KERNEL=0` reproduces it): **574 vs 1443 GFLOP/s at 2048, a 2.5x
+gap** that no amount of tile tuning on the fast path could reach.
+
+**Fix (§46a): a GPU host-dispatch matmul hybrid.** The codebase already had this
+mechanism twice — `mm_tc` for NVIDIA TF32 (§36) and `mm2p` for CPU (§12/§13) —
+both gated so Xe2 got neither. Added a third: peel pure-matmul phases out of the
+program and enqueue `mm2`, same flush-without-drain structure (in-order queue
+serializes it after the flushed phases, no `clFinish`). Chained 2048³ matmul:
+**30.25 → 11.72 ms/op (2.58x, 568 → 1467 GFLOP/s)**; embedded matmul now matches
+the standalone path.
+
+**Fix (§46b): mm2_epi, because the FFN matmuls were still excluded.** With the
+hybrid on, the transformer gained only 9%. The `PJRT_OCL_MM_HYBRID_DBG`
+diagnostic (added here — it reports *why* a phase was kept on the VM) showed
+only the QKV projection routing; the two **largest** matmuls, FFN up
+(2048×4096×1024) and FFN down (2048×1024×4096), were rejected *solely* for
+carrying a store-epilogue (`p6!=0` — fused bias+gelu / residual add), since
+`mm2` had no epilogue path. Mirroring the CPU's `mm2p_epi`, `vmo_mm2p_epi` moved
+above the `VMO_CPU_TILES` split and `mm2`/`mm2_epi` now share ONE tuned body
+(`vmo_mm2_body`; `ep6==0` makes the epilogue the identity, costing one branch
+per *output* element — O(M*N) against an O(M*N*K) loop). The `__local` panels are
+declared by the kernels and passed in: OpenCL C forbids `__local` declarations
+in non-kernel functions.
+
+**Size gate — routing everything REGRESSES small programs.** Peeling costs an
+extra enqueue and breaks the phase's batching. Measured on the transformer:
+routing every matmul regressed `small` (vol ~3e7) by **39%** and was neutral on
+`base` (vol ≤5.4e8), while `large_l1` (vol ≥2.1e9) gained 27%. The gate is
+therefore on compute VOLUME `M*N*K >= 1<<30` (same form as the NVIDIA fp16
+hybrid's), which sits in that gap with margin.
+`PJRT_OCL_MM_HYBRID_GPU_MINVOL` re-tunes it; `PJRT_OCL_MM_HYBRID_GPU=0` disables.
+Noise floor on this host is ±6% — measured by running `base` OFF vs a
+route-nothing gate, which is how the earlier "6% base regression" was identified
+as noise rather than signal.
+
+**Result.** Transformer `large_l1` **101.2 → 74.2 ms/iter (1.36x, 552 → 753
+GFLOP/s)**; `small`/`base` unchanged. Chained per-op matmul vs JAX CPU is now
+**2.4–2.7x FASTER at every size** (was ~par at 2048, and crashing before §44).
+Validated: `pytest tests/` **406 passed / 1 skipped on BOTH Xe2 and PoCL**,
+`runtime_test` PASS on both, transformer `--check` allclose PASS on base and
+large_l1. NVIDIA is untouched (`mm_tc` still takes precedence; the new path
+requires `!mm_tc_kernel()`), CPU untouched (`is_gpu()` guard).
+
+**Honest scope.** Still NOT routed, by design: batched matmuls (`p3>1` — the
+per-head attention QK^T/AV) and matmuls with folded view operands (`p4/p5!=0`),
+neither of which `mm2` can read. Those keep the in-VM tile and are the next
+lever, along with size-adaptive tile geometry (§45) and Xe2's XMX/DPAS matrix
+engine (bf16-only, so it needs the same operand rounding the NVIDIA TF32 path
+uses — a vendor extension, belongs behind the kernel-table override).
+
+**Tooling gap found.** `tools/bench_suite/run_suite.py` is hardcoded to compare
+against native CUDA and forces `PJRT_OCL_DEVICE=NVIDIA` in its workers, so on a
+non-NVIDIA host every workload fails on BOTH sides. It has a `--cpu` mode
+(PoCL vs XLA CPU) but no GPU-vs-CPU mode, so the 18-workload testbench cannot
+currently be run on Xe2. Not fixed here — recorded as a gap.

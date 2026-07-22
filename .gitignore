@@ -20,3 +20,4 @@ pjrt_plugin/build-dev/
 poc/17-nv-mma/bench17
 poc/17-nv-mma/bench17hp
 poc/17-nv-mma/probe
+poc/19-xe2-mma/bench19

@@ -345,10 +345,17 @@ alternative you'd actually use.
 - **Large arrays are where the iGPU pays off**: elementwise at 16M runs
   **~2.2x faster** than XLA CPU (~120 GB/s effective on the shared LPDDR5X — but
   note XLA:CPU *fuses* elementwise chains into one memory pass and our bytecode
-  VM does not, so this streaming comparison flatters XLA). `dot_general` is
-  **faster than XLA CPU from N≈128 up through 1536** (1.8x at 768³, 1.4x at
-  1536³) and reaches ~parity at 2048³ (~1.15 TFLOP/s) — the large-matmul
-  kernel is the next optimization target (Xe2's f32 peak is far higher).
+  VM does not, so this streaming comparison flatters XLA).
+- **`dot_general` is 2.4–2.7x faster than XLA CPU at every size ≥256**
+  (~1.47 TFLOP/s at 2048³). Two fixes got it there, both in
+  `docs/decisions.md` §45–§46: the SGEMM's staged K-block was halved
+  (`MM2_BK` 16→8 — an *occupancy* win, not a register one: it halves
+  local-memory per workgroup so twice as many stay co-resident, poc/19), and —
+  the big one — **matmuls embedded in a larger program are now peeled out to
+  that SGEMM** instead of crawling on the in-VM tile (574 → 1467 GFLOP/s,
+  2.5x). An epilogue-fused variant (`mm2_epi`) is what lets a transformer's
+  FFN matmuls (fused bias+gelu / residual add) take that path. Routing is
+  gated on compute volume ≥2³⁰ — peeling smaller matmuls regresses them.
   `matrix × vector` is at parity at 2048 via the dedicated `gemv` kernel.
 - **`while` loops**: ~2 µs/call scheduler overhead at small N (1.7x *faster*
   than XLA CPU at 4K), within 1.1x at 16M.
@@ -400,8 +407,7 @@ bytecode through this plugin
 - Both run the identical bytecode on shared LPDDR5X, yet the iGPU wins
   everywhere: **~8x** on elementwise at 16M (32 XVEs outpace 8 CPU cores on
   the same memory), **~1.5x** on `gather` and the `while` loop, **2.6x** on
-  `matmul` at 768³, and **1.2x** at 2048³ (both matmul kernels have headroom
-  left at that size).
+  `matmul` at 768³ and **~3x** at 2048³ after the §45–§46 matmul work.
 - Practical guidance: on any machine with a working GPU ICD, the default
   device selection (first GPU) is the right choice — it never loses, and wins
   big on compute-dense programs. Select PoCL explicitly
