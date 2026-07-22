@@ -343,9 +343,12 @@ alternative you'd actually use.
   (NVIDIA: hundreds of lanes) keep the megakernel. `PJRT_OCL_ENGINE=mega`
   forces it back. See `docs/decisions.md` §44.
 - **Large arrays are where the iGPU pays off**: elementwise at 16M runs
-  **~2.2x faster** than XLA CPU (~120 GB/s effective on the shared LPDDR5X — but
-  note XLA:CPU *fuses* elementwise chains into one memory pass and our bytecode
-  VM does not, so this streaming comparison flatters XLA).
+  **~2.2x faster** than XLA CPU. Both backends *fuse* the benchmark's
+  elementwise chain into ~one memory pass (ours costs 1.25x a single add for
+  16 chained adds, not 16x), so this is an honest bandwidth-vs-bandwidth
+  comparison: ~76 GB/s for us against the shared LPDDR5X's ~136 GB/s
+  theoretical peak. Streaming ops sit at that same ~75 GB/s ceiling
+  (`dynamic_slice` included) — headroom remains.
 - **`dot_general` is 2.4–2.7x faster than XLA CPU at every size ≥256**
   (~1.47 TFLOP/s at 2048³). Two fixes got it there, both in
   `docs/decisions.md` §45–§46: the SGEMM's staged K-block was halved
@@ -359,9 +362,11 @@ alternative you'd actually use.
   `matrix × vector` is at parity at 2048 via the dedicated `gemv` kernel.
 - **`while` loops**: ~2 µs/call scheduler overhead at small N (1.7x *faster*
   than XLA CPU at 4K), within 1.1x at 16M.
+- **`gather`/`dynamic_slice` is ~2x behind XLA CPU at 16M**, but it is already
+  running at the same ~75 GB/s streaming ceiling as everything else — it is
+  bandwidth-bound, not algorithmically bad.
 - **Small ops are dispatch-bound** (~10–70 µs wall-clock vs XLA CPU's
-  ~1–30 µs): expect 2–6x slower below ~1M elements — and `gather` at any size
-  (host-dispatch launches one kernel per slice); batch or fuse small work.
+  ~1–30 µs): expect 2–6x slower below ~1M elements; batch or fuse small work.
 - Bring-up found and fixed a real portability bug: lane count is now *measured*
   at init (occupancy discovery, `docs/decisions.md` §9) instead of derived from
   the vendor-ambiguous `CL_DEVICE_MAX_COMPUTE_UNITS`.

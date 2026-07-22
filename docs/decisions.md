@@ -3871,3 +3871,42 @@ against native CUDA and forces `PJRT_OCL_DEVICE=NVIDIA` in its workers, so on a
 non-NVIDIA host every workload fails on BOTH sides. It has a `--cpu` mode
 (PoCL vs XLA CPU) but no GPU-vs-CPU mode, so the 18-workload testbench cannot
 currently be run on Xe2. Not fixed here — recorded as a gap.
+
+## 47. Xe2 streaming bandwidth: we are at 86% of achievable — NO change shipped (2026-07-22)
+
+**Context.** After the matmul work (§45/§46), the only op Xe2 still loses to XLA
+CPU on is `gather`/`dynamic_slice` (~2x at 16M). Before optimizing it, measure:
+is it a bad kernel, or the memory wall?
+
+**First, a correction to an earlier reading of the bench.** The chained
+benchmark's per-op elementwise number implied ~1100 GB/s, which is impossible on
+LPDDR5X. The explanation is that **our VM fuses the chain too** — 16 chained
+adds cost 1.25x a single add, not 16x. An earlier draft of the README claimed
+"XLA:CPU fuses elementwise chains and our bytecode VM does not"; that is WRONG
+and has been fixed. Both backends fuse, so the 2.2x elementwise ratio is an
+honest bandwidth-vs-bandwidth comparison.
+
+**PoC (poc/20-xe2-bw): the achievable ceiling is ~109 GB/s, not 136.** A bare
+triad / copy / read-only reduction all converge on ~108–110 GB/s (80% of
+theoretical — the normal ratio). Measured through the plugin, our elementwise
+`a+b` at 16M reaches **~94 GB/s = 86% of achievable**, and `dynamic_slice` sits
+at the same ceiling. So `gather` is **bandwidth-bound, not algorithmically
+bad**, and the "2x behind XLA CPU" is the same fused-chain comparison artifact,
+not a kernel defect. The residual ~14% is bytecode-VM interpretation (per-tile
+task descriptor read, handle resolution, sub-opcode branch) — intrinsic to the
+"one generic kernel, never recompile per dispatch" design.
+
+**`float8`/`float16` are a 27% PENALTY on Xe2** (80 vs 108 GB/s); `float1/2/4`
+are equivalent. This is the OPPOSITE of the CPU result (§11 / poc/09, where
+explicit `float8` took PoCL from 5 to 46 GB/s). Our `float8` bodies are gated to
+`VMO_CPU_TILES` and GPUs take the `float4` path, so the shipped code is already
+correct — but this is a trap for anyone tempted to widen the GPU vectors.
+
+**`EW_TS` re-checked and deliberately left at 4096.** Raising it buys nothing at
+16M (94 GB/s either way — an apparent 85→89 gain was run variance) and costs
+**44%** at n=64K (0.065 → 0.093 ms: too few tiles, idle XVEs). The
+NVIDIA-derived default is right for Xe2 too.
+
+**Outcome: no code change.** Recorded because the negative result is the useful
+part — it closes "optimize gather/elementwise on Xe2" as a dead end at the
+kernel level and prices the remaining VM-interpretation overhead at ~14%.
