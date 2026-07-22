@@ -4045,6 +4045,16 @@ I/O expecting a win.
 
 ## 50. OPEN BUG: fused softmax_seg returns WRONG results on Xe2, non-deterministically across processes (2026-07-22)
 
+> **SUPERSEDED BY §56 — READ THAT FIRST. Two premises below are WRONG.**
+> (1) `vmo_softmax_seg` never executes for this program at all: JAX 0.10.2's
+> `jax.nn.softmax` emits an extra `maximum` that breaks the §19 fusion
+> recognizer, so it lowers to 8 plain tasks. Every "specific to the fused
+> softmax" conclusion here is about an op that was not running. (2) It is not
+> Xe2-specific and not a softmax bug — it is an intra-work-group data race
+> between fused tile entries, latent on the megakernel and exposed by §44's
+> host-dispatch default. Kept unedited as a record of how the investigation
+> actually went.
+
 **This is a silent-wrong-answer bug, not a perf issue. It is NOT fixed.** Found
 by the reworked workload suite (§51) via an accuracy marker, not by the test
 suite — the error is small enough (~5e-3 on ~0.1 values) to pass the 2e-2
@@ -4464,6 +4474,12 @@ Nothing on this list makes batchnorm, embedding_softmax or fft win; see the
 UNWINNABLE paragraph.
 
 ## 54. §50 follow-up: the Xe2 softmax_seg bug needs lsz==256 AND a ported input — three hypotheses eliminated (2026-07-22)
+
+> **SUPERSEDED BY §56.** The two bracketing conditions found here are real but
+> were mis-attributed. `lsz==256` matters because it is what makes the producing
+> tile need three grid-stride trips with a last-written tail; the "ported input"
+> condition is really "which ops the scheduler fuses into one chain", which
+> inserting `x*1.0+0.0` changes. Neither is about I/O ports or softmax.
 
 Still NOT fixed, but the reproducer is now sharply bracketed
 (`tools/softmax_bug.py`, `tools/softmax_bug2.py`, `tools/softmax_shapes.sh`;
