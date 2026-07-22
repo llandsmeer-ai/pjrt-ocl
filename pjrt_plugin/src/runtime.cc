@@ -531,11 +531,15 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   // barrier); GPUs keep the persistent megakernel. A device whose vm.cl build
   // lacks device-scope fences (strict OpenCL C 1.2, see dialect probe above)
   // must ALSO use host-dispatch: its spin-barrier is a data race (poc/07).
-  // PJRT_OCL_ENGINE overrides.
+  // PJRT_OCL_ENGINE overrides.  engine_forced tracks an EXPLICIT host/mega
+  // choice so the residency heuristic below (which runs after ProbeResidency)
+  // only reshapes the "auto" default and never silently overrides the user.
+  bool engine_forced = false;
   rt->host_dispatch_ = !rt->info_.is_gpu || !rt->info_.has_device_fence;
   if (const char* e = std::getenv("PJRT_OCL_ENGINE"); e && e[0]) {
     if (!std::strcmp(e, "host")) {
       rt->host_dispatch_ = true;
+      engine_forced = true;
     } else if (!std::strcmp(e, "mega")) {
       if (!rt->info_.has_device_fence)
         return fail(
@@ -543,6 +547,7 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
             "device-scope acquire/release fences; the megakernel "
             "spin-barrier would be a data race (poc/07)");
       rt->host_dispatch_ = false;
+      engine_forced = true;
     }
     // "auto" (or anything else) keeps the default.
   }
@@ -585,6 +590,23 @@ std::unique_ptr<OclRuntime> OclRuntime::Create(std::string* err) {
   if (rt->info_.is_gpu)
     if ((measured_res = rt->ProbeResidency()))
       rt->ngroups_ = std::min(rt->ngroups_, measured_res);
+  // Low-residency GPUs (small iGPUs like Intel Arc 140V Xe2, measured 32
+  // co-resident workgroups) are a NET LOSS on the persistent megakernel:
+  // parallelism is capped at residency while a host-launched kernel gets a
+  // full oversubscribed grid the driver latency-hides across the XVEs, and
+  // the cross-workgroup spin-barrier is pure overhead here. Measured on Xe2,
+  // host-dispatch matmul is 5-8x faster than the megakernel AND avoids the
+  // -5 (CL_OUT_OF_RESOURCES) that a long chained-matmul megakernel dispatch
+  // trips (decisions.md §44). The megakernel only pays off when residency is
+  // large enough to cover the work (NVIDIA: hundreds of lanes). So the "auto"
+  // default flips GPUs whose MEASURED residency is below kMegaMinResidency to
+  // host-dispatch; NVIDIA (well above it) is untouched, so this needs no
+  // NVIDIA re-validation. Only applies to a genuine measurement (nonzero) and
+  // never overrides an explicit PJRT_OCL_ENGINE.
+  constexpr cl_uint kMegaMinResidency = 64;
+  if (!engine_forced && !rt->host_dispatch_ && measured_res &&
+      measured_res < kMegaMinResidency)
+    rt->host_dispatch_ = true;
   if (const char* g = std::getenv("PJRT_OCL_VM_LANES"); g && g[0])
     rt->ngroups_ = std::max(1, std::atoi(g));
   // Host-dispatch tile work-group size. On CPU, lsz=1 removes the collaborative

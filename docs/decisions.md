@@ -3711,3 +3711,64 @@ strictly-linear bytecode, still f32 split-pair) — recorded, not built. complex
 is rejected (arena is f32). The top-level func may not RETURN a complex value
 (PJRT output buffers are single f32 arrays) — only real projections (abs/real/
 imag) cross the host boundary, which is all a magnitude-spectrum program needs.
+
+## 44. Xe2 (low-residency iGPU) defaults to host-dispatch, not the megakernel — 5–8x matmul win + fixes a chained-matmul -5 (2026-07-22)
+
+**Context.** Post-container-recreate bring-up on the Lunar Lake host (Intel Arc
+140V Xe2, `intel-opencl-icd` 26.22). Re-running `tools/plot_bench.py --device
+Intel` under the default engine produced `nan`s: `matrix x matrix` at N≥1536
+failed with `clFinish -5` (CL_OUT_OF_RESOURCES), and — because the bench worker
+benchmarks every op in ONE persistent process — that kernel-execution error
+POISONED the OpenCL context, so every *subsequent* op family (gather, while)
+then failed with `WriteToDevice failed`. In isolation gather/while are fine
+(verified); the cascade was purely downstream of the matmul -5.
+
+**Root cause.** The bench applies each op as a CHAIN=16 data-dependent chain in
+one dispatch. On the megakernel that is 16 sequential matmul instructions in a
+single long-running persistent-kernel launch. On Xe2 this is pathological:
+- Residency is only **32 co-resident workgroups** (measured, poc/08). The
+  megakernel caps parallelism at residency, so a 2048³ matmul (1024 output
+  tiles) is processed 32-at-a-time by persistent threads, while the
+  cross-workgroup spin-barrier between the 16 instructions is pure overhead.
+- A single 2048³ matmul is correct and takes ~16 ms; ×16 chained in one
+  dispatch runs long enough / hard enough that the Intel GPU returns -5.
+
+**Measurement (divergence experiment).** Same matmul chain, mega vs host
+engine (`PJRT_OCL_ENGINE`), N=512:
+
+| K (chain depth) | mega ms/matmul | host ms/matmul |
+|---|---|---|
+| 1  | 3.48 | 0.54 |
+| 8  | 2.19 | 0.39 |
+| 16 | 2.16 | 0.28 |
+
+Host-dispatch is **5–8x faster** and never trips -5. A host-launched matmul
+gets a full oversubscribed grid the driver latency-hides across the XVEs; the
+megakernel's whole premise (amortize launch overhead with persistent threads)
+does not pay on a 32-workgroup iGPU where launch is cheap relative to the
+barrier + the parallelism cap.
+
+**Decision (converge).** The "auto" engine default now flips GPUs whose
+**measured** residency is below `kMegaMinResidency = 64` to host-dispatch
+(`runtime.cc`, after `ProbeResidency`). Xe2 probes 32 → host; NVIDIA probes
+into the hundreds → keeps the megakernel, so **no NVIDIA re-validation needed**
+(the change is inert there). Guards: only fires on a genuine nonzero
+measurement, and never overrides an explicit `PJRT_OCL_ENGINE=host|mega`
+(tracked via `engine_forced`). `PJRT_OCL_ENGINE=mega` still forces the
+megakernel on Xe2 (runtime_test PASS confirms it still works when asked).
+
+**Validation.** Full `pytest tests/` on Xe2 with the new default: **406 passed,
+1 skipped** (the known Phase-1 WHILE/IF seam). `runtime_test` PASS on both
+Intel and PoCL. Regenerated `docs/bench_plot_xe2.csv` (no nans): matmul now
+completes at every N and beats JAX CPU through 1536³ (1.8x @768, 1.4x @1536),
+~par at 2048³. PoCL unaffected (CPU was always host-dispatch; the heuristic
+requires a nonzero residency measurement, and CPU probes 0).
+
+**Honest scope / next.** This is the project's "plan B keeps winning on small
+GPUs" case, exactly as CLAUDE.md anticipated — the megakernel thesis still
+holds on big discrete GPUs (NVIDIA benchmarks unchanged). The residency
+threshold (64) is a proxy; a per-device mega-vs-host matmul calibration at init
+would be more principled but adds init cost — deferred. Remaining Xe2 perf gap:
+the large matmul (2048³) is only ~par with an 8-core CPU at ~1.15 TFLOP/s,
+far below Xe2's f32 peak — the host-dispatch SGEMM microkernel is the next
+optimization target (§45+).
